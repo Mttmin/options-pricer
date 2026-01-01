@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "options",
+    "black-scholes",
+    "cli",
+]
+resolver = "2"
+
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,6 @@
+# Ignore build output directory
+/target
+
+# Ignore IDE specific files
+/.vscode/
+/.claude/
