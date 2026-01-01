@@ -1,6 +1,6 @@
 Coding a fully fledged options pricer in rust for options, futures and exotics
 
-Work in progress, see ToDo
+Serves as a learning environment for learning rust
 
 ## Project Status
 See [TODO.md](TODO.md) for current tasks and roadmap.
