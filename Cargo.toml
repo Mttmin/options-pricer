@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "options",
-    "black-scholes",
     "cli",
 ]
 resolver = "2"

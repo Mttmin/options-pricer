@@ -4,5 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-black-scholes = { path = "../black-scholes" }
 options = { path = "../options" }

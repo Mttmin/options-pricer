@@ -1,8 +1,7 @@
 # Overall To-do list
 
-- European Call/Put using Black Scholz
 - Standard derivatives structures of Options as linear combination of Black Scholz call puts
-- Convertible pricing
+- Convertible pricing using more than BS
 - American Call/puts
 - Asian Call/puts
 - All around multi-threaded Monte Carlo
@@ -16,4 +15,3 @@
 2. Vol calculation
 3. risk-free rate pull
 4. normal distrib calculation
-5. Black Scholz final implementation
