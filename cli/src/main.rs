@@ -9,6 +9,7 @@ fn main() {
         0.2,
         0.05,
         1.0,
+        None
     );
     let price = black_scholes_price(call_option);
     println!("Call Option Price: {:.4}", price);
@@ -25,6 +26,7 @@ fn main() {
         stock_price: 55.0,
         volatility: 0.25,
         time_to_maturity: 5.0,
+        dividend_yield: None
     };
     let cb_price = convertible_bond.bs_pricing();
     println!("Convertible Bond Price: {:.4}", cb_price);
