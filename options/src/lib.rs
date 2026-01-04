@@ -1,6 +1,8 @@
 pub mod black_scholes;
 pub mod exotics;
 
+use std::f64;
+
 use black_scholes::*;
 use statrs::distribution::{Continuous, ContinuousCDF, Normal};
 
@@ -49,6 +51,36 @@ impl Options {
             dividend_yield,
         ))
     }
+    pub fn volatility(&self) -> f64 {
+        match self {
+            Options::Call(call) => call.volatility(),
+            Options::Put(put) => put.volatility(),
+        }
+    }
+    pub fn risk_free_rate(&self) -> f64 {
+        match self {
+            Options::Call(call) => call.risk_free_rate(),
+            Options::Put(put) => put.risk_free_rate(),
+        }
+    }
+    pub fn time_to_maturity(&self) -> f64 {
+        match self {
+            Options::Call(call) => call.time_to_maturity(),
+            Options::Put(put) => put.time_to_maturity(),
+        }
+    }
+    pub fn strike_price(&self) -> f64 {
+        match self {
+            Options::Call(call) => call.strike_price,
+            Options::Put(put) => put.strike_price,
+        }
+    }
+    pub fn spot_price(&self) -> f64 {
+        match self {
+            Options::Call(call) => call.spot_price,
+            Options::Put(put) => put.spot_price,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +96,15 @@ pub struct Call {
 impl Call {
     pub fn bs_pricing(&self) -> f64 {
         black_scholes_price(Options::Call(*self))
+    }
+    pub fn volatility(&self) -> f64{
+        self.volatility
+    }
+    pub fn risk_free_rate(&self) -> f64{
+        self.risk_free_rate
+    }
+    pub fn time_to_maturity(&self) -> f64{
+        self.time_to_maturity
     }
     pub fn new(
         strike_price: f64,
@@ -216,6 +257,16 @@ impl Put {
     pub fn bs_pricing(&self) -> f64 {
         black_scholes_price(Options::Put(*self))
     }
+        pub fn volatility(&self) -> f64{
+        self.volatility
+    }
+    pub fn risk_free_rate(&self) -> f64{
+        self.risk_free_rate
+    }
+    pub fn time_to_maturity(&self) -> f64{
+        self.time_to_maturity
+    }
+
     pub fn new(
         strike_price: f64,
         spot_price: f64,
@@ -349,5 +400,50 @@ impl Put {
             * self.time_to_maturity
             * std_norm.cdf(-d2)
             * (-interest_rate * self.time_to_maturity).exp()
+    }
+}
+pub trait Payoff: Send + Sync {
+    // Instance method for dynamic dispatch
+    fn compute(&self, spot_t: f64, strike: f64) -> f64;
+    
+    // Static method for monomorphization (zero-cost at runtime)
+    fn compute_static(spot_t: f64, strike: f64) -> f64;
+}
+
+impl Payoff for Call {
+    #[inline(always)]
+    fn compute(&self, spot_t: f64, strike: f64) -> f64 {
+        (spot_t - strike).max(0.0)
+    }
+    
+    #[inline(always)]
+    fn compute_static(spot_t: f64, strike: f64) -> f64 {
+        (spot_t - strike).max(0.0)
+    }
+}
+
+impl Payoff for Put {
+    #[inline(always)]
+    fn compute(&self, spot_t: f64, strike: f64) -> f64 {
+        (strike - spot_t).max(0.0)
+    }
+    
+    #[inline(always)]
+    fn compute_static(spot_t: f64, strike: f64) -> f64 {
+        (strike - spot_t).max(0.0)
+    }
+}
+
+impl Payoff for Options {
+    fn compute(&self, spot_t: f64, strike: f64) -> f64 {
+        match self {
+            Options::Call(call) => call.compute(spot_t, strike),
+            Options::Put(put) => put.compute(spot_t, strike),
+        }
+    }
+    
+    fn compute_static(spot_t: f64, strike: f64) -> f64 {
+        // Can't determine call vs put statically
+        panic!("Use compute() instance method for Options enum")
     }
 }

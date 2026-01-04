@@ -4,3 +4,9 @@
 # Ignore IDE specific files
 /.vscode/
 /.claude/
+
+# Ignore documentation directory
+/documentation/
+
+# Ignore python tests
+*.py
