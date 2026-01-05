@@ -60,6 +60,7 @@ impl SimulationConstants {
     }
 }
 
+/// Prices European options using Monte Carlo with antithetic variates variance reduction..
 pub fn price_european<P: Payoff>(opt: &Options, num_simulations: u32) -> MonteCarloResult {
     let constants = SimulationConstants::new(opt);
 
@@ -73,11 +74,18 @@ pub fn price_european<P: Payoff>(opt: &Options, num_simulations: u32) -> MonteCa
             },
             |(rng, normal), _| {
                 let z: f64 = normal.sample(rng);
-                let spot_t = opt.spot_price() * (constants.drift + constants.diffusion * z).exp();
-                
-                // This call is monomorphized - no runtime dispatch
-                let payoff = P::compute_static(spot_t, opt.strike_price());
-                (payoff, payoff * payoff)
+
+                // Compute payoff for +z path
+                let spot_t_plus = opt.spot_price() * (constants.drift + constants.diffusion * z).exp();
+                let payoff_plus = P::compute_static(spot_t_plus, opt.strike_price());
+
+                // Compute payoff for -z path (antithetic variate)
+                let spot_t_minus = opt.spot_price() * (constants.drift + constants.diffusion * (-z)).exp();
+                let payoff_minus = P::compute_static(spot_t_minus, opt.strike_price());
+
+                // Average the two payoffs
+                let avg_payoff = (payoff_plus + payoff_minus) / 2.0;
+                (avg_payoff, avg_payoff * avg_payoff)
             },
         )
         .reduce(|| (0.0, 0.0), |(a, a2), (b, b2)| (a + b, a2 + b2));
@@ -113,9 +121,9 @@ mod tests {
             None,   // no dividend
         );
 
-        let num_simulations = 1_000_000_000;  
+        let num_simulations = 100_000_000;  
         let num_paths = 10_000;         
-        let num_steps = 356;            // Reduced steps
+        let num_steps = 356;           
 
         println!("\n=== Monte Carlo Speed Test ===");
         println!("Option parameters: K=100, S=100, sigma=0.2, r=0.05, T=1.0");
