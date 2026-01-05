@@ -70,7 +70,7 @@ pub fn black_scholes_price(option: Options) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Call, Options, Put};
+    use crate::{Call, Greeks, Options, Put};
     #[test]
     fn test_black_scholes_pricing() {
         // Setup test options - ITM Call (spot > strike)

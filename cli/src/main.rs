@@ -1,4 +1,4 @@
-use options::{black_scholes::black_scholes_price, Options, exotics::ConvertibleBond};
+use options::{BlackScholesPrice, Options, black_scholes::black_scholes_price, exotics::ConvertibleBond};
 
 fn main() {
     println!("Black-Scholes Option Pricing CLI");

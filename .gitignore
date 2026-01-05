@@ -4,3 +4,10 @@
 # Ignore IDE specific files
 /.vscode/
 /.claude/
+/.pycache/
+
+# Ignore python tests
+*.py
+
+# Ignore documentation 
+/documentation/

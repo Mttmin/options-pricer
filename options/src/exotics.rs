@@ -1,4 +1,4 @@
-use crate::Call;
+use crate::{BlackScholesPrice, Call};
 
 pub enum ExoticOptions {
     ConvertibleBond(ConvertibleBond),
@@ -49,12 +49,14 @@ impl ConvertibleBond {
         };
         underlying_call.bs_pricing()
     }
+}
+
+impl BlackScholesPrice for ConvertibleBond {
     /// Calculate the total price of the convertible bond using Black-Scholes for the conversion option and NPV for the bond component
-    pub fn bs_pricing(&self) -> f64 {
+    fn bs_pricing(&self) -> f64 {
         self.npv() + self.face_value / self.conversion_price * self.conversion_option_price()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

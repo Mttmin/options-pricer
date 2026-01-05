@@ -1,8 +1,19 @@
 pub mod black_scholes;
 pub mod exotics;
+pub mod optionspreads;
+
+use std::f64;
 
 use black_scholes::*;
 use statrs::distribution::{Continuous, ContinuousCDF, Normal};
+
+pub trait Greeks {
+    fn delta(&self, imply_vol: f64, spot_price: f64) -> f64;
+    fn theta(&self, imply_vol: f64, spot_price: f64) -> f64;
+    fn gamma(&self, imply_vol: f64, spot_price: f64) -> f64;
+    fn vega(&self, spot_price: f64) -> f64;
+    fn rho(&self, imply_vol: f64, spot_price: f64, interest_rate: f64) -> f64;
+}
 
 // Core option contract types shared across pricing engines and front-ends.
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +60,44 @@ impl Options {
             dividend_yield,
         ))
     }
+
+}
+
+impl Greeks for Options {
+    fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
+        match self {
+            Options::Call(call) => call.delta(imply_vol, spot_price),
+            Options::Put(put) => put.delta(imply_vol, spot_price),
+        }
+    }
+
+    fn theta(&self, imply_vol: f64, spot_price: f64) -> f64 {
+        match self {
+            Options::Call(call) => call.theta(imply_vol, spot_price),
+            Options::Put(put) => put.theta(imply_vol, spot_price),
+        }
+    }
+
+    fn gamma(&self, imply_vol: f64, spot_price: f64) -> f64 {
+        match self {
+            Options::Call(call) => call.gamma(imply_vol, spot_price),
+            Options::Put(put) => put.gamma(imply_vol, spot_price),
+        }
+    }
+
+    fn vega(&self, spot_price: f64) -> f64 {
+        match self {
+            Options::Call(call) => call.vega(spot_price),
+            Options::Put(put) => put.vega(spot_price),
+        }
+    }
+
+    fn rho(&self, imply_vol: f64, spot_price: f64, interest_rate: f64) -> f64 {
+        match self {
+            Options::Call(call) => call.rho(imply_vol, spot_price, interest_rate),
+            Options::Put(put) => put.rho(imply_vol, spot_price, interest_rate),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,11 +134,14 @@ impl Call {
     pub fn payout(&self, spot: f64) -> f64 {
         f64::max(0.0, spot - self.strike_price)
     }
+}
+
+impl Greeks for Call {
     /// Calculates Delta (Δ) - the rate of change of option price with respect to spot price.
     /// For calls, delta ranges from 0 to 1. Higher values indicate deeper in-the-money positions
     /// 
     /// Formula: Δ = e^(-qT) * N(d₁)
-    pub fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
+    fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
         let d1 = d_plus(
             self.time_to_maturity,
             self.risk_free_rate,
@@ -108,7 +160,7 @@ impl Call {
     /// Typically negative for calls. Divide by 365 for daily theta
     /// 
     /// Formula: Θ = -[S*N'(d₁)*σ*e^(-qT)] / [2√T] + qS*N(d₁)*e^(-qT) - rK*e^(-rT)*N(d₂)
-    pub fn theta(&self, imply_vol: f64, spot_price: f64) -> f64 {
+    fn theta(&self, imply_vol: f64, spot_price: f64) -> f64 {
         let d1 = d_plus(
             self.time_to_maturity,
             self.risk_free_rate,
@@ -146,7 +198,7 @@ impl Call {
     /// Always positive. Highest for at-the-money options near expiration
     /// 
     /// Formula: Γ = N'(d₁) * e^(-qT) / (S * σ * √T)
-    pub fn gamma(&self, imply_vol: f64, spot_price: f64) -> f64 {
+    fn gamma(&self, imply_vol: f64, spot_price: f64) -> f64 {
         let d1 = d_plus(
             self.time_to_maturity,
             self.risk_free_rate,
@@ -166,7 +218,7 @@ impl Call {
     /// Always positive. Highest for at-the-money options
     /// 
     /// Formula: ν = S * N'(d₁) * √T * e^(-qT)
-    pub fn vega(&self, spot_price: f64) -> f64 {
+    fn vega(&self, spot_price: f64) -> f64 {
         let d1 = d_plus(
             self.time_to_maturity,
             self.risk_free_rate,
@@ -185,7 +237,7 @@ impl Call {
     /// Positive for calls. Larger for longer-dated and in-the-money options
     /// 
     /// Formula: ρ = K * T * e^(-rT) * N(d₂)
-    pub fn rho(&self, imply_vol: f64, spot_price: f64, interest_rate: f64) -> f64 {
+    fn rho(&self, imply_vol: f64, spot_price: f64, interest_rate: f64) -> f64 {
         let std_norm = Normal::new(0.0, 1.0).unwrap();
         let d2 = d_minus(
             self.time_to_maturity,
@@ -236,11 +288,14 @@ impl Put {
     pub fn payout(&self, spot: f64) -> f64 {
         f64::max(0.0, self.strike_price - spot)
     }
+}
+
+impl Greeks for Put {
     /// Calculates Delta (Δ) - the rate of change of option price with respect to spot price.
     /// For puts, delta ranges from -1 to 0. More negative values indicate deeper in-the-money positions
     /// 
     /// Formula: Δ = e^(-qT) * [N(d₁) - 1]
-    pub fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
+    fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
         let d1 = d_plus(
             self.time_to_maturity,
             self.risk_free_rate,
@@ -259,7 +314,7 @@ impl Put {
     /// Can be positive or negative for puts depending on moneyness. Divide by 365 for daily theta
     /// 
     /// Formula: Θ = -[S*N'(d₁)*σ*e^(-qT)] / [2√T] - qS*N(-d₁)*e^(-qT) + rK*e^(-rT)*N(-d₂)
-    pub fn theta(&self, imply_vol: f64, spot_price: f64) -> f64 {
+    fn theta(&self, imply_vol: f64, spot_price: f64) -> f64 {
         let d1 = d_plus(
             self.time_to_maturity,
             self.risk_free_rate,
@@ -297,7 +352,7 @@ impl Put {
     /// Always positive. Highest for at-the-money options near expiration
     /// 
     /// Formula: Γ = N'(d₁) * e^(-qT) / (S * σ * √T)
-    pub fn gamma(&self, imply_vol: f64, spot_price: f64) -> f64 {
+    fn gamma(&self, imply_vol: f64, spot_price: f64) -> f64 {
         let d1 = d_plus(
             self.time_to_maturity,
             self.risk_free_rate,
@@ -316,7 +371,7 @@ impl Put {
     /// Always positive. Highest for at-the-money options
     /// 
     /// Formula: ν = S * N'(d₁) * √T * e^(-qT)
-    pub fn vega(&self, spot_price: f64) -> f64 {
+    fn vega(&self, spot_price: f64) -> f64 {
         let d1 = d_plus(
             self.time_to_maturity,
             self.risk_free_rate,
@@ -335,7 +390,7 @@ impl Put {
     /// Negative for puts. Larger absolute value for longer-dated and in-the-money options
     /// 
     /// Formula: ρ = -K * T * e^(-rT) * N(-d₂)
-    pub fn rho(&self, imply_vol: f64, spot_price: f64, interest_rate: f64) -> f64 {
+    fn rho(&self, imply_vol: f64, spot_price: f64, interest_rate: f64) -> f64 {
         let std_norm = Normal::new(0.0, 1.0).unwrap();
         let d2 = d_minus(
             self.time_to_maturity,
@@ -349,5 +404,15 @@ impl Put {
             * self.time_to_maturity
             * std_norm.cdf(-d2)
             * (-interest_rate * self.time_to_maturity).exp()
+    }
+}
+
+pub trait BlackScholesPrice {
+    fn bs_pricing(&self) -> f64;
+}
+
+impl BlackScholesPrice for Options {
+    fn bs_pricing(&self) -> f64 {
+        self.bs_pricing()
     }
 }
