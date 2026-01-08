@@ -3,11 +3,10 @@ pub mod exotics;
 pub mod optionspreads;
 
 use std::f64;
-
-use std::f64;
-
 use black_scholes::*;
 use statrs::distribution::{Continuous, ContinuousCDF, Normal};
+
+pub use optionspreads::MonteCarloParameters;
 
 pub trait Greeks {
     fn delta(&self, imply_vol: f64, spot_price: f64) -> f64;
@@ -90,9 +89,9 @@ impl Options {
         match self {
             Options::Call(call) => call.spot_price,
             Options::Put(put) => put.spot_price,
-
+        }
+    }
 }
-
 impl Greeks for Options {
     fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
         match self {
@@ -495,10 +494,11 @@ impl Payoff for Options {
             Options::Put(put) => put.compute(spot_t),
         }
     }
-    
-    fn compute_static(spot_t: f64, strike: f64) -> f64 {
+
+    fn compute_static(_spot_t: f64,_strike: f64) -> f64 {
         // Can't determine call vs put statically
-        panic!("Use compute() instance method for Options enum")
+        panic!("Use compute() instance method for Options enum")}
+    }
 
 pub trait BlackScholesPrice {
     fn bs_pricing(&self) -> f64;
@@ -507,5 +507,59 @@ pub trait BlackScholesPrice {
 impl BlackScholesPrice for Options {
     fn bs_pricing(&self) -> f64 {
         self.bs_pricing()
+    }
+}
+
+impl MonteCarloParameters for Options {
+    fn spot_price(&self) -> f64 {
+        self.spot_price()
+    }
+
+    fn volatility(&self) -> f64 {
+        self.volatility()
+    }
+
+    fn risk_free_rate(&self) -> f64 {
+        self.risk_free_rate()
+    }
+
+    fn time_to_maturity(&self) -> f64 {
+        self.time_to_maturity()
+    }
+}
+
+impl MonteCarloParameters for Call {
+    fn spot_price(&self) -> f64 {
+        self.spot_price
+    }
+
+    fn volatility(&self) -> f64 {
+        self.volatility
+    }
+
+    fn risk_free_rate(&self) -> f64 {
+        self.risk_free_rate
+    }
+
+    fn time_to_maturity(&self) -> f64 {
+        self.time_to_maturity
+    }
+}
+
+impl MonteCarloParameters for Put {
+    fn spot_price(&self) -> f64 {
+        self.spot_price
+    }
+
+    fn volatility(&self) -> f64 {
+        self.volatility
+    }
+
+    fn risk_free_rate(&self) -> f64 {
+        self.risk_free_rate
+    }
+
+    fn time_to_maturity(&self) -> f64 {
+        self.time_to_maturity
     }
 }

@@ -1,4 +1,4 @@
-use crate::{BlackScholesPrice, Options};
+use crate::{BlackScholesPrice, Options, Payoff};
 
 pub struct Position {
     option: Options,
@@ -194,9 +194,14 @@ impl crate::Payoff for OptionSpreads {
         )
     }
 }
+pub trait MonteCarloParameters {
+    fn spot_price(&self) -> f64;
+    fn volatility(&self) -> f64;
+    fn risk_free_rate(&self) -> f64;
+    fn time_to_maturity(&self) -> f64;
+}
 
-// Implement MonteCarloParameters for OptionSpreads
-impl crate::MonteCarloParameters for OptionSpreads {
+impl MonteCarloParameters for OptionSpreads {
     fn spot_price(&self) -> f64 {
         // Extract from first component (all components share these parameters)
         self.components[0].option.spot_price()

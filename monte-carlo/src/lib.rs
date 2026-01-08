@@ -1,4 +1,5 @@
 pub mod binomial;
+use options::MonteCarloParameters;
 use rand::SeedableRng;
 use rand_distr::{Normal, Distribution};
 use rand::rng;
