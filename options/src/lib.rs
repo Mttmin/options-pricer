@@ -457,16 +457,16 @@ impl Greeks for Put {
 }
 pub trait Payoff: Send + Sync {
     // Instance method for dynamic dispatch
-    fn compute(&self, spot_t: f64, strike: f64) -> f64;
-    
+    fn compute(&self, spot_t: f64) -> f64;
+
     // Static method for monomorphization (zero-cost at runtime)
     fn compute_static(spot_t: f64, strike: f64) -> f64;
 }
 
 impl Payoff for Call {
     #[inline(always)]
-    fn compute(&self, spot_t: f64, strike: f64) -> f64 {
-        (spot_t - strike).max(0.0)
+    fn compute(&self, spot_t: f64) -> f64 {
+        (spot_t - self.strike_price).max(0.0)
     }
     
     #[inline(always)]
@@ -477,8 +477,8 @@ impl Payoff for Call {
 
 impl Payoff for Put {
     #[inline(always)]
-    fn compute(&self, spot_t: f64, strike: f64) -> f64 {
-        (strike - spot_t).max(0.0)
+    fn compute(&self, spot_t: f64) -> f64 {
+        (self.strike_price - spot_t).max(0.0)
     }
     
     #[inline(always)]
@@ -488,10 +488,11 @@ impl Payoff for Put {
 }
 
 impl Payoff for Options {
-    fn compute(&self, spot_t: f64, strike: f64) -> f64 {
+    #[inline]
+    fn compute(&self, spot_t: f64) -> f64 {
         match self {
-            Options::Call(call) => call.compute(spot_t, strike),
-            Options::Put(put) => put.compute(spot_t, strike),
+            Options::Call(call) => call.compute(spot_t),
+            Options::Put(put) => put.compute(spot_t),
         }
     }
     

@@ -5,8 +5,17 @@ pub struct Position {
     weight: f32,
 }
 
-impl Position{
+impl Payoff for Position {
+    #[inline(always)]
+    fn compute(&self, spot_t: f64) -> f64 {
+        self.option.compute(spot_t) * self.weight as f64
+    }
 
+    fn compute_static(_spot_t: f64, _strike: f64) -> f64 {
+        panic!(
+            "Position is a composite type containing dynamic Options enum - use compute() instance method instead"
+        )
+    }
 }
 
 impl crate::Greeks for Position {
@@ -165,6 +174,44 @@ impl OptionSpreads {
 impl BlackScholesPrice for OptionSpreads {
     fn bs_pricing(&self) -> f64 {
         self.components.iter().map(|pos| pos.bs_pricing()).sum()
+    }
+}
+
+impl crate::Payoff for OptionSpreads {
+    #[inline(always)]
+    fn compute(&self, spot_t: f64) -> f64 {
+        self.components
+            .iter()
+            .map(|pos| {
+                pos.option.compute(spot_t) * pos.weight as f64
+            })
+            .sum()
+    }
+
+    fn compute_static(_spot_t: f64, _strike: f64) -> f64 {
+        panic!(
+            "OptionSpreads is a composite type with dynamic components - use compute() instance method instead"
+        )
+    }
+}
+
+// Implement MonteCarloParameters for OptionSpreads
+impl crate::MonteCarloParameters for OptionSpreads {
+    fn spot_price(&self) -> f64 {
+        // Extract from first component (all components share these parameters)
+        self.components[0].option.spot_price()
+    }
+
+    fn volatility(&self) -> f64 {
+        self.components[0].option.volatility()
+    }
+
+    fn risk_free_rate(&self) -> f64 {
+        self.components[0].option.risk_free_rate()
+    }
+
+    fn time_to_maturity(&self) -> f64 {
+        self.components[0].option.time_to_maturity()
     }
 }
 

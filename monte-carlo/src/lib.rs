@@ -1,3 +1,4 @@
+pub mod binomial;
 use rand::SeedableRng;
 use rand_distr::{Normal, Distribution};
 use rand::rng;
@@ -99,6 +100,115 @@ pub fn price_european<P: Payoff>(opt: &Options, num_simulations: u32) -> MonteCa
     MonteCarloResult { price, std_error }
 }
 
+/// Generic Monte Carlo pricing for any derivative implementing Payoff and MonteCarloParameters.
+/// 
+/// For simple Call/Put options, prefer `price_european()` for better performance.
+pub fn monte_carlo<T>(derivative: &T, num_simulations: u32) -> MonteCarloResult
+where
+    T: Payoff + MonteCarloParameters + Sync,
+{
+    let t = derivative.time_to_maturity();
+    let r = derivative.risk_free_rate();
+    let sigma = derivative.volatility();
+    let spot = derivative.spot_price();
+
+    let drift = (r - 0.5 * sigma * sigma) * t;
+    let diffusion = sigma * t.sqrt();
+    let discount = (-r * t).exp();
+
+    let (sum, sum_sq): (f64, f64) = (0..num_simulations)
+        .into_par_iter()
+        .map_init(
+            || {
+                let rng = Xoshiro256PlusPlus::from_rng(&mut rand::rng());
+                let normal = Normal::new(0.0, 1.0).unwrap();
+                (rng, normal)
+            },
+            |(rng, normal), _| {
+                let z: f64 = normal.sample(rng);
+
+                // Compute payoff for +z path
+                let spot_t_plus = spot * (drift + diffusion * z).exp();
+                let payoff_plus = derivative.compute(spot_t_plus);
+
+                // Compute payoff for -z path (antithetic variate)
+                let spot_t_minus = spot * (drift + diffusion * (-z)).exp();
+                let payoff_minus = derivative.compute(spot_t_minus);
+                // Average the two payoffs
+                let avg_payoff = (payoff_plus + payoff_minus) / 2.0;
+                (avg_payoff, avg_payoff * avg_payoff)
+            },
+        )
+        .reduce(|| (0.0, 0.0), |(a, a2), (b, b2)| (a + b, a2 + b2));
+
+    let n = num_simulations as f64;
+    let mean_payoff = sum / n;
+    let price = discount * mean_payoff;
+    let variance = (sum_sq / n) - (mean_payoff * mean_payoff);
+    let std_error = discount * (variance / n).sqrt();
+
+    MonteCarloResult { price, std_error }
+}
+
+/// Prices European options using Monte Carlo with antithetic variates variance reduction.
+/// 
+/// Uses compile-time monomorphization for zero-cost abstraction on simple call/puts
+pub fn price_american<P: Payoff>(opt: &options::Options, num_simulations: u32, num_exercice_check: u32) -> MonteCarloResult {
+    let constants = SimulationConstants::new(opt);
+
+    let (sum, sum_sq): (f64, f64) = (0..num_simulations)
+        .into_par_iter()
+        .map_init(
+            || {
+                let rng = Xoshiro256PlusPlus::from_rng(&mut rand::rng());
+                let normal = Normal::new(0.0, 1.0).unwrap();
+                let values_up: Vec<f64> = Vec::with_capacity((num_exercice_check) as usize);
+                let values_down: Vec<f64> = Vec::with_capacity((num_exercice_check) as usize);
+                (rng, normal, (values_up, values_down))
+            },
+            |(rng, normal, values), _| {
+                // forward pass to generate asset prices at exercice dates 
+                // store payoffs in values vectors, and generate antithetic variates
+                for _ in 0..num_exercice_check {
+                    let z: f64 = normal.sample(rng);
+
+                    // Compute payoff for +z path
+                    let spot_t_plus = opt.spot_price() * (constants.drift + constants.diffusion * z).exp();
+                    let payoff_plus = P::compute_static(spot_t_plus, opt.strike_price());
+                    values.0.push(payoff_plus);
+
+                    // Compute payoff for -z path (antithetic variate)
+                    let spot_t_minus = opt.spot_price() * (constants.drift + constants.diffusion * (-z)).exp();
+                    let payoff_minus = P::compute_static(spot_t_minus, opt.strike_price());
+                    values.1.push(payoff_minus);
+                }
+
+                // backward pass to determine optimal stopping
+                let mut discounted_payoff_up: f64 = 0.0;
+                let mut discounted_payoff_down: f64 = 0.0;
+                for i in (0..num_exercice_check).rev() {
+                    let t_i = opt.time_to_maturity() * (i as f64) / (num_exercice_check as f64);
+                    let discount_i = (-opt.risk_free_rate() * t_i).exp();
+
+                    let exercise_value_up = values.0[i as usize];
+                    let exercise_value_down = values.1[i as usize];
+
+                    discounted_payoff_up = discounted_payoff_up.max(exercise_value_up * discount_i);
+                    discounted_payoff_down = discounted_payoff_down.max(exercise_value_down * discount_i);
+                }
+                let avg_payoff = (discounted_payoff_up + discounted_payoff_down) / 2.0;
+                (avg_payoff, avg_payoff * avg_payoff)
+            },
+        ).reduce(|| (0.0, 0.0), |(a, a2), (b, b2)| (a + b, a2 + b2));
+
+    let n = num_simulations as f64;
+    let mean_payoff = sum / n;
+    let price = constants.discount * mean_payoff;
+    let variance = (sum_sq / n) - (mean_payoff * mean_payoff);
+    let std_error = constants.discount * (variance / n).sqrt();
+
+    MonteCarloResult { price, std_error }
+}
 
 #[cfg(test)]
 mod tests {
