@@ -14,6 +14,7 @@ pub fn d_minus(t: f64, r: f64, q: Option<f64>, sigma: f64, spot: f64, strike: f6
     let denominator = sigma * t.sqrt();
     numerator / denominator
 }
+
 /// Calculate the Black-Scholes price for a given option, either Call or Put.
 ///
 /// Needs the option parameters encapsulated in the Options enum, handles dividend yields if they are present
@@ -67,6 +68,45 @@ pub fn black_scholes_price(option: Options) -> f64 {
         0.0
     }
 }
+
+/// Approximate the price of an American option using Black's approximation method
+/// 
+/// If a dividend date is provided, the option price is calculated just before the last dividend payment and compare it to exercising at maturity
+/// If a stock doesn't pay dividends, the option should in theory not be exercised early, so the European price is returned.
+pub fn black_scholes_approx_american(option: Options, dividend_date: Option<f64>) -> f64 {
+    // we use the Black approximation for American options
+    let european_price = black_scholes_price(option);
+    if let Some(div_date) = dividend_date {
+        // If there's a dividend before maturity, calculate the black scholes price just before the dividend date
+        let adjusted_option = match option {
+            Options::Call(call) => Options::Call(crate::Call {
+                strike_price: call.strike_price,
+                spot_price: call.spot_price - (call.spot_price * 0.02), // assuming a 2% dividend for simplicity
+                volatility: call.volatility,
+                risk_free_rate: call.risk_free_rate,
+                time_to_maturity: div_date,
+                dividend_yield: call.dividend_yield,
+            }),
+            Options::Put(put) => Options::Put(crate::Put {
+                strike_price: put.strike_price,
+                spot_price: put.spot_price - (put.spot_price * 0.02), // assuming a 2% dividend for simplicity
+                volatility: put.volatility,
+                risk_free_rate: put.risk_free_rate,
+                time_to_maturity: div_date,
+                dividend_yield: put.dividend_yield,
+            }),
+        };
+        let pre_div_price = black_scholes_price(adjusted_option);
+        if pre_div_price > european_price {
+            pre_div_price
+        } else {
+            european_price
+        }
+    } else {
+        european_price
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
