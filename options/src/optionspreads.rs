@@ -1,8 +1,8 @@
 use crate::{BlackScholesPrice, Options, Payoff};
 
 pub struct Position {
-    option: Options,
-    weight: f32,
+    pub option: Options,
+    pub weight: f32,
 }
 
 impl Payoff for Position {
