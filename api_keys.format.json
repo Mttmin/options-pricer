@@ -1,0 +1,5 @@
+{
+    "Alpha_vantage": "ALPHA_VANTAGE_API_KEY",
+    "Finnhub": "FINNHUB_API_KEY",
+    "Finnhub_secret": "FINNHUB_SECRET"
+}
