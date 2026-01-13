@@ -1,8 +1,8 @@
 use crate::{BlackScholesPrice, Options, Payoff};
 
 pub struct Position {
-    option: Options,
-    weight: f32,
+    pub option: Options,
+    pub weight: f32,
 }
 
 impl Payoff for Position {
@@ -54,7 +54,7 @@ pub struct OptionSpreads {
 }
 
 impl OptionSpreads {
-    pub fn new(components: Vec<Position>) -> Self{
+    pub fn new(components: Vec<Position>) -> Self {
         OptionSpreads { components }
     }
 
@@ -168,7 +168,414 @@ impl OptionSpreads {
             components: spreads,
         }
     }
+    pub fn new_strip(
+        strike_price: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let call: Options = Options::new_call(
+            strike_price,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let put: Options = Options::new_put(
+            strike_price,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
 
+        spreads.push(Position {
+            option: call,
+            weight: 1.0,
+        });
+        spreads.push(Position {
+            option: put,
+            weight: 2.0,
+        });
+        OptionSpreads {
+            components: spreads,
+        }
+    }
+    pub fn new_strap(
+        strike_price: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let call: Options = Options::new_call(
+            strike_price,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let put: Options = Options::new_put(
+            strike_price,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
+
+        spreads.push(Position {
+            option: call,
+            weight: 2.0,
+        });
+        spreads.push(Position {
+            option: put,
+            weight: 1.0,
+        });
+        OptionSpreads {
+            components: spreads,
+        }
+    }
+    pub fn new_synthetic_stock(
+        direction: Direction,
+        strike_price: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let call: Options = Options::new_call(
+            strike_price,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let put: Options = Options::new_put(
+            strike_price,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
+
+        match direction {
+            Direction::LONG => {
+                spreads.push(Position {
+                    option: call,
+                    weight: 1.0,
+                });
+                spreads.push(Position {
+                    option: put,
+                    weight: -1.0,
+                });
+            }
+            Direction::SHORT => {
+                spreads.push(Position {
+                    option: call,
+                    weight: -1.0,
+                });
+                spreads.push(Position {
+                    option: put,
+                    weight: 1.0,
+                });
+            }
+        }
+
+        OptionSpreads {
+            components: spreads,
+        }
+    }
+    pub fn new_bull_spread_call(
+        strike_price_low: f64,
+        strike_price_high: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let call_1: Options = Options::new_call(
+            strike_price_low,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let call_2: Options = Options::new_call(
+            strike_price_high,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
+        spreads.push(Position {
+            option: call_1,
+            weight: 1.0,
+        });
+        spreads.push(Position {
+            option: call_2,
+            weight: -1.0,
+        });
+        OptionSpreads {
+            components: spreads,
+        }
+    }
+    pub fn new_bull_spread_put(
+        strike_price_low: f64,
+        strike_price_high: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let put_1: Options = Options::new_put(
+            strike_price_low,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let put_2: Options = Options::new_put(
+            strike_price_high,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
+        spreads.push(Position {
+            option: put_1,
+            weight: 1.0,
+        });
+        spreads.push(Position {
+            option: put_2,
+            weight: -1.0,
+        });
+        OptionSpreads {
+            components: spreads,
+        }
+    }
+    pub fn new_bear_spread_call(
+        strike_price_low: f64,
+        strike_price_high: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let call_1: Options = Options::new_put(
+            strike_price_low,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let call_2: Options = Options::new_put(
+            strike_price_high,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
+        spreads.push(Position {
+            option: call_1,
+            weight: -1.0,
+        });
+        spreads.push(Position {
+            option: call_2,
+            weight: 1.0,
+        });
+        OptionSpreads {
+            components: spreads,
+        }
+    }
+    pub fn new_bear_spread_put(
+        strike_price_low: f64,
+        strike_price_high: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let put_1: Options = Options::new_put(
+            strike_price_low,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let put_2: Options = Options::new_put(
+            strike_price_high,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
+        spreads.push(Position {
+            option: put_1,
+            weight: -1.0,
+        });
+        spreads.push(Position {
+            option: put_2,
+            weight: 1.0,
+        });
+        OptionSpreads {
+            components: spreads,
+        }
+    }
+    pub fn new_butterfly(
+        direction: Direction,
+        strike_price_low: f64,
+        strike_price_high: f64,
+        strike_price_medium: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let call_1: Options = Options::new_call(
+            strike_price_low,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let call_2: Options = Options::new_call(
+            strike_price_medium,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let call_3: Options = Options::new_call(
+            strike_price_high,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
+
+        match direction {
+            Direction::LONG => {
+                spreads.push(Position {
+                    option: call_1,
+                    weight: 1.0,
+                });
+                spreads.push(Position {
+                    option: call_2,
+                    weight: -2.0,
+                });
+                spreads.push(Position {
+                    option: call_3,
+                    weight: 1.0,
+                });
+            }
+            Direction::SHORT => {
+                spreads.push(Position {
+                    option: call_1,
+                    weight: -1.0,
+                });
+                spreads.push(Position {
+                    option: call_2,
+                    weight: 2.0,
+                });
+                spreads.push(Position {
+                    option: call_3,
+                    weight: -1.0,
+                });
+            }
+        }
+        OptionSpreads {
+            components: spreads,
+        }
+    }
+    pub fn new_calendar_spread(
+        direction: Direction,
+        strike_price: f64,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        short_term_maturity: f64,
+        long_term_maturity:f64,
+        dividend_yield: Option<f64>,
+    ) -> OptionSpreads {
+        let call_st: Options = Options::new_call(
+            strike_price,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            short_term_maturity,
+            dividend_yield,
+        );
+        let call_lt: Options = Options::new_put(
+            strike_price,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            long_term_maturity,
+            dividend_yield,
+        );
+        let mut spreads: Vec<Position> = Vec::new();
+
+        match direction {
+            Direction::LONG => {
+                spreads.push(Position {
+                    option: call_st,
+                    weight: -1.0,
+                });
+                spreads.push(Position {
+                    option: call_lt,
+                    weight: 1.0,
+                });
+            }
+            Direction::SHORT => {
+                spreads.push(Position {
+                    option: call_st,
+                    weight: 1.0,
+                });
+                spreads.push(Position {
+                    option: call_lt,
+                    weight: -1.0,
+                });
+            }
+        }
+
+        OptionSpreads {
+            components: spreads,
+        }
+    }
 }
 
 impl BlackScholesPrice for OptionSpreads {
@@ -221,7 +628,7 @@ impl MonteCarloParameters for OptionSpreads {
 }
 
 // Greeks
-impl crate::Greeks for OptionSpreads{
+impl crate::Greeks for OptionSpreads {
     fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
         self.components
             .iter()
@@ -244,10 +651,7 @@ impl crate::Greeks for OptionSpreads{
     }
 
     fn vega(&self, spot_price: f64) -> f64 {
-        self.components
-            .iter()
-            .map(|pos| pos.vega(spot_price))
-            .sum()
+        self.components.iter().map(|pos| pos.vega(spot_price)).sum()
     }
 
     fn rho(&self, imply_vol: f64, spot_price: f64, interest_rate: f64) -> f64 {

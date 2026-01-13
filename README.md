@@ -1,10 +1,12 @@
 # Options Pricer
 
-Coding a fully fledged options pricer in rust for options, futures and exotics
+Coding a fully fledged options pricer in rust for options, futures and exotics. Serves as a personnal learning project for rust
 
-Currently supports BS-pricing of European Calls and Puts, as well as Greeks calculations
+## Current Functionnalities
 
-Serves as a learning project for rust for me
+Currently supports Black-Scholes and Monte-Carlo pricing of European Calls/Puts and frequent option spreads
+
+Includes Greeks calculations ($\Delta, \Gamma, \theta, \rho, vega$) for Europeans and Option Spreads
 
 ## Project Status
 

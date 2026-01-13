@@ -1,4 +1,4 @@
-use crate::{BlackScholesPrice, Call};
+use crate::{BlackScholesPrice, Call, Options, optionspreads::{OptionSpreads, Position}};
 
 pub enum ExoticOptions {
     ConvertibleBond(ConvertibleBond),
@@ -55,6 +55,43 @@ impl BlackScholesPrice for ConvertibleBond {
     /// Calculate the total price of the convertible bond using Black-Scholes for the conversion option and NPV for the bond component
     fn bs_pricing(&self) -> f64 {
         self.npv() + self.face_value / self.conversion_price * self.conversion_option_price()
+    }
+}
+
+pub struct ChooserOption {
+    underlying: OptionSpreads,
+}
+
+impl ChooserOption{
+    pub fn new(
+        spot_price: f64,
+        strike_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+        choose_time: f64,
+    ) -> Self {
+        let call: Options = Options::new_call(strike_price, spot_price, volatility, risk_free_rate, time_to_maturity, dividend_yield);
+        let put: Options = Options::new_put(strike_price*(-(risk_free_rate-dividend_yield.unwrap_or(0.0))*(time_to_maturity - choose_time)).exp(), spot_price, volatility, risk_free_rate, choose_time, dividend_yield);
+        let portfolio: Vec<Position> = vec![
+            Position {
+                option: call,
+                weight: 1.0,
+            },
+            Position {
+                option: put,
+                weight: ((-dividend_yield.unwrap_or(0.0)*(time_to_maturity-choose_time)).exp()) as f32,
+            },
+        ];
+        let underlying = OptionSpreads::new(portfolio);
+        Self { underlying }
+    }
+}
+
+impl BlackScholesPrice for ChooserOption {
+    fn bs_pricing(&self) -> f64 {
+        self.underlying.bs_pricing()
     }
 }
 #[cfg(test)]

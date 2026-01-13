@@ -3,7 +3,7 @@ use options::MonteCarloParameters;
 use rand::SeedableRng;
 use rand_distr::{Normal, Distribution};
 use rand::rng;
-use options::{Options, Payoff};
+use options::{Options, Payoff, MonteCarloParameters};
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::ParallelIterator;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -62,8 +62,10 @@ impl SimulationConstants {
     }
 }
 
-/// Prices European options using Monte Carlo with antithetic variates variance reduction..
-pub fn price_european<P: Payoff>(opt: &Options, num_simulations: u32) -> MonteCarloResult {
+/// Prices European options using Monte Carlo with antithetic variates variance reduction.
+/// 
+/// Uses compile-time monomorphization for zero-cost abstraction on simple call/puts
+pub fn price_european<P: Payoff>(opt: &options::Options, num_simulations: u32) -> MonteCarloResult {
     let constants = SimulationConstants::new(opt);
 
     let (sum, sum_sq): (f64, f64) = (0..num_simulations)
@@ -159,13 +161,13 @@ mod tests {
     use std::time::Instant;
     use binomial::{BinomialParameters, binomial_price, ExerciseStyle};
 
-    /// Speed comparison test
-    /// Run with: cargo test --release -- --ignored --nocapture speed_test
+    /// Speed comparison test: Monte Carlo vs Price Path
+    /// Run all speedtests: cargo test --release speedtest -- --ignored --nocapture
     #[test]
     #[ignore]
-    fn speed_test_monte_carlo_vs_price_path() {
+    fn speedtest_monte_carlo_vs_price_path() {
         // Create a test call option
-        let call_option = Options::new_call(
+        let call_option = options::Options::new_call(
             100.0,  // strike
             100.0,  // spot
             0.2,    // volatility (20%)
@@ -192,7 +194,7 @@ mod tests {
         // Test price_european function
         println!("\n1. Testing price_european ({} simulations, monomorphized, parallel)...", num_simulations);
         let start = Instant::now();
-        let result_european = price_european::<Call>(&call_option, num_simulations);
+        let result_european = price_european::<options::Call>(&call_option, num_simulations);
         let duration_european = start.elapsed();
 
         println!("   Price: ${:.4}", result_european.price);
@@ -242,7 +244,67 @@ mod tests {
 
         println!("\n=== Accuracy Comparison (vs Black-Scholes ${:.4}) ===", bs_price);
         println!("price_european error: ${:.4}", (result_european.price - bs_price).abs());
-        println!("price_path error:     ${:.4}", (avg_price - bs_price).abs());
+        // println!("price_path error:     ${:.4}", (avg_price - bs_price).abs());
+    }
+
+    /// Speed comparison test: Straddle vs Call
+    /// Run all speedtests: cargo test --release speedtest -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn speedtest_straddle_vs_call() {
+        use options::optionspreads::{OptionSpreads, Direction};
+
+        let strike = 100.0;
+        let spot = 100.0;
+        let vol = 0.2;
+        let rfr = 0.05;
+        let ttm = 1.0;
+
+        let straddle = OptionSpreads::new_straddle(
+            Direction::LONG,
+            strike,
+            spot,
+            vol,
+            rfr,
+            ttm,
+            None,
+        );
+
+        let call = options::Options::new_call(strike, spot, vol, rfr, ttm, None);
+
+        println!("\n=== Straddle vs Call Performance Comparison ===");
+        // println!("Parameters: K={}, S={}, sigma={}, r={}, T={}\n", strike, spot, vol, rfr, ttm);
+
+        // // BS Pricing
+        // let start = Instant::now();
+        // let straddle_bs = options::BlackScholesPrice::bs_pricing(&straddle);
+        // let straddle_bs_time = start.elapsed();
+
+        // let start = Instant::now();
+        // let call_bs = options::BlackScholesPrice::bs_pricing(&call);
+        // let call_bs_time = start.elapsed();
+
+        // println!("Black-Scholes:");
+        // println!("  Straddle: ${:.4} in {:?}", straddle_bs, straddle_bs_time);
+        // println!("  Call:     ${:.4} in {:?}\n", call_bs, call_bs_time);
+
+        // Monte Carlo with 1B simulations
+        println!("Monte Carlo (1B simulations):");
+        let num_sims = 1_000_000_000;
+
+        let start = Instant::now();
+        let _straddle_mc = monte_carlo(&straddle, num_sims);
+        let straddle_mc_time = start.elapsed();
+
+        let start = Instant::now();
+        let _call_mc = price_european::<options::Call>(&call, num_sims);
+        let call_mc_time = start.elapsed();
+
+        // println!("  Straddle: ${:.4} ±{:.4} in {:?}", straddle_mc.price, straddle_mc.std_error, straddle_mc_time);
+        // println!("  Call:     ${:.4} ±{:.4} in {:?}\n", call_mc.price, call_mc.std_error, call_mc_time);
+
+        println!("Performance Ratio:");
+        println!("  Straddle/Call: {:.2}x", straddle_mc_time.as_secs_f64() / call_mc_time.as_secs_f64());
     }
 
 
