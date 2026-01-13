@@ -2,16 +2,11 @@ pub mod black_scholes;
 pub mod exotics;
 pub mod optionspreads;
 
+use std::f64;
 use black_scholes::*;
 use statrs::distribution::{Continuous, ContinuousCDF, Normal};
 
-/// Trait for types that can provide market parameters needed for Monte Carlo pricing
-pub trait MonteCarloParameters {
-    fn spot_price(&self) -> f64;
-    fn volatility(&self) -> f64;
-    fn risk_free_rate(&self) -> f64;
-    fn time_to_maturity(&self) -> f64;
-}
+pub use optionspreads::MonteCarloParameters;
 
 pub trait Greeks {
     fn delta(&self, imply_vol: f64, spot_price: f64) -> f64;
@@ -97,24 +92,6 @@ impl Options {
         }
     }
 }
-impl MonteCarloParameters for Options {
-    fn spot_price(&self) -> f64 {
-        self.spot_price()
-    }
-
-    fn volatility(&self) -> f64 {
-        self.volatility()
-    }
-
-    fn risk_free_rate(&self) -> f64 {
-        self.risk_free_rate()
-    }
-
-    fn time_to_maturity(&self) -> f64 {
-        self.time_to_maturity()
-    }
-}
-
 impl Greeks for Options {
     fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
         match self {
@@ -480,7 +457,7 @@ impl Greeks for Put {
 }
 pub trait Payoff: Send + Sync {
     // Instance method for dynamic dispatch
-    fn compute(&self, spot_t: f64, strike: f64) -> f64;
+    fn compute(&self, spot_t: f64) -> f64;
 
     // Static method for monomorphization (zero-cost at runtime)
     fn compute_static(spot_t: f64, strike: f64) -> f64;
@@ -488,7 +465,7 @@ pub trait Payoff: Send + Sync {
 
 impl Payoff for Call {
     #[inline(always)]
-    fn compute(&self, spot_t: f64, _strike: f64) -> f64 {
+    fn compute(&self, spot_t: f64) -> f64 {
         (spot_t - self.strike_price).max(0.0)
     }
 
@@ -500,7 +477,7 @@ impl Payoff for Call {
 
 impl Payoff for Put {
     #[inline(always)]
-    fn compute(&self, spot_t: f64, _strike: f64) -> f64 {
+    fn compute(&self, spot_t: f64) -> f64 {
         (self.strike_price - spot_t).max(0.0)
     }
 
@@ -512,16 +489,18 @@ impl Payoff for Put {
 
 impl Payoff for Options {
     #[inline]
-    fn compute(&self, spot_t: f64, strike: f64) -> f64 {
+    fn compute(&self, spot_t: f64) -> f64 {
         match self {
-            Options::Call(call) => call.compute(spot_t, strike),
-            Options::Put(put) => put.compute(spot_t, strike),
+            Options::Call(call) => call.compute(spot_t),
+            Options::Put(put) => put.compute(spot_t),
         }
     }
-    fn compute_static(_spot_t: f64, _strike: f64) -> f64 {
-        panic!("no static call to the option enum")
+
+    fn compute_static(_spot_t: f64,_strike: f64) -> f64 {
+        // Can't determine call vs put statically
+        panic!("Use compute() instance method for Options enum")}
     }
-}
+
 pub trait BlackScholesPrice {
     fn bs_pricing(&self) -> f64;
 }
@@ -529,5 +508,59 @@ pub trait BlackScholesPrice {
 impl BlackScholesPrice for Options {
     fn bs_pricing(&self) -> f64 {
         self.bs_pricing()
+    }
+}
+
+impl MonteCarloParameters for Options {
+    fn spot_price(&self) -> f64 {
+        self.spot_price()
+    }
+
+    fn volatility(&self) -> f64 {
+        self.volatility()
+    }
+
+    fn risk_free_rate(&self) -> f64 {
+        self.risk_free_rate()
+    }
+
+    fn time_to_maturity(&self) -> f64 {
+        self.time_to_maturity()
+    }
+}
+
+impl MonteCarloParameters for Call {
+    fn spot_price(&self) -> f64 {
+        self.spot_price
+    }
+
+    fn volatility(&self) -> f64 {
+        self.volatility
+    }
+
+    fn risk_free_rate(&self) -> f64 {
+        self.risk_free_rate
+    }
+
+    fn time_to_maturity(&self) -> f64 {
+        self.time_to_maturity
+    }
+}
+
+impl MonteCarloParameters for Put {
+    fn spot_price(&self) -> f64 {
+        self.spot_price
+    }
+
+    fn volatility(&self) -> f64 {
+        self.volatility
+    }
+
+    fn risk_free_rate(&self) -> f64 {
+        self.risk_free_rate
+    }
+
+    fn time_to_maturity(&self) -> f64 {
+        self.time_to_maturity
     }
 }
