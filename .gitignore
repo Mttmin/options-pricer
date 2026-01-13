@@ -11,3 +11,6 @@
 
 # Ignore documentation 
 /documentation/
+
+# Ignore data handler API keys
+api_keys.json
