@@ -7,8 +7,8 @@ pub struct Position {
 
 impl Payoff for Position {
     #[inline(always)]
-    fn compute(&self, spot_t: f64, strike: f64) -> f64 {
-        self.option.compute(spot_t, strike) * self.weight as f64
+    fn compute(&self, spot_t: f64) -> f64 {
+        self.option.compute(spot_t) * self.weight as f64
     }
 
     fn compute_static(_spot_t: f64, _strike: f64) -> f64 {
@@ -586,12 +586,11 @@ impl BlackScholesPrice for OptionSpreads {
 
 impl crate::Payoff for OptionSpreads {
     #[inline(always)]
-    fn compute(&self, spot_t: f64, _strike: f64) -> f64 {
+    fn compute(&self, spot_t: f64) -> f64 {
         self.components
             .iter()
             .map(|pos| {
-                let option_strike = pos.option.strike_price();
-                pos.option.compute(spot_t, option_strike) * pos.weight as f64
+                pos.option.compute(spot_t) * pos.weight as f64
             })
             .sum()
     }
@@ -602,9 +601,14 @@ impl crate::Payoff for OptionSpreads {
         )
     }
 }
+pub trait MonteCarloParameters {
+    fn spot_price(&self) -> f64;
+    fn volatility(&self) -> f64;
+    fn risk_free_rate(&self) -> f64;
+    fn time_to_maturity(&self) -> f64;
+}
 
-// Implement MonteCarloParameters for OptionSpreads
-impl crate::MonteCarloParameters for OptionSpreads {
+impl MonteCarloParameters for OptionSpreads {
     fn spot_price(&self) -> f64 {
         // Extract from first component (all components share these parameters)
         self.components[0].option.spot_price()

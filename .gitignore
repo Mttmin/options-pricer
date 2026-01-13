@@ -11,3 +11,6 @@
 
 # Ignore documentation 
 /documentation/
+
+# Ignore api keys and secrets
+api_keys.json
