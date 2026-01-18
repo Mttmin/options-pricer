@@ -1,4 +1,5 @@
 pub mod fetcher;
+pub mod volatility;
 use options::{BlackScholesPrice, Options, black_scholes::black_scholes_price, exotics::ConvertibleBond};
 
 #[tokio::main]
@@ -34,16 +35,13 @@ async fn main() {
     println!("Convertible Bond Price: {:.4}", cb_price);
 
     // Demonstrate live market data fetching
-    println!("\n Live Market Demo ");
+    println!("\n Live Market");
 
     match fetcher::load_api_keys() {
-        Ok(config) => {
+        Ok(_config) => {
             println!("API keys loaded successfully!");
 
-            let fetcher = fetcher::DataFetcher::new(
-                config.alpha_vantage.clone(),
-                config.finnhub.clone(),
-            );
+            let fetcher = fetcher::DataFetcher::new();
 
             let symbol = "AAPL";
             let lookback_days = 180;

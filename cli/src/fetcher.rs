@@ -14,6 +14,8 @@ pub struct ApiConfig {
     pub finnhub: String,
     #[serde(rename = "Finnhub_secret")]
     pub finnhub_secret: String,
+    #[serde(rename = "FRED")]
+    pub fred: String,
 }
 
 /// Load API keys from api_keys.json in the project root
@@ -47,17 +49,17 @@ pub fn load_api_keys() -> Result<ApiConfig, Box<dyn std::error::Error>> {
 
 #[derive(Debug, Deserialize)]
 struct FinnhubQuote {
-    c: f64,   // current price
+    c: f64, // current price
     #[serde(rename = "h")]
-    _h: f64,  // high
+    _h: f64, // high
     #[serde(rename = "l")]
-    _l: f64,  // low
+    _l: f64, // low
     #[serde(rename = "o")]
-    _o: f64,  // open
+    _o: f64, // open
     #[serde(rename = "pc")]
     _pc: f64, // previous close
     #[serde(rename = "t")]
-    _t: i64,  // timestamp
+    _t: i64, // timestamp
 }
 
 #[derive(Clone, Debug)]
@@ -75,13 +77,31 @@ pub struct DataFetcher {
     finnhub_key: String,
     client: reqwest::Client,
     cache: Arc<RwLock<HashMap<String, MarketData>>>,
+    fred_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Observation {
+    date: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FredResponse {
+    observations: Vec<Observation>,
 }
 
 impl DataFetcher {
-    pub fn new(alpha_vantage_key: String, finnhub_key: String) -> Self {
+    pub fn new() -> Self {
+        // get the API keys
+        let config = load_api_keys().expect("failed to load API keys");
+        let alpha_vantage = config.alpha_vantage;
+        let finnhub = config.finnhub;
+        let fred_key = config.fred;
         Self {
-            alpha_vantage_key,
-            finnhub_key: finnhub_key,
+            alpha_vantage_key: alpha_vantage,
+            finnhub_key:finnhub,
+            fred_key: fred_key,
             client: reqwest::Client::new(),
             cache: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -105,7 +125,7 @@ impl DataFetcher {
             .await?;
         Ok(response)
     }
-    
+
     #[allow(dead_code)]
     /// returns 15 min delayed price from Alpha Vantage
     async fn get_current_price_alpha_vantage(
@@ -128,10 +148,7 @@ impl DataFetcher {
         // Find the "Global Quote" key (may have suffix like "- DATA DELAYED BY 15 MINUTES")
         let global_quote_key = response
             .as_object()
-            .and_then(|obj| {
-                obj.keys()
-                    .find(|k| k.starts_with("Global Quote"))
-            })
+            .and_then(|obj| obj.keys().find(|k| k.starts_with("Global Quote")))
             .ok_or("Invalid response format - missing Global Quote key")?;
 
         let price_str = response[global_quote_key]["05. price"]
@@ -164,15 +181,15 @@ impl DataFetcher {
         }
     }
 
-    async fn get_historical_data(
+    pub async fn get_historical_data(
         &self,
         symbol: &str,
         lookback_days: usize,
     ) -> Result<(Vec<(String, f64)>, f64), Box<dyn std::error::Error>> {
         let url = format!(
-        "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={}&outputsize=full&apikey={}",
-        symbol, self.alpha_vantage_key
-    );
+            "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={}&outputsize=full&apikey={}",
+            symbol, self.alpha_vantage_key
+        );
 
         let response = self
             .client
@@ -234,7 +251,7 @@ impl DataFetcher {
         Ok((prices, yesterday_close))
     }
 
-    fn calculate_volatility(prices: &[(String, f64)]) -> f64 {
+    pub fn calculate_volatility(prices: &[(String, f64)]) -> f64 {
         if prices.len() < 2 {
             return 0.0;
         }
@@ -250,6 +267,58 @@ impl DataFetcher {
             / (log_returns.len() - 1) as f64;
 
         variance.sqrt() * (252.0_f64).sqrt() // correction for trading days
+    }
+
+    /// Fetch the most recent VIX closing value from FRED API
+    ///
+    /// Uses the VIXCLS series from the Federal Reserve Economic Data API.
+    /// Returns VIX value as a percentage
+    pub async fn fetch_fred_vix(
+        &self,
+        num_days: u16,
+    ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+        let url = format!(
+            "https://api.stlouisfed.org/fred/series/observations?series_id=VIXCLS&api_key={}&file_type=json&limit={}&sort_order=desc",
+            &self.fred_key, &num_days
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json::<FredResponse>()
+            .await?;
+
+        // Check if we received any observations
+        if response.observations.is_empty() {
+            return Err("No VIX observations found in FRED response".into());
+        }
+
+        let mut vix_values: Vec<f64> = Vec::new();
+        for i in 0..num_days {
+            // With &sort_order=desc, latest observation are at the beginning
+            let observation = &response.observations[i as usize];
+
+            // Parse the value
+            let vix_value: f64 = observation.value.parse().map_err(|e| {
+                format!(
+                    "Failed to parse VIX value '{}' from date {}: {}",
+                    observation.value, observation.date, e
+                )
+            })?;
+            // // Check : VIX typically ranges 10-80, cannot go under 0, but can spike to 150+ in extreme markets
+            // if vix_value <= 0.0 || vix_value > 70.0 {
+            //     return Err(format!(
+            //         "VIX value {:.2} from {} is outside expected range (0-70)",
+            //         vix_value, observation.date
+            //     )
+            //     .into());
+            // }
+            vix_values.push(vix_value);
+        }
+
+        Ok(vix_values)
     }
 
     fn detect_corporate_action(
@@ -292,10 +361,10 @@ impl DataFetcher {
 
         // Fetch from both APIs in parallel if we need both
         if needs_vol_update && needs_price_update {
-            println!(
-                "Fetching both price and volatility for {} in parallel...",
-                symbol
-            );
+            // println!(
+            //     "Fetching both price and volatility for {} in parallel...",
+            //     symbol
+            // );
 
             let hist_future = self.get_historical_data(symbol, lookback_days);
             let price_future = self.get_current_price_with_fallback(symbol);
@@ -330,10 +399,10 @@ impl DataFetcher {
             data.last_price_update = now;
         } else if needs_vol_update {
             // Only need historical data
-            println!(
-                "Fetching only volatility for {} (already have recent price)...",
-                symbol
-            );
+            // eprintln!(
+            //     "Fetching only volatility for {} (already have recent price)...",
+            //     symbol
+            // );
 
             let (prices, yesterday_close) = self.get_historical_data(symbol, lookback_days).await?;
             data.volatility = Self::calculate_volatility(&prices);
@@ -341,10 +410,10 @@ impl DataFetcher {
             data.vol_calculation_date = today;
         } else if needs_price_update {
             // Only need current price
-            println!(
-                "Fetching only price for {} (already have today's volatility)...",
-                symbol
-            );
+            // eprintln!(
+            //     "Fetching only price for {} (already have today's volatility)...",
+            //     symbol
+            // );
 
             let current_price = self.get_current_price_with_fallback(symbol).await?;
 
@@ -365,7 +434,7 @@ impl DataFetcher {
 
             data.last_price_update = now;
         } else {
-            println!("Using cached data for {} (no updates needed)", symbol);
+            // eprintln!("Using cached data for {} (no updates needed)", symbol);
         }
 
         // Update cache
@@ -444,7 +513,12 @@ mod tests {
                 }
             }
             Value::String(s) => {
-                println!("{}{}String: {:?}", indent, path, s.chars().take(50).collect::<String>());
+                println!(
+                    "{}{}String: {:?}",
+                    indent,
+                    path,
+                    s.chars().take(50).collect::<String>()
+                );
             }
             Value::Number(n) => {
                 println!("{}{}Number: {}", indent, path, n);
@@ -535,8 +609,14 @@ mod tests {
         println!("\nField presence check:");
         println!("  'Global Quote': {}", json.get("Global Quote").is_some());
         if let Some(quote) = json.get("Global Quote") {
-            println!("  'Global Quote'.'05. price': {}", quote.get("05. price").is_some());
-            println!("  'Global Quote'.'01. symbol': {}", quote.get("01. symbol").is_some());
+            println!(
+                "  'Global Quote'.'05. price': {}",
+                quote.get("05. price").is_some()
+            );
+            println!(
+                "  'Global Quote'.'01. symbol': {}",
+                quote.get("01. symbol").is_some()
+            );
         }
     }
 
@@ -553,7 +633,10 @@ mod tests {
             symbol, config.alpha_vantage
         );
 
-        println!("\nFetching Alpha Vantage TIME_SERIES_DAILY_ADJUSTED for {}...", symbol);
+        println!(
+            "\nFetching Alpha Vantage TIME_SERIES_DAILY_ADJUSTED for {}...",
+            symbol
+        );
         println!("URL: {}", url.replace(&config.alpha_vantage, "***"));
         println!("Note: Using outputsize=compact (last 100 days) to reduce response size");
 
@@ -590,7 +673,10 @@ mod tests {
 
         // Check for expected fields
         println!("\nField presence check:");
-        println!("  'Time Series (Daily)': {}", json.get("Time Series (Daily)").is_some());
+        println!(
+            "  'Time Series (Daily)': {}",
+            json.get("Time Series (Daily)").is_some()
+        );
 
         if let Some(time_series) = json.get("Time Series (Daily)") {
             if let Some(map) = time_series.as_object() {
@@ -605,7 +691,10 @@ mod tests {
                             println!("    - {}", key);
                         }
                     }
-                    println!("  Has '5. adjusted close': {}", data.get("5. adjusted close").is_some());
+                    println!(
+                        "  Has '5. adjusted close': {}",
+                        data.get("5. adjusted close").is_some()
+                    );
                 }
             }
         }
@@ -630,8 +719,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_finnhub_deserialize() {
-        let config = get_test_api_keys();
-        let fetcher = DataFetcher::new(config.alpha_vantage, config.finnhub);
+        let fetcher = DataFetcher::new();
 
         let symbols = vec!["AAPL", "MSFT"];
 
@@ -657,12 +745,15 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_alpha_vantage_quote_parse() {
-        let config = get_test_api_keys();
-        let fetcher = DataFetcher::new(config.alpha_vantage, config.finnhub);
+        let fetcher = DataFetcher::new();
+
 
         let symbol = "AAPL";
 
-        println!("\nTesting Alpha Vantage GLOBAL_QUOTE parsing for {}...", symbol);
+        println!(
+            "\nTesting Alpha Vantage GLOBAL_QUOTE parsing for {}...",
+            symbol
+        );
 
         match fetcher.get_current_price_alpha_vantage(symbol).await {
             Ok(price) => {
@@ -679,13 +770,16 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_alpha_vantage_historical_parse() {
-        let config = get_test_api_keys();
-        let fetcher = DataFetcher::new(config.alpha_vantage, config.finnhub);
+        let fetcher = DataFetcher::new();
+
 
         let symbol = "AAPL";
         let lookback = 30;
 
-        println!("\nTesting Alpha Vantage TIME_SERIES_DAILY_ADJUSTED parsing for {}...", symbol);
+        println!(
+            "\nTesting Alpha Vantage TIME_SERIES_DAILY_ADJUSTED parsing for {}...",
+            symbol
+        );
         println!("Requesting {} days of history", lookback);
 
         match fetcher.get_historical_data(symbol, lookback).await {
@@ -716,8 +810,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_update_symbol_integration() {
-        let config = get_test_api_keys();
-        let fetcher = DataFetcher::new(config.alpha_vantage, config.finnhub);
+        let fetcher = DataFetcher::new();
+
 
         let symbol = "AAPL";
         let lookback_days = 30;
@@ -728,9 +822,18 @@ mod tests {
             Ok(market_data) => {
                 println!("Successfully fetched market data:");
                 // Sanity checks
-                assert!(market_data.spot_price > 0.0, "Spot price should be positive");
-                assert!(market_data.volatility > 0.0, "Volatility should be positive");
-                assert!(market_data.yesterday_adjusted_close > 0.0, "Yesterday close should be positive");
+                assert!(
+                    market_data.spot_price > 0.0,
+                    "Spot price should be positive"
+                );
+                assert!(
+                    market_data.volatility > 0.0,
+                    "Volatility should be positive"
+                );
+                assert!(
+                    market_data.yesterday_adjusted_close > 0.0,
+                    "Yesterday close should be positive"
+                );
             }
             Err(e) => {
                 println!("Integration test failed: {}", e);
@@ -774,6 +877,19 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn test_fetch_fred_vix() {
+        let fetcher = DataFetcher::new();
+
+
+        match fetcher.fetch_fred_vix(1).await {
+            Ok(vix_value) => {
+                println!("Successfully fetched VIX value from FRED: {:.2}", vix_value[0]);
+            }
+            Err(e) => {
+                println!("Failed to fetch VIX from FRED: {}", e);
+                panic!("fetch_fred_vix failed: {}", e);
+            }
+        }
+    }
 }
-
-
