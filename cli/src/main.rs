@@ -82,7 +82,8 @@ async fn main() {
                     eprintln!("Note: API rate limits may apply. Alpha Vantage has a limit of 5 calls/minute for free tier.");
                 }
             }
-        },
+            let vol = volatility::vix_volatility("AAPL", fetcher,120).await.unwrap();
+            println!("{}", vol);}
         Err(e) => {
             eprintln!("Failed to load API keys: {}", e);
             eprintln!("To use live market data, ensure api_keys.json exists in the project root.");

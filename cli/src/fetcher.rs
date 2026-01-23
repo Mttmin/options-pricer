@@ -261,6 +261,11 @@ impl DataFetcher {
             .map(|pair| (pair[1].1 / pair[0].1).ln())
             .collect();
 
+        // Need at least 2 log returns to calculate variance
+        if log_returns.len() < 2 {
+            return 0.0;
+        }
+
         let mean = log_returns.iter().sum::<f64>() / log_returns.len() as f64;
 
         let variance = log_returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
@@ -891,5 +896,17 @@ mod tests {
                 panic!("fetch_fred_vix failed: {}", e);
             }
         }
+    }
+
+    // Volatility Tests
+    #[test]
+    fn test_calculate_volatility() {
+        assert_eq!(DataFetcher::calculate_volatility(&vec![("2024-01-01".to_string(), 100.0); 4]), 0.0);
+        assert_eq!(DataFetcher::calculate_volatility(&vec![]), 0.0);
+        assert_eq!(DataFetcher::calculate_volatility(&vec![("1".to_string(), 100.0), ("2".to_string(), 102.0)]), 0.0);
+
+        let mut trend = vec![("2024-01-01".to_string(), 100.0)];
+        for i in 1..31 { trend.push((format!("{}", i), trend.last().unwrap().1 * 1.01)); }
+        assert!(DataFetcher::calculate_volatility(&trend) < 0.05);
     }
 }
