@@ -525,8 +525,8 @@ impl DataFetcher {
         let url = match endpoint {
             OptionsEndpoint::Historical { date } => {
                 let mut u = format!(
-                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}&apikey={}",
-                    symbol, self.alpha_vantage_key
+                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}",
+                    symbol
                 );
                 if let Some(d) = date {
                     u.push_str(&format!("&date={}", d));
@@ -535,8 +535,8 @@ impl DataFetcher {
             }
             OptionsEndpoint::Realtime => {
                 format!(
-                    "https://www.alphavantage.co/query?function=REALTIME_OPTIONS&symbol={}&require_greeks=true&apikey={}",
-                    symbol, self.alpha_vantage_key
+                    "https://www.alphavantage.co/query?function=REALTIME_OPTIONS&symbol={}&require_greeks=true",
+                    symbol
                 )
             }
         };
@@ -544,6 +544,7 @@ impl DataFetcher {
         let response = self
             .client
             .get(&url)
+            .header("X-API-KEY", &self.alpha_vantage_key)
             .send()
             .await?
             .json::<serde_json::Value>()
