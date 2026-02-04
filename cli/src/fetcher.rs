@@ -1239,14 +1239,16 @@ mod tests {
         let config = get_test_api_keys();
         let client = reqwest::Client::new();
 
-        let url = format!(
-            "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol=IBM&apikey={}",
-            config.alpha_vantage
-        );
+        let url = "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol=IBM";
 
         println!("\nFetching Alpha Vantage HISTORICAL_OPTIONS for IBM...");
 
-        let response = client.get(&url).send().await.expect("Request failed");
+        let response = client
+            .get(url)
+            .header("X-API-Key", &config.alpha_vantage)
+            .send()
+            .await
+            .expect("Request failed");
         let status = response.status();
         println!("Status: {}", status);
 
