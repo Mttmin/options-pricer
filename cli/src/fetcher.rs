@@ -117,13 +117,14 @@ impl DataFetcher {
         symbol: &str,
     ) -> Result<FinnhubQuote, Box<dyn std::error::Error>> {
         let url = format!(
-            "https://finnhub.io/api/v1/quote?symbol={}&token={}",
-            symbol, self.finnhub_key
+            "https://finnhub.io/api/v1/quote?symbol={}",
+            symbol
         );
 
         let response = self
             .client
             .get(&url)
+            .header("X-Finnhub-Token", &self.finnhub_key)
             .send()
             .await?
             .json::<FinnhubQuote>()
