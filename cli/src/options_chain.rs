@@ -133,10 +133,9 @@ impl OptionChain {
         let mut smiles_by_expiry: HashMap<NaiveDate, Vec<SmilePoint>> = HashMap::new();
 
         for contract in &self.contracts {
-            if let Some(expiries) = expirations {
-                if !expiries.contains(&contract.expiration) {
+            if let Some(expiries) = expirations
+                && !expiries.contains(&contract.expiration) {
                     continue;
-                }
             }
 
             if contract.implied_volatility <= 0.0 || contract.open_interest < min_open_interest {

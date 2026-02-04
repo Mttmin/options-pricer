@@ -95,6 +95,12 @@ struct FredResponse {
     observations: Vec<Observation>,
 }
 
+impl Default for DataFetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DataFetcher {
     pub fn new() -> Self {
         // get the API keys
@@ -104,8 +110,8 @@ impl DataFetcher {
         let fred_key = config.fred;
         Self {
             alpha_vantage_key: alpha_vantage,
-            finnhub_key:finnhub,
-            fred_key: fred_key,
+            finnhub_key: finnhub,
+            fred_key,
             client: reqwest::Client::new(),
             cache: Arc::new(RwLock::new(HashMap::new())),
             options_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -635,14 +641,10 @@ impl DataFetcher {
     ) -> Result<OptionContract, Box<dyn std::error::Error>> {
         let parse_f64 = |key: &str| -> f64 {
             item.get(key)
-                .map(|v| {
-                    if let Some(s) = v.as_str() {
-                        s.parse::<f64>().unwrap_or(0.0)
-                    } else if let Some(n) = v.as_f64() {
-                        n
-                    } else {
-                        0.0
-                    }
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| v.as_f64())
                 })
                 .unwrap_or(0.0)
         };
@@ -663,14 +665,10 @@ impl DataFetcher {
 
         let parse_u64 = |key: &str| -> u64 {
             item.get(key)
-                .map(|v| {
-                    if let Some(s) = v.as_str() {
-                        s.parse::<u64>().unwrap_or(0)
-                    } else if let Some(n) = v.as_u64() {
-                        n
-                    } else {
-                        0
-                    }
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| v.as_u64())
                 })
                 .unwrap_or(0)
         };
