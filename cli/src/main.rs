@@ -1,4 +1,5 @@
 pub mod fetcher;
+pub mod options_chain;
 pub mod volatility;
 use options::{BlackScholesPrice, Options, black_scholes::black_scholes_price, exotics::ConvertibleBond};
 

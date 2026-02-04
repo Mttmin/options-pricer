@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use crate::options_chain::{OptionChain, OptionContract, OptionType, OptionsEndpoint};
 
 /// Configuration struct for API keys loaded from api_keys.json
 #[derive(Debug, Deserialize)]
@@ -70,6 +71,8 @@ pub struct MarketData {
     pub vol_calculation_date: NaiveDate,
     pub yesterday_adjusted_close: f64,
     pub corporate_action_detected: bool,
+    /// Implied volatility from option chain (None if not fetched)
+    pub implied_volatility: Option<f64>,
 }
 
 pub struct DataFetcher {
@@ -78,6 +81,7 @@ pub struct DataFetcher {
     client: reqwest::Client,
     cache: Arc<RwLock<HashMap<String, MarketData>>>,
     fred_key: String,
+    options_cache: Arc<RwLock<HashMap<String, OptionChain>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +108,7 @@ impl DataFetcher {
             fred_key: fred_key,
             client: reqwest::Client::new(),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            options_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -362,6 +367,7 @@ impl DataFetcher {
             vol_calculation_date: NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
             yesterday_adjusted_close: 0.0,
             corporate_action_detected: false,
+            implied_volatility: None,
         });
 
         // Fetch from both APIs in parallel if we need both
@@ -484,6 +490,319 @@ impl DataFetcher {
         lookback_days: usize,
     ) -> Result<MarketData, Box<dyn std::error::Error>> {
         self.update_single_symbol(symbol, lookback_days).await
+    }
+
+    /// Fetch option chain data from Alpha Vantage.
+    ///
+    /// Supports both HISTORICAL_OPTIONS (all tiers) and REALTIME_OPTIONS (premium).
+    /// Returns the full chain with per-contract IV and Greeks.
+    /// Automatically computes summary_implied_volatility on the result.
+    pub async fn fetch_option_chain(
+        &self,
+        symbol: &str,
+        endpoint: OptionsEndpoint,
+    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+        let cache_key = match endpoint {
+            OptionsEndpoint::Historical { date } => match date {
+                Some(d) => format!("{}:hist:{}", symbol, d),
+                None => format!("{}:hist:latest", symbol),
+            },
+            OptionsEndpoint::Realtime => format!("{}:realtime", symbol),
+        };
+
+        // Check cache (15-minute TTL)
+        {
+            let cache = self.options_cache.read().await;
+            if let Some(cached) = cache.get(&cache_key) {
+                let now = Utc::now();
+                if (now - cached.fetch_timestamp).num_minutes() < 15 {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        let url = match endpoint {
+            OptionsEndpoint::Historical { date } => {
+                let mut u = format!(
+                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}&apikey={}",
+                    symbol, self.alpha_vantage_key
+                );
+                if let Some(d) = date {
+                    u.push_str(&format!("&date={}", d));
+                }
+                u
+            }
+            OptionsEndpoint::Realtime => {
+                format!(
+                    "https://www.alphavantage.co/query?function=REALTIME_OPTIONS&symbol={}&require_greeks=true&apikey={}",
+                    symbol, self.alpha_vantage_key
+                )
+            }
+        };
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+
+        // Standard Alpha Vantage error checking
+        if let Some(note) = response.get("Note") {
+            return Err(format!(
+                "Alpha Vantage rate limit exceeded: {}",
+                note.as_str().unwrap_or("unknown")
+            )
+            .into());
+        }
+        if let Some(error) = response.get("Error Message") {
+            return Err(format!(
+                "Alpha Vantage error: {}",
+                error.as_str().unwrap_or("unknown")
+            )
+            .into());
+        }
+        if let Some(info) = response.get("Information") {
+            return Err(format!(
+                "Alpha Vantage API info (possible premium-only endpoint): {}",
+                info.as_str().unwrap_or("unknown")
+            )
+            .into());
+        }
+
+        let chain = Self::parse_options_response(symbol, &response)?;
+
+        // Cache the result
+        {
+            let mut cache = self.options_cache.write().await;
+            cache.insert(cache_key, chain.clone());
+        }
+
+        Ok(chain)
+    }
+
+    /// Parse the Alpha Vantage options JSON response into OptionChain.
+    fn parse_options_response(
+        symbol: &str,
+        response: &serde_json::Value,
+    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+        let data_array = response
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or("Invalid response format - missing 'data' array")?;
+
+        let mut contracts: Vec<OptionContract> = Vec::with_capacity(data_array.len());
+
+        for item in data_array {
+            match Self::parse_option_contract(item) {
+                Ok(contract) => contracts.push(contract),
+                Err(e) => {
+                    eprintln!("WARNING: Skipping contract due to parse error: {}", e);
+                }
+            }
+        }
+
+        let underlying_price = Self::estimate_underlying_from_chain(&contracts);
+
+        // Try to extract data date from response metadata
+        let data_date = response
+            .get("meta")
+            .and_then(|m| m.get("date"))
+            .and_then(|d| d.as_str())
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .unwrap_or_else(|| Utc::now().date_naive());
+
+        let mut chain = OptionChain {
+            symbol: symbol.to_string(),
+            underlying_price,
+            fetch_timestamp: Utc::now(),
+            data_date,
+            contracts,
+            summary_implied_volatility: None,
+        };
+
+        chain.compute_summary_iv();
+
+        Ok(chain)
+    }
+
+    /// Parse a single contract JSON object from the Alpha Vantage response.
+    fn parse_option_contract(
+        item: &serde_json::Value,
+    ) -> Result<OptionContract, Box<dyn std::error::Error>> {
+        let parse_f64 = |key: &str| -> f64 {
+            item.get(key)
+                .map(|v| {
+                    if let Some(s) = v.as_str() {
+                        s.parse::<f64>().unwrap_or(0.0)
+                    } else if let Some(n) = v.as_f64() {
+                        n
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(0.0)
+        };
+
+        let parse_optional_f64 = |key: &str| -> Option<f64> {
+            item.get(key).and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    if s == "N/A" || s.is_empty() {
+                        None
+                    } else {
+                        s.parse::<f64>().ok()
+                    }
+                } else {
+                    v.as_f64()
+                }
+            })
+        };
+
+        let parse_u64 = |key: &str| -> u64 {
+            item.get(key)
+                .map(|v| {
+                    if let Some(s) = v.as_str() {
+                        s.parse::<u64>().unwrap_or(0)
+                    } else if let Some(n) = v.as_u64() {
+                        n
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0)
+        };
+
+        let type_str = item
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let option_type = match type_str.to_lowercase().as_str() {
+            "call" => OptionType::Call,
+            "put" => OptionType::Put,
+            other => return Err(format!("Unknown option type: '{}'", other).into()),
+        };
+
+        let expiration_str = item
+            .get("expiration")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing expiration field")?;
+
+        let expiration = NaiveDate::parse_from_str(expiration_str, "%Y-%m-%d")
+            .map_err(|e| format!("Failed to parse expiration '{}': {}", expiration_str, e))?;
+
+        let in_the_money_str = item
+            .get("in_the_money")
+            .and_then(|v| v.as_str())
+            .unwrap_or("FALSE");
+
+        Ok(OptionContract {
+            contract_id: item
+                .get("contractID")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            symbol: item
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            expiration,
+            strike: parse_f64("strike"),
+            option_type,
+            last: parse_f64("last"),
+            mark: parse_f64("mark"),
+            bid: parse_f64("bid"),
+            ask: parse_f64("ask"),
+            volume: parse_u64("volume"),
+            open_interest: parse_u64("open_interest"),
+            implied_volatility: parse_f64("implied_volatility"),
+            delta: parse_optional_f64("delta"),
+            gamma: parse_optional_f64("gamma"),
+            theta: parse_optional_f64("theta"),
+            vega: parse_optional_f64("vega"),
+            rho: parse_optional_f64("rho"),
+            in_the_money: in_the_money_str.eq_ignore_ascii_case("TRUE"),
+        })
+    }
+
+    /// Estimate underlying price from the chain using the highest open-interest contract.
+    fn estimate_underlying_from_chain(contracts: &[OptionContract]) -> f64 {
+        if contracts.is_empty() {
+            return 0.0;
+        }
+        contracts
+            .iter()
+            .max_by_key(|c| c.open_interest)
+            .map(|c| c.strike)
+            .unwrap_or(0.0)
+    }
+
+    /// Fetch option chain implied volatility and optionally update MarketData cache.
+    ///
+    /// This is a standalone volatility source. The caller decides whether to use
+    /// historical vol, EMA vol, VIX-correlated vol, or this market IV.
+    pub async fn fetch_implied_volatility(
+        &self,
+        symbol: &str,
+        endpoint: OptionsEndpoint,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let chain = self.fetch_option_chain(symbol, endpoint).await?;
+
+        let iv = chain
+            .summary_implied_volatility
+            .ok_or("Could not compute summary implied volatility from chain")?;
+
+        // Update the cached MarketData with IV if present
+        {
+            let mut cache = self.cache.write().await;
+            if let Some(market_data) = cache.get_mut(symbol) {
+                market_data.implied_volatility = Some(iv);
+            }
+        }
+
+        Ok(iv)
+    }
+
+    /// Fetch option chain with a known underlying price (e.g. from a live Finnhub quote).
+    /// Recomputes summary IV with the correct underlying.
+    pub async fn fetch_option_chain_with_underlying(
+        &self,
+        symbol: &str,
+        endpoint: OptionsEndpoint,
+        underlying_price: f64,
+    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+        let mut chain = self.fetch_option_chain(symbol, endpoint).await?;
+        chain.underlying_price = underlying_price;
+        chain.compute_summary_iv();
+        Ok(chain)
+    }
+
+    /// Try REALTIME_OPTIONS first, fall back to HISTORICAL_OPTIONS on premium error.
+    pub async fn fetch_option_chain_with_fallback(
+        &self,
+        symbol: &str,
+    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+        match self
+            .fetch_option_chain(symbol, OptionsEndpoint::Realtime)
+            .await
+        {
+            Ok(chain) => Ok(chain),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("premium") || err_str.contains("Information") {
+                    eprintln!(
+                        "WARNING: REALTIME_OPTIONS not available for {} ({}). Falling back to HISTORICAL_OPTIONS.",
+                        symbol, err_str
+                    );
+                    self.fetch_option_chain(symbol, OptionsEndpoint::Historical { date: None })
+                        .await
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -719,7 +1038,7 @@ mod tests {
         }
     }
 
-    // ==================== Tier 2: Deserialization Tests ====================
+    // Deserialization Tests 
 
     #[tokio::test]
     #[ignore]
@@ -810,7 +1129,7 @@ mod tests {
         }
     }
 
-    // ==================== Tier 3: Integration and Smoke Tests ====================
+    // Integration and Smoke Tests
 
     #[tokio::test]
     #[ignore]
@@ -908,5 +1227,152 @@ mod tests {
         let mut trend = vec![("2024-01-01".to_string(), 100.0)];
         for i in 1..31 { trend.push((format!("{}", i), trend.last().unwrap().1 * 1.01)); }
         assert!(DataFetcher::calculate_volatility(&trend) < 0.05);
+    }
+
+    // Options Chain Tests
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_historical_options_raw() {
+        let config = get_test_api_keys();
+        let client = reqwest::Client::new();
+
+        let url = format!(
+            "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol=IBM&apikey={}",
+            config.alpha_vantage
+        );
+
+        println!("\nFetching Alpha Vantage HISTORICAL_OPTIONS for IBM...");
+
+        let response = client.get(&url).send().await.expect("Request failed");
+        let status = response.status();
+        println!("Status: {}", status);
+
+        let json: Value = response.json().await.expect("Failed to parse as JSON");
+
+        // Print top-level structure
+        println!("\nTop-level keys:");
+        if let Some(obj) = json.as_object() {
+            for key in obj.keys() {
+                println!("  - {}", key);
+            }
+        }
+
+        // Inspect first few contracts
+        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+            println!("\nNumber of contracts: {}", data.len());
+            for (i, contract) in data.iter().take(3).enumerate() {
+                println!("\n--- Contract {} ---", i + 1);
+                println!("{}", serde_json::to_string_pretty(contract).unwrap());
+            }
+        } else {
+            println!("\nFull response:");
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_option_chain_historical() {
+        use crate::options_chain::OptionsEndpoint;
+
+        let fetcher = DataFetcher::new();
+        let chain = fetcher
+            .fetch_option_chain("IBM", OptionsEndpoint::Historical { date: None })
+            .await
+            .expect("Failed to fetch option chain");
+
+        assert!(!chain.contracts.is_empty(), "Chain should have contracts");
+        println!("Fetched {} contracts for {}", chain.contracts.len(), chain.symbol);
+        println!("Underlying price estimate: ${:.2}", chain.underlying_price);
+        println!("Data date: {}", chain.data_date);
+
+        if let Some(iv) = chain.summary_implied_volatility {
+            println!("Summary IV: {:.2}%", iv * 100.0);
+        } else {
+            println!("Could not compute summary IV");
+        }
+
+        // Print first few contracts
+        for contract in chain.contracts.iter().take(5) {
+            println!(
+                "  {:?} {} strike=${:.2} exp={} IV={:.4} OI={}",
+                contract.option_type, contract.symbol, contract.strike,
+                contract.expiration, contract.implied_volatility, contract.open_interest
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_implied_volatility() {
+        use crate::options_chain::OptionsEndpoint;
+
+        let fetcher = DataFetcher::new();
+        let iv = fetcher
+            .fetch_implied_volatility("IBM", OptionsEndpoint::Historical { date: None })
+            .await
+            .expect("Failed to fetch IV");
+
+        assert!(iv > 0.0 && iv < 2.0, "IV {:.4} outside reasonable range", iv);
+        println!("IBM implied volatility: {:.2}%", iv * 100.0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_realtime_options_premium_error() {
+        use crate::options_chain::OptionsEndpoint;
+
+        let fetcher = DataFetcher::new();
+        let result = fetcher
+            .fetch_option_chain("IBM", OptionsEndpoint::Realtime)
+            .await;
+
+        match result {
+            Ok(chain) => println!("Premium user: got {} contracts", chain.contracts.len()),
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("premium") || err.contains("Information"),
+                    "Error should indicate premium requirement: {}",
+                    err
+                );
+                println!("Expected premium error: {}", err);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_volatility_smile_extraction_live() {
+        use crate::options_chain::OptionsEndpoint;
+
+        let fetcher = DataFetcher::new();
+        let chain = fetcher
+            .fetch_option_chain("SPY", OptionsEndpoint::Historical { date: None })
+            .await
+            .expect("Failed to fetch SPY chain");
+
+        let smile = chain.extract_smile(None, 100);
+
+        println!("SPY Volatility Smile:");
+        println!("Underlying: ${:.2}", smile.underlying_price);
+        println!("Expirations: {}", smile.smiles_by_expiry.len());
+
+        for (expiry, points) in &smile.smiles_by_expiry {
+            println!("\n  Expiration: {}", expiry);
+            for p in points.iter().take(5) {
+                println!(
+                    "    Strike: ${:.2}, IV: {:.2}%, Type: {:?}, Moneyness: {:.3}",
+                    p.strike,
+                    p.implied_volatility * 100.0,
+                    p.option_type,
+                    p.moneyness
+                );
+            }
+            if points.len() > 5 {
+                println!("    ... ({} more points)", points.len() - 5);
+            }
+        }
     }
 }
