@@ -21,10 +21,10 @@ pub fn price_path(spot_0: f64, vol: f64, risk_free: f64, num_steps: u32, time_si
     result[0] = spot_0;
     let mut spot_t = spot_0;
     
-    for i in 1..=num_steps as usize {
+    for result_entry in result.iter_mut().skip(1) {
         let z = normal.sample(&mut rng);
         spot_t *= ((risk_free - vol * vol / 2.0) * delta_t + vol * z * sqrt_dt).exp();
-        result[i] = spot_t;
+        *result_entry = spot_t;
     }
     
     result

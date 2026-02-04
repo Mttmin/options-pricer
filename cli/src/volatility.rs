@@ -80,7 +80,7 @@ pub async fn vix_volatility(symbol: &str, data_fetcher:  DataFetcher, num_days: 
         eprintln!("Not using vix correlation as it is too low");
         return Err(latest_ema_vol)
     }
-    return Ok(last_vix*correlation + (1.0-correlation)*latest_ema_vol)
+    Ok(last_vix*correlation + (1.0-correlation)*latest_ema_vol)
 }
 #[cfg(test)]
 mod tests {

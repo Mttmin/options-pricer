@@ -192,16 +192,16 @@ impl OptionSpreads {
             time_to_maturity,
             dividend_yield,
         );
-        let mut spreads: Vec<Position> = Vec::new();
-
-        spreads.push(Position {
-            option: call,
-            weight: 1.0,
-        });
-        spreads.push(Position {
-            option: put,
-            weight: 2.0,
-        });
+        let spreads = vec![
+            Position {
+                option: call,
+                weight: 1.0,
+            },
+            Position {
+                option: put,
+                weight: 2.0,
+            },
+        ];
         OptionSpreads {
             components: spreads,
         }
@@ -230,16 +230,16 @@ impl OptionSpreads {
             time_to_maturity,
             dividend_yield,
         );
-        let mut spreads: Vec<Position> = Vec::new();
-
-        spreads.push(Position {
-            option: call,
-            weight: 2.0,
-        });
-        spreads.push(Position {
-            option: put,
-            weight: 1.0,
-        });
+        let spreads = vec![
+            Position {
+                option: call,
+                weight: 2.0,
+            },
+            Position {
+                option: put,
+                weight: 1.0,
+            },
+        ];
         OptionSpreads {
             components: spreads,
         }
@@ -323,15 +323,16 @@ impl OptionSpreads {
             time_to_maturity,
             dividend_yield,
         );
-        let mut spreads: Vec<Position> = Vec::new();
-        spreads.push(Position {
-            option: call_1,
-            weight: 1.0,
-        });
-        spreads.push(Position {
-            option: call_2,
-            weight: -1.0,
-        });
+        let spreads = vec![
+            Position {
+                option: call_1,
+                weight: 1.0,
+            },
+            Position {
+                option: call_2,
+                weight: -1.0,
+            },
+        ];
         OptionSpreads {
             components: spreads,
         }
@@ -361,15 +362,16 @@ impl OptionSpreads {
             time_to_maturity,
             dividend_yield,
         );
-        let mut spreads: Vec<Position> = Vec::new();
-        spreads.push(Position {
-            option: put_1,
-            weight: 1.0,
-        });
-        spreads.push(Position {
-            option: put_2,
-            weight: -1.0,
-        });
+        let spreads = vec![
+            Position {
+                option: put_1,
+                weight: 1.0,
+            },
+            Position {
+                option: put_2,
+                weight: -1.0,
+            },
+        ];
         OptionSpreads {
             components: spreads,
         }
@@ -399,15 +401,16 @@ impl OptionSpreads {
             time_to_maturity,
             dividend_yield,
         );
-        let mut spreads: Vec<Position> = Vec::new();
-        spreads.push(Position {
-            option: call_1,
-            weight: -1.0,
-        });
-        spreads.push(Position {
-            option: call_2,
-            weight: 1.0,
-        });
+        let spreads = vec![
+            Position {
+                option: call_1,
+                weight: -1.0,
+            },
+            Position {
+                option: call_2,
+                weight: 1.0,
+            },
+        ];
         OptionSpreads {
             components: spreads,
         }
@@ -437,15 +440,16 @@ impl OptionSpreads {
             time_to_maturity,
             dividend_yield,
         );
-        let mut spreads: Vec<Position> = Vec::new();
-        spreads.push(Position {
-            option: put_1,
-            weight: -1.0,
-        });
-        spreads.push(Position {
-            option: put_2,
-            weight: 1.0,
-        });
+        let spreads = vec![
+            Position {
+                option: put_1,
+                weight: -1.0,
+            },
+            Position {
+                option: put_2,
+                weight: 1.0,
+            },
+        ];
         OptionSpreads {
             components: spreads,
         }
