@@ -1,4 +1,6 @@
 pub mod fetcher;
+pub mod options_chain;
+pub mod volatility;
 use options::{BlackScholesPrice, Options, black_scholes::black_scholes_price, exotics::ConvertibleBond};
 
 #[tokio::main]
@@ -34,16 +36,13 @@ async fn main() {
     println!("Convertible Bond Price: {:.4}", cb_price);
 
     // Demonstrate live market data fetching
-    println!("\n Live Market Demo ");
+    println!("\n Live Market");
 
     match fetcher::load_api_keys() {
-        Ok(config) => {
+        Ok(_config) => {
             println!("API keys loaded successfully!");
 
-            let fetcher = fetcher::DataFetcher::new(
-                config.alpha_vantage.clone(),
-                config.finnhub.clone(),
-            );
+            let fetcher = fetcher::DataFetcher::new();
 
             let symbol = "AAPL";
             let lookback_days = 180;
@@ -84,7 +83,8 @@ async fn main() {
                     eprintln!("Note: API rate limits may apply. Alpha Vantage has a limit of 5 calls/minute for free tier.");
                 }
             }
-        },
+            let vol = volatility::vix_volatility("AAPL", fetcher,120).await.unwrap();
+            println!("{}", vol);}
         Err(e) => {
             eprintln!("Failed to load API keys: {}", e);
             eprintln!("To use live market data, ensure api_keys.json exists in the project root.");
