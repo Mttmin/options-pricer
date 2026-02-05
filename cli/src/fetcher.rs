@@ -20,7 +20,7 @@ pub struct ApiConfig {
 }
 
 /// Load API keys from api_keys.json in the project root
-pub fn load_api_keys() -> Result<ApiConfig, Box<dyn std::error::Error>> {
+pub fn load_api_keys() -> Result<ApiConfig, Box<dyn std::error::Error + Send + Sync>> {
     let possible_paths = vec![
         "api_keys.json",    // Current directory
         "../api_keys.json", // Parent directory (when running from cli/)
@@ -75,6 +75,7 @@ pub struct MarketData {
     pub implied_volatility: Option<f64>,
 }
 
+#[derive(Clone)]
 pub struct DataFetcher {
     alpha_vantage_key: String,
     finnhub_key: String,
@@ -121,7 +122,7 @@ impl DataFetcher {
     async fn get_current_price_finnhub(
         &self,
         symbol: &str,
-    ) -> Result<FinnhubQuote, Box<dyn std::error::Error>> {
+    ) -> Result<FinnhubQuote, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://finnhub.io/api/v1/quote?symbol={}",
             symbol
@@ -143,7 +144,7 @@ impl DataFetcher {
     async fn get_current_price_alpha_vantage(
         &self,
         symbol: &str,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={}&entitlement=delayed&apikey={}",
             symbol, self.alpha_vantage_key
@@ -176,7 +177,7 @@ impl DataFetcher {
     async fn get_current_price_with_fallback(
         &self,
         symbol: &str,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         // Try Finnhub first
         match self.get_current_price_finnhub(symbol).await {
             Ok(quote) => Ok(quote.c),
@@ -197,7 +198,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         lookback_days: usize,
-    ) -> Result<(Vec<(String, f64)>, f64), Box<dyn std::error::Error>> {
+    ) -> Result<(Vec<(String, f64)>, f64), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={}&outputsize=full&apikey={}",
             symbol, self.alpha_vantage_key
@@ -293,7 +294,7 @@ impl DataFetcher {
     pub async fn fetch_fred_vix(
         &self,
         num_days: u16,
-    ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<f64>, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://api.stlouisfed.org/fred/series/observations?series_id=VIXCLS&api_key={}&file_type=json&limit={}&sort_order=desc",
             &self.fred_key, &num_days
@@ -351,7 +352,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         lookback_days: usize,
-    ) -> Result<MarketData, Box<dyn std::error::Error>> {
+    ) -> Result<MarketData, Box<dyn std::error::Error + Send + Sync>> {
         let now = Utc::now();
         let today = now.date_naive();
 
@@ -495,7 +496,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         lookback_days: usize,
-    ) -> Result<MarketData, Box<dyn std::error::Error>> {
+    ) -> Result<MarketData, Box<dyn std::error::Error + Send + Sync>> {
         self.update_single_symbol(symbol, lookback_days).await
     }
 
@@ -508,7 +509,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         endpoint: OptionsEndpoint,
-    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+    ) -> Result<OptionChain, Box<dyn std::error::Error + Send + Sync>> {
         let cache_key = match endpoint {
             OptionsEndpoint::Historical { date } => match date {
                 Some(d) => format!("{}:hist:{}", symbol, d),
@@ -531,8 +532,8 @@ impl DataFetcher {
         let url = match endpoint {
             OptionsEndpoint::Historical { date } => {
                 let mut u = format!(
-                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}",
-                    symbol
+                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}&apikey={}",
+                    symbol, self.alpha_vantage_key
                 );
                 if let Some(d) = date {
                     u.push_str(&format!("&date={}", d));
@@ -541,8 +542,8 @@ impl DataFetcher {
             }
             OptionsEndpoint::Realtime => {
                 format!(
-                    "https://www.alphavantage.co/query?function=REALTIME_OPTIONS&symbol={}&require_greeks=true",
-                    symbol
+                    "https://www.alphavantage.co/query?function=REALTIME_OPTIONS&symbol={}&require_greeks=true&apikey={}",
+                    symbol, self.alpha_vantage_key
                 )
             }
         };
@@ -550,7 +551,6 @@ impl DataFetcher {
         let response = self
             .client
             .get(&url)
-            .header("X-API-KEY", &self.alpha_vantage_key)
             .send()
             .await?
             .json::<serde_json::Value>()
@@ -594,7 +594,7 @@ impl DataFetcher {
     fn parse_options_response(
         symbol: &str,
         response: &serde_json::Value,
-    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+    ) -> Result<OptionChain, Box<dyn std::error::Error + Send + Sync>> {
         let data_array = response
             .get("data")
             .and_then(|d| d.as_array())
@@ -638,7 +638,7 @@ impl DataFetcher {
     /// Parse a single contract JSON object from the Alpha Vantage response.
     fn parse_option_contract(
         item: &serde_json::Value,
-    ) -> Result<OptionContract, Box<dyn std::error::Error>> {
+    ) -> Result<OptionContract, Box<dyn std::error::Error + Send + Sync>> {
         let parse_f64 = |key: &str| -> f64 {
             item.get(key)
                 .and_then(|v| {
@@ -747,7 +747,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         endpoint: OptionsEndpoint,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         let chain = self.fetch_option_chain(symbol, endpoint).await?;
 
         let iv = chain
@@ -772,7 +772,7 @@ impl DataFetcher {
         symbol: &str,
         endpoint: OptionsEndpoint,
         underlying_price: f64,
-    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+    ) -> Result<OptionChain, Box<dyn std::error::Error + Send + Sync>> {
         let mut chain = self.fetch_option_chain(symbol, endpoint).await?;
         chain.underlying_price = underlying_price;
         chain.compute_summary_iv();
@@ -783,7 +783,7 @@ impl DataFetcher {
     pub async fn fetch_option_chain_with_fallback(
         &self,
         symbol: &str,
-    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+    ) -> Result<OptionChain, Box<dyn std::error::Error + Send + Sync>> {
         match self
             .fetch_option_chain(symbol, OptionsEndpoint::Realtime)
             .await
@@ -803,6 +803,63 @@ impl DataFetcher {
                 }
             }
         }
+    }
+
+    /// Search for ticker symbols using Finnhub API
+    /// Returns a vector of (symbol, description, type) tuples
+    pub async fn search_symbols(
+        &self,
+        query: &str,
+    ) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "https://finnhub.io/api/v1/search?q={}",
+            query
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-Finnhub-Token", &self.finnhub_key)
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+
+        let results = response["result"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        let symbol = item["symbol"].as_str()?.to_string();
+                        let description = item["description"].as_str().unwrap_or("").to_string();
+                        let security_type = item["type"].as_str().unwrap_or("").to_string();
+                        // Filter to only US stocks for simplicity
+                        if security_type == "Common Stock" || security_type.is_empty() {
+                            Some((symbol, description, security_type))
+                        } else {
+                            None
+                        }
+                    })
+                    .take(10)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(results)
+    }
+
+    /// Get historical prices for charting
+    /// Returns a vector of (date, price) tuples, most recent first
+    pub async fn get_historical_prices(
+        &self,
+        symbol: &str,
+        days: usize,
+    ) -> Result<Vec<(String, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+        let (mut prices, _) = self.get_historical_data(symbol, days.max(30)).await?;
+        // get_historical_data returns oldest first after reversal, we want newest first
+        prices.reverse();
+        prices.truncate(days);
+        Ok(prices)
     }
 }
 

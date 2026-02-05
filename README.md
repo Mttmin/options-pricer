@@ -19,3 +19,9 @@ As implemented right now, the pricer uses Alpha Vantage API for volatility estim
 To get the vol estimates from historical data, and to avoid any problems from stock splits or dividends, the fetcher uses the adjusted daily endpoint, which requires a premium subscription. In case of a Finnhub problem, the fallback is to use the 15 minutes delayed Alpha Vantage global quote.
 
 In case the online connectivity doesn't interest you, simply input your own vol and spot.
+
+## AI Disclaimer
+
+Tests in the code, were written through claude code (Opus 4.5) but main logic was not. Checks on safety are also run by AI Github agents regularly for things I could have missed.
+
+As a back-end/math oriented programmer, front-end dev is not my speciality and as such when a frontend will be iimplemented it will be through AI

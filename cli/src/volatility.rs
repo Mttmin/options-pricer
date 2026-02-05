@@ -1,5 +1,30 @@
 use crate::fetcher::DataFetcher;
-use ggca::correlation::spearman_correlation;
+
+fn calculate_pearson_correlation(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len();
+    if n != y.len() || n == 0 {
+        return 0.0;
+    }
+    
+    let n_f64 = n as f64;
+    let mean_x = x.iter().sum::<f64>() / n_f64;
+    let mean_y = y.iter().sum::<f64>() / n_f64;
+    
+    let (covariance, var_x, var_y) = x.iter()
+        .zip(y.iter())
+        .fold((0.0, 0.0, 0.0), |(cov, vx, vy), (&xi, &yi)| {
+            let dx = xi - mean_x;
+            let dy = yi - mean_y;
+            (cov + dx * dy, vx + dx * dx, vy + dy * dy)
+        });
+    
+    if var_x <= f64::EPSILON || var_y <= f64::EPSILON {
+        0.0
+    } else {
+        covariance / (var_x.sqrt() * var_y.sqrt())
+    }
+}
+
 
 /// Tries and create an ema estimator for volatility,
 /// in case of error falls back to a no estimator and pure historical volatility
@@ -31,7 +56,7 @@ pub fn ema_volatility(data: &[(String, f64)],n_days_per: u16, lambda: f64) -> Re
     }
 }
 
-fn ema_volatility_all(data: &[(String, f64)],n_days_per: u16, lambda: f64) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+fn ema_volatility_all(data: &[(String, f64)],n_days_per: u16, lambda: f64) -> Result<Vec<f64>, Box<dyn std::error::Error + Send + Sync>> {
     // Check for valid parameters before subtraction to avoid overflow
     if data.len() <= n_days_per as usize || n_days_per < 2 {
         return Err(format!("Wrong input parameters, data length={} vs n_days_per={}, need data.len() > n_days_per and n_days_per >= 2",
@@ -74,7 +99,7 @@ pub async fn vix_volatility(symbol: &str, data_fetcher:  DataFetcher, num_days: 
     let latest_ema_vol = ema_vol[0];
     ema_vol.remove(0);
     // calculate the correlation between previous vix and price vol for next day
-    let correlation = spearman_correlation(&ema_vol, &vix_data);
+    let correlation = calculate_pearson_correlation(&ema_vol, &vix_data);
     // use the ema and correlation to construct and estimate of today's volatility
     if correlation < 0.2{
         eprintln!("Not using vix correlation as it is too low");
