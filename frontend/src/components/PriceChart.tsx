@@ -1,3 +1,4 @@
+import { useState, useRef, useCallback } from "react";
 import type { PricePoint } from "../api/client.ts";
 import { Spinner } from "./ui/Spinner.tsx";
 
@@ -9,6 +10,59 @@ interface PriceChartProps {
 }
 
 export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartProps) {
+  const [hoverPoint, setHoverPoint] = useState<{ price: number; date: string; x: number; y: number } | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  const chartHeight = 150;
+  const chartWidth = 400;
+  const padding = { left: 50, right: 20, top: 20, bottom: 30 };
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<SVGSVGElement>) => {
+      if (!svgRef.current || data.length === 0) return;
+
+      const prices = data.map((p) => p.price);
+      const minPrice = Math.min(...prices);
+      const maxPrice = Math.max(...prices);
+      const priceRange = maxPrice - minPrice || 1;
+
+      const getX = (index: number) =>
+        padding.left + (index / (data.length - 1)) * (chartWidth - padding.left - padding.right);
+
+      const getY = (price: number) =>
+        padding.top + (1 - (price - minPrice) / priceRange) * (chartHeight - padding.top - padding.bottom);
+
+      const rect = svgRef.current.getBoundingClientRect();
+      const svgX = e.clientX - rect.left;
+      const svgWidth = rect.width;
+      const normalizedX = (svgX / svgWidth) * chartWidth;
+
+      if (normalizedX < padding.left || normalizedX > chartWidth - padding.right) {
+        setHoverPoint(null);
+        return;
+      }
+
+      const dataX = ((normalizedX - padding.left) / (chartWidth - padding.left - padding.right)) * (data.length - 1);
+      const index = Math.round(dataX);
+      const clampedIndex = Math.max(0, Math.min(data.length - 1, index));
+
+      const point = data[clampedIndex];
+      if (point) {
+        setHoverPoint({
+          price: point.price,
+          date: point.date,
+          x: getX(clampedIndex),
+          y: getY(point.price),
+        });
+      }
+    },
+    [data, chartWidth, chartHeight, padding]
+  );
+
+  const handleMouseLeave = useCallback(() => {
+    setHoverPoint(null);
+  }, []);
+
   if (!ticker) {
     return (
       <div className="relative h-48 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
@@ -50,18 +104,21 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
   const minPrice = Math.min(...prices);
   const maxPrice = Math.max(...prices);
   const priceRange = maxPrice - minPrice || 1;
-  const padding = priceRange * 0.1;
 
-  const chartHeight = 150;
-  const chartWidth = 400;
+  const getX = (index: number) =>
+    padding.left + (index / (data.length - 1)) * (chartWidth - padding.left - padding.right);
+
+  const getY = (price: number) =>
+    padding.top + (1 - (price - minPrice) / priceRange) * (chartHeight - padding.top - padding.bottom);
 
   const points = data
-    .map((point, i) => {
-      const x = (i / (data.length - 1)) * chartWidth;
-      const y = chartHeight - ((point.price - minPrice + padding) / (priceRange + 2 * padding)) * chartHeight;
-      return `${x},${y}`;
-    })
+    .map((point, i) => `${getX(i)},${getY(point.price)}`)
     .join(" ");
+
+  const numGridLinesY = 5;
+  const yTicks = Array.from({ length: numGridLinesY }, (_, i) =>
+    minPrice + (i * priceRange) / (numGridLinesY - 1)
+  );
 
   const firstPrice = data[data.length - 1]?.price ?? 0;
   const lastPrice = data[0]?.price ?? 0;
@@ -90,9 +147,12 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
 
       <div className="relative">
         <svg
+          ref={svgRef}
           viewBox={`0 0 ${chartWidth} ${chartHeight}`}
           className="w-full h-40"
-          preserveAspectRatio="none"
+          preserveAspectRatio="xMidYMid meet"
+          onMouseMove={handleMouseMove}
+          onMouseLeave={handleMouseLeave}
         >
           <defs>
             <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
@@ -108,8 +168,54 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
               />
             </linearGradient>
           </defs>
+
+          {yTicks.map((tick, i) => {
+            const y = getY(tick);
+            return (
+              <g key={`y-grid-${i}`}>
+                <line
+                  x1={padding.left}
+                  y1={y}
+                  x2={chartWidth - padding.right}
+                  y2={y}
+                  stroke="#334155"
+                  strokeWidth="0.5"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <text
+                  x={padding.left - 5}
+                  y={y}
+                  textAnchor="end"
+                  dominantBaseline="middle"
+                  className="text-[8px] fill-slate-400"
+                >
+                  ${tick.toFixed(2)}
+                </text>
+              </g>
+            );
+          })}
+
+          <line
+            x1={padding.left}
+            y1={padding.top}
+            x2={padding.left}
+            y2={chartHeight - padding.bottom}
+            stroke="#475569"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+          />
+          <line
+            x1={padding.left}
+            y1={chartHeight - padding.bottom}
+            x2={chartWidth - padding.right}
+            y2={chartHeight - padding.bottom}
+            stroke="#475569"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+          />
+
           <polygon
-            points={`0,${chartHeight} ${points} ${chartWidth},${chartHeight}`}
+            points={`${padding.left},${chartHeight - padding.bottom} ${points} ${chartWidth - padding.right},${chartHeight - padding.bottom}`}
             fill="url(#chartGradient)"
           />
           <polyline
@@ -119,20 +225,53 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
             strokeWidth="2"
             vectorEffect="non-scaling-stroke"
           />
+
+          {hoverPoint && (
+            <>
+              <line
+                x1={hoverPoint.x}
+                y1={padding.top}
+                x2={hoverPoint.x}
+                y2={chartHeight - padding.bottom}
+                stroke="#8b5cf6"
+                strokeWidth="1"
+                strokeDasharray="4 4"
+                vectorEffect="non-scaling-stroke"
+              />
+              <circle
+                cx={hoverPoint.x}
+                cy={hoverPoint.y}
+                r="4"
+                fill={isPositive ? "#22c55e" : "#ef4444"}
+                stroke="white"
+                strokeWidth="2"
+              />
+            </>
+          )}
+
+          <text
+            x={chartWidth / 2}
+            y={chartHeight - 5}
+            textAnchor="middle"
+            className="text-[8px] fill-slate-400"
+          >
+            Date
+          </text>
         </svg>
 
-        <div className="absolute left-0 top-0 text-xs text-slate-500">
-          ${maxPrice.toFixed(2)}
-        </div>
-        <div className="absolute left-0 bottom-0 text-xs text-slate-500">
-          ${minPrice.toFixed(2)}
-        </div>
-        <div className="absolute right-0 bottom-0 text-xs text-slate-500">
-          {data[0]?.date}
-        </div>
-        <div className="absolute left-1/2 -translate-x-1/2 bottom-0 text-xs text-slate-500">
-          {data[Math.floor(data.length / 2)]?.date}
-        </div>
+        {hoverPoint && (
+          <div
+            className="absolute bg-slate-800 text-white text-xs px-2 py-1 rounded shadow-lg pointer-events-none z-10"
+            style={{
+              left: `${(hoverPoint.x / chartWidth) * 100}%`,
+              top: `${(hoverPoint.y / chartHeight) * 100}%`,
+              transform: "translate(-50%, -120%)",
+            }}
+          >
+            <div className="font-semibold">${hoverPoint.price.toFixed(2)}</div>
+            <div className="text-slate-400">{hoverPoint.date}</div>
+          </div>
+        )}
       </div>
     </div>
   );

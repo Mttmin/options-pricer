@@ -75,22 +75,29 @@ export function IVSmileChart({ data, loading }: IVSmileChartProps) {
 
   const strikeRange = maxStrike - minStrike || 1;
   const ivRange = maxIV - minIV || 1;
-  const strikePadding = strikeRange * 0.1;
-  const ivPadding = ivRange * 0.1;
 
   const chartWidth = 500;
   const chartHeight = 200;
+  const padding = { left: 50, right: 30, top: 20, bottom: 40 };
 
   const getX = (strike: number) =>
-    ((strike - minStrike + strikePadding) /
-      (strikeRange + 2 * strikePadding)) *
-    chartWidth;
+    padding.left +
+    ((strike - minStrike) / strikeRange) * (chartWidth - padding.left - padding.right);
 
   const getY = (iv: number) =>
-    chartHeight -
-    ((iv - minIV + ivPadding) / (ivRange + 2 * ivPadding)) * chartHeight;
+    padding.top +
+    (1 - (iv - minIV) / ivRange) * (chartHeight - padding.top - padding.bottom);
 
   const atmX = getX(data.underlying_price);
+
+  const numGridLinesY = 5;
+  const numGridLinesX = 5;
+  const yTicks = Array.from({ length: numGridLinesY }, (_, i) =>
+    minIV + (i * ivRange) / (numGridLinesY - 1)
+  );
+  const xTicks = Array.from({ length: numGridLinesX }, (_, i) =>
+    minStrike + (i * strikeRange) / (numGridLinesX - 1)
+  );
 
   const callsSorted = [...calls].sort((a, b) => a.strike - b.strike);
   const putsSorted = [...puts].sort((a, b) => a.strike - b.strike);
@@ -130,11 +137,81 @@ export function IVSmileChart({ data, loading }: IVSmileChartProps) {
           className="w-full h-64"
           preserveAspectRatio="xMidYMid meet"
         >
+          {yTicks.map((tick, i) => {
+            const y = getY(tick);
+            return (
+              <g key={`y-grid-${i}`}>
+                <line
+                  x1={padding.left}
+                  y1={y}
+                  x2={chartWidth - padding.right}
+                  y2={y}
+                  stroke="#334155"
+                  strokeWidth="0.5"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <text
+                  x={padding.left - 5}
+                  y={y}
+                  textAnchor="end"
+                  dominantBaseline="middle"
+                  className="text-[8px] fill-slate-400"
+                >
+                  {tick.toFixed(1)}%
+                </text>
+              </g>
+            );
+          })}
+
+          {xTicks.map((tick, i) => {
+            const x = getX(tick);
+            return (
+              <g key={`x-grid-${i}`}>
+                <line
+                  x1={x}
+                  y1={padding.top}
+                  x2={x}
+                  y2={chartHeight - padding.bottom}
+                  stroke="#334155"
+                  strokeWidth="0.5"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <text
+                  x={x}
+                  y={chartHeight - padding.bottom + 15}
+                  textAnchor="middle"
+                  className="text-[8px] fill-slate-400"
+                >
+                  ${tick.toFixed(0)}
+                </text>
+              </g>
+            );
+          })}
+
+          <line
+            x1={padding.left}
+            y1={padding.top}
+            x2={padding.left}
+            y2={chartHeight - padding.bottom}
+            stroke="#475569"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+          />
+          <line
+            x1={padding.left}
+            y1={chartHeight - padding.bottom}
+            x2={chartWidth - padding.right}
+            y2={chartHeight - padding.bottom}
+            stroke="#475569"
+            strokeWidth="1.5"
+            vectorEffect="non-scaling-stroke"
+          />
+
           <line
             x1={atmX}
-            y1="0"
+            y1={padding.top}
             x2={atmX}
-            y2={chartHeight}
+            y2={chartHeight - padding.bottom}
             stroke="#8b5cf6"
             strokeWidth="1"
             strokeDasharray="4 4"
@@ -180,26 +257,25 @@ export function IVSmileChart({ data, loading }: IVSmileChartProps) {
               fill="#ef4444"
             />
           ))}
-        </svg>
 
-        <div className="absolute left-0 top-0 text-xs text-slate-500">
-          {maxIV.toFixed(1)}%
-        </div>
-        <div className="absolute left-0 bottom-0 text-xs text-slate-500">
-          {minIV.toFixed(1)}%
-        </div>
-        <div className="absolute right-0 bottom-0 text-xs text-slate-500">
-          ${maxStrike.toFixed(2)}
-        </div>
-        <div className="absolute left-1/2 -translate-x-1/2 -bottom-6 text-xs text-slate-400">
-          Strike Price
-        </div>
-        <div
-          className="absolute -left-12 top-1/2 -translate-y-1/2 -rotate-90 text-xs text-slate-400"
-          style={{ transformOrigin: "center" }}
-        >
-          Implied Volatility (%)
-        </div>
+          <text
+            x={chartWidth / 2}
+            y={chartHeight - 5}
+            textAnchor="middle"
+            className="text-[10px] fill-slate-400 font-medium"
+          >
+            Strike Price
+          </text>
+          <text
+            x={15}
+            y={chartHeight / 2}
+            textAnchor="middle"
+            transform={`rotate(-90 15 ${chartHeight / 2})`}
+            className="text-[10px] fill-slate-400 font-medium"
+          >
+            Implied Volatility (%)
+          </text>
+        </svg>
       </div>
 
       <div className="flex items-center justify-center gap-6 text-sm mt-8">

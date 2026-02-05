@@ -2,6 +2,8 @@ export type OptionType = "call" | "put";
 
 export type Direction = "long" | "short";
 
+export type ExerciseStyle = "european" | "american";
+
 export type SpreadType =
   | "straddle"
   | "strangle"

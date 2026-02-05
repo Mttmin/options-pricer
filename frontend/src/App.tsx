@@ -6,6 +6,7 @@ import type {
   SpreadType,
   ExoticType,
   VolSource,
+  ExerciseStyle,
   SpreadStrikes,
   PriceRequest,
   MarketDataResponse,
@@ -28,6 +29,7 @@ import { PriceChart } from "./components/PriceChart.tsx";
 import { StructureSelector } from "./components/StructureSelector.tsx";
 import { DirectionToggle } from "./components/DirectionToggle.tsx";
 import { ManualOverrideToggle } from "./components/ManualOverrideToggle.tsx";
+import { ExerciseStyleToggle } from "./components/ExerciseStyleToggle.tsx";
 import { SingleOptionForm } from "./components/inputs/SingleOptionForm.tsx";
 import { SpreadForm } from "./components/inputs/SpreadForm.tsx";
 import { ExoticForm } from "./components/inputs/ExoticForm.tsx";
@@ -36,6 +38,7 @@ import { PricingTable } from "./components/PricingTable.tsx";
 import { PayoffDiagram } from "./components/PayoffDiagram.tsx";
 import { IVSmileChart } from "./components/IVSmileChart.tsx";
 import { OptionChainDisplay } from "./components/OptionChainDisplay.tsx";
+import { MonteCarloPathsChart } from "./components/MonteCarloPathsChart.tsx";
 import { Button } from "./components/ui/Button.tsx";
 
 export default function App() {
@@ -54,6 +57,7 @@ export default function App() {
   const [structureType, setStructureType] = useState<StructureType>("single");
   const [direction, setDirection] = useState<Direction>("long");
   const [manualOverride, setManualOverride] = useState(false);
+  const [exerciseStyle, setExerciseStyle] = useState<ExerciseStyle>("european");
 
   // Single option state
   const [singleValues, setSingleValues] = useState({
@@ -87,6 +91,7 @@ export default function App() {
   const [priceError, setPriceError] = useState<string | null>(null);
 
   const handleSearch = useCallback(async (symbol: string) => {
+    console.log("Searching for symbol:", symbol);
     setMarketLoading(true);
     setMarketError(null);
     setSelectedTicker(symbol);
@@ -94,8 +99,15 @@ export default function App() {
       const [data, history, ivSmile] = await Promise.all([
         fetchMarketData(symbol),
         fetchPriceHistory(symbol, 90),
-        fetchOptionChain(symbol).catch(() => null),
+        fetchOptionChain(symbol).catch((err) => {
+          console.warn("Option chain fetch failed:", err);
+          return null;
+        }),
       ]);
+      console.log("Market data:", data);
+      console.log("Price history:", history);
+      console.log("IV Smile data:", ivSmile);
+
       setMarketData(data);
       setPriceHistory(history);
       setIVSmileData(ivSmile);
@@ -107,8 +119,11 @@ export default function App() {
         ).toFixed(4),
       }));
       // Fetch vol data in background
-      fetchVolatility(symbol).then(setVolData).catch(() => {});
+      fetchVolatility(symbol).then(setVolData).catch((err) => {
+        console.warn("Volatility fetch failed:", err);
+      });
     } catch (err) {
+      console.error("Search error:", err);
       setMarketError(err instanceof Error ? err.message : "Failed to fetch data");
     } finally {
       setMarketLoading(false);
@@ -392,13 +407,19 @@ export default function App() {
 
         {/* Structure Selection */}
         <section className="mb-6 space-y-4">
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 flex-wrap">
             <StructureSelector
               selected={structureType}
               onChange={setStructureType}
             />
             {structureType !== "exotic" && (
               <DirectionToggle direction={direction} onChange={setDirection} />
+            )}
+            {structureType === "single" && (
+              <ExerciseStyleToggle
+                style={exerciseStyle}
+                onChange={setExerciseStyle}
+              />
             )}
             <ManualOverrideToggle
               enabled={manualOverride}
@@ -471,7 +492,11 @@ export default function App() {
                 volData={volData}
               />
             </div>
-            <PricingTable result={priceResult} loading={priceLoading} />
+            <PricingTable
+              result={priceResult}
+              loading={priceLoading}
+              exerciseStyle={structureType === "single" ? exerciseStyle : "european"}
+            />
           </section>
         )}
 
@@ -482,6 +507,21 @@ export default function App() {
               request={getCurrentRequest()}
               priceResult={priceResult}
               loading={priceLoading}
+            />
+          </section>
+        )}
+
+        {/* Monte Carlo Paths Visualization */}
+        {priceResult?.pricing.monte_carlo && structureType === "single" && (
+          <section className="mb-8">
+            <MonteCarloPathsChart
+              mcResult={priceResult.pricing.monte_carlo}
+              spotPrice={parseFloat(singleValues.spotPrice) || marketData?.spot_price || 100}
+              timeToMaturity={
+                singleValues.expirationDate
+                  ? calculateTTM(singleValues.expirationDate)
+                  : 0.25
+              }
             />
           </section>
         )}
