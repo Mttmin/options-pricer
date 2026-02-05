@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::options_chain::{OptionChain, OptionContract, OptionType, OptionsEndpoint};
+use options::black_scholes::calculate_iv;
 
 /// Configuration struct for API keys loaded from api_keys.json
 #[derive(Debug, Deserialize)]
@@ -532,7 +533,7 @@ impl DataFetcher {
         let url = match endpoint {
             OptionsEndpoint::Historical { date } => {
                 let mut u = format!(
-                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}&apikey={}",
+                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}&require_greeks=true&apikey={}",
                     symbol, self.alpha_vantage_key
                 );
                 if let Some(d) = date {
@@ -629,6 +630,39 @@ impl DataFetcher {
             contracts,
             summary_implied_volatility: None,
         };
+
+        // Fallback IV Calculation
+        for c in chain.contracts.iter_mut() {
+            if c.implied_volatility == 0.0 || c.implied_volatility.abs() < 1e-6 {
+                let t = (c.expiration - chain.data_date).num_days() as f64 / 365.0;
+                let r = 0.05;
+                let q = 0.0;
+                let is_call = match c.option_type {
+                    OptionType::Call => true,
+                    OptionType::Put => false,
+                };
+
+                let price = if c.mark > 0.0 {
+                    c.mark
+                } else if c.bid > 0.0 && c.ask > 0.0 {
+                    (c.bid + c.ask) / 2.0
+                } else {
+                    c.last
+                };
+
+                if t > 0.0 && price > 0.0 {
+                    c.implied_volatility = calculate_iv(
+                        price,
+                        chain.underlying_price,
+                        c.strike,
+                        t,
+                        r,
+                        q,
+                        is_call,
+                    );
+                }
+            }
+        }
 
         chain.compute_summary_iv();
 
