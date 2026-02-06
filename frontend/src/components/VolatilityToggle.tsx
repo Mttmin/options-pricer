@@ -24,7 +24,7 @@ export function VolatilityToggle({
   volData,
 }: VolatilityToggleProps) {
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex items-center gap-2">
       {VOL_SOURCES.map((opt) => {
         const isActive = source === opt.value;
         const vol =
@@ -42,16 +42,17 @@ export function VolatilityToggle({
             key={opt.value}
             onClick={() => isAvailable && onChange(opt.value)}
             disabled={!isAvailable}
-            className={`rounded px-2 py-1 text-xs font-medium transition-colors ${
+            className={`rounded px-3 py-2 text-sm font-medium transition-colors flex flex-col items-center min-w-[70px] ${
               isActive
                 ? "bg-blue-500 text-white"
                 : isAvailable
                   ? "bg-slate-800 text-slate-300 hover:bg-slate-700"
                   : "cursor-not-allowed bg-slate-900 text-slate-600"
             }`}
-            title={`${opt.label}: ${formatVol(vol)}`}
+            title={opt.label}
           >
-            {opt.shortLabel}
+            <span className="text-xs opacity-80">{opt.shortLabel}</span>
+            <span className="font-semibold">{formatVol(vol)}</span>
           </button>
         );
       })}

@@ -7,6 +7,7 @@ pub struct MarketDataResponse {
     pub historical_volatility: f64,
     pub implied_volatility: Option<f64>,
     pub corporate_action_detected: bool,
+    pub dividend_yield: Option<f64>,
 }
 
 #[derive(Serialize)]

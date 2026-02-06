@@ -128,6 +128,12 @@ export type MarketDataResponse = {
   historical_volatility: number;
   implied_volatility: number | null;
   corporate_action_detected: boolean;
+  dividend_yield: number | null;
+};
+
+export type SofrResponse = {
+  rate: number;
+  date: string;
 };
 
 export type VolatilityResponse = {

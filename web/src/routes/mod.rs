@@ -3,6 +3,7 @@ pub mod market;
 pub mod options_chain;
 pub mod price;
 pub mod search;
+pub mod sofr;
 pub mod volatility;
 
 use std::sync::Arc;
@@ -14,6 +15,7 @@ pub fn api_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/search", get(search::search_tickers))
+        .route("/api/sofr", get(sofr::get_sofr))
         .route("/api/market/{symbol}", get(market::get_market_data))
         .route("/api/history/{symbol}", get(history::get_price_history))
         .route("/api/volatility/{symbol}", get(volatility::get_volatility))

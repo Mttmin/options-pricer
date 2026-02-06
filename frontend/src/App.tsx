@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import type {
   StructureType,
   Direction,
@@ -20,6 +20,7 @@ import {
   submitPricing,
   fetchPriceHistory,
   fetchOptionChain,
+  fetchSofr,
   type PricePoint,
 } from "./api/client.ts";
 import { calculateTTM } from "./utils/ttm.ts";
@@ -90,6 +91,35 @@ export default function App() {
   const [priceLoading, setPriceLoading] = useState(false);
   const [priceError, setPriceError] = useState<string | null>(null);
 
+  // Recalculate when volatility source changes (if we have a previous result)
+  useEffect(() => {
+    if (priceResult && !manualOverride) {
+      handleCalculate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [volSource]);
+
+  // Fetch SOFR rate on app load
+  useEffect(() => {
+    const loadSofr = async () => {
+      try {
+        const sofrData = await fetchSofr();
+        console.log("SOFR rate loaded:", sofrData.rate);
+        setSingleValues((prev) => ({
+          ...prev,
+          riskFreeRate: sofrData.rate.toFixed(4),
+        }));
+      } catch (err) {
+        console.warn("SOFR fetch failed, using default 0.05:", err);
+        setSingleValues((prev) => ({
+          ...prev,
+          riskFreeRate: "0.05",
+        }));
+      }
+    };
+    loadSofr();
+  }, []);
+
   const handleSearch = useCallback(async (symbol: string) => {
     console.log("Searching for symbol:", symbol);
     setMarketLoading(true);
@@ -117,6 +147,9 @@ export default function App() {
         volatility: (
           data.implied_volatility ?? data.historical_volatility
         ).toFixed(4),
+        dividendYield: data.dividend_yield
+          ? (data.dividend_yield * 100).toFixed(2)
+          : "",
       }));
       // Fetch vol data in background
       fetchVolatility(symbol).then(setVolData).catch((err) => {
@@ -171,7 +204,7 @@ export default function App() {
         const strike = parseFloat(singleValues.strike) || spot;
         const rfr = parseFloat(singleValues.riskFreeRate) || 0.05;
         const divStr = singleValues.dividendYield.trim();
-        const div = divStr ? parseFloat(divStr) : null;
+        const div = divStr ? parseFloat(divStr) / 100 : null;
 
         return {
           structure_type: "single",
@@ -191,7 +224,7 @@ export default function App() {
           ? calculateTTM(singleValues.expirationDate)
           : 0.25;
         const divStr = singleValues.dividendYield.trim();
-        const div = divStr ? parseFloat(divStr) : null;
+        const div = divStr ? parseFloat(divStr) / 100 : null;
 
         return {
           structure_type: "spread",
@@ -239,7 +272,7 @@ export default function App() {
         const strike = parseFloat(singleValues.strike);
         const rfr = parseFloat(singleValues.riskFreeRate) || 0.05;
         const divStr = singleValues.dividendYield.trim();
-        const div = divStr ? parseFloat(divStr) : null;
+        const div = divStr ? parseFloat(divStr) / 100 : null;
 
         if (!spot || isNaN(spot)) {
           throw new Error("Spot price is required. Search for a ticker or enter manually.");
@@ -269,7 +302,7 @@ export default function App() {
           ? calculateTTM(singleValues.expirationDate)
           : 0.25;
         const divStr = singleValues.dividendYield.trim();
-        const div = divStr ? parseFloat(divStr) : null;
+        const div = divStr ? parseFloat(divStr) / 100 : null;
 
         request = {
           structure_type: "spread",
@@ -518,7 +551,11 @@ export default function App() {
         {/* IV Smile Chart */}
         {ivSmileData && (
           <section className="mb-6">
-            <IVSmileChart data={ivSmileData} loading={marketLoading} />
+            <IVSmileChart
+              data={ivSmileData}
+              loading={marketLoading}
+              underlyingPrice={marketData?.spot_price ?? null}
+            />
           </section>
         )}
 

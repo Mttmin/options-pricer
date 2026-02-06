@@ -6,9 +6,10 @@ import { Select } from "./ui/Select.tsx";
 interface IVSmileChartProps {
   data: IVSmileData | null;
   loading: boolean;
+  underlyingPrice?: number | null;
 }
 
-export function IVSmileChart({ data, loading }: IVSmileChartProps) {
+export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
 
@@ -41,6 +42,16 @@ export function IVSmileChart({ data, loading }: IVSmileChartProps) {
   }, [data]);
 
   const [selectedExpiration, setSelectedExpiration] = useState<string>("");
+
+  useEffect(() => {
+    if (expirations.length === 0) {
+      setSelectedExpiration("");
+      return;
+    }
+    if (!selectedExpiration || !expirations.includes(selectedExpiration)) {
+      setSelectedExpiration(expirations[0]);
+    }
+  }, [expirations, selectedExpiration]);
 
   const currentExpiration = selectedExpiration || expirations[0] || "";
   const smileData = data?.smiles_by_expiry[currentExpiration] || [];
@@ -111,7 +122,8 @@ export function IVSmileChart({ data, loading }: IVSmileChartProps) {
       padding.top +
       (1 - (iv - minIV) / ivRange) * (chartHeight - padding.top - padding.bottom);
 
-    const atmX = getX(data.underlying_price);
+    const spotPrice = underlyingPrice ?? data.underlying_price;
+    const atmX = getX(spotPrice);
 
     const numGridLinesY = 5;
     const numGridLinesX = 5;
@@ -141,7 +153,7 @@ export function IVSmileChart({ data, loading }: IVSmileChartProps) {
               Implied Volatility Smile
             </span>
             <span className="ml-3 text-sm text-slate-400">
-              {data.symbol} @ ${data.underlying_price.toFixed(2)}
+              {data.symbol} @ ${spotPrice.toFixed(2)}
             </span>
           </div>
           <div className="w-48">
@@ -154,7 +166,10 @@ export function IVSmileChart({ data, loading }: IVSmileChartProps) {
           </div>
         </div>
 
-        <div ref={chartContainerRef} className="relative flex-1 min-h-0">
+        <div
+          ref={chartContainerRef}
+          className="relative flex-1 min-h-[240px]"
+        >
           <svg
             width={chartWidth}
             height={chartHeight}
@@ -314,7 +329,9 @@ export function IVSmileChart({ data, loading }: IVSmileChartProps) {
           </div>
           <div className="flex items-center gap-2">
             <div className="w-8 h-0.5 bg-purple-500 opacity-50"></div>
-            <span className="text-slate-400">ATM ({data.underlying_price.toFixed(2)})</span>
+            <span className="text-slate-400">
+              ATM (Underlying: {spotPrice.toFixed(2)})
+            </span>
           </div>
         </div>
       </div>

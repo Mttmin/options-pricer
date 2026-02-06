@@ -74,6 +74,8 @@ pub struct MarketData {
     pub corporate_action_detected: bool,
     /// Implied volatility from option chain (None if not fetched)
     pub implied_volatility: Option<f64>,
+    /// Dividend yield as decimal (e.g., 0.0044 for 0.44%)
+    pub dividend_yield: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -84,12 +86,24 @@ pub struct DataFetcher {
     cache: Arc<RwLock<HashMap<String, MarketData>>>,
     fred_key: String,
     options_cache: Arc<RwLock<HashMap<String, OptionChain>>>,
+    sofr_cache: Arc<RwLock<Option<(DateTime<Utc>, f64)>>>,
+    fundamentals_cache: Arc<RwLock<HashMap<String, (DateTime<Utc>, CompanyFundamentals)>>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Observation {
     date: String,
     value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompanyFundamentals {
+    #[serde(rename = "DividendYield")]
+    pub dividend_yield: Option<String>,
+    #[serde(rename = "DividendPerShare")]
+    pub dividend_per_share: Option<String>,
+    #[serde(rename = "MarketCapitalization")]
+    pub market_cap: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +131,8 @@ impl DataFetcher {
             client: reqwest::Client::new(),
             cache: Arc::new(RwLock::new(HashMap::new())),
             options_cache: Arc::new(RwLock::new(HashMap::new())),
+            sofr_cache: Arc::new(RwLock::new(None)),
+            fundamentals_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -179,18 +195,18 @@ impl DataFetcher {
         &self,
         symbol: &str,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        // Try Finnhub first
-        match self.get_current_price_finnhub(symbol).await {
-            Ok(quote) => Ok(quote.c),
-            Err(finnhub_error) => {
-                // Finnhub failed, fall back to Alpha Vantage
+        // Try Alpha Vantage first (user has premium key = real-time data)
+        match self.get_current_price_alpha_vantage(symbol).await {
+            Ok(price) => Ok(price),
+            Err(av_error) => {
+                // Alpha Vantage failed, fall back to Finnhub
                 eprintln!(
-                    "WARNING: Finnhub real-time quote failed for {} ({}). Falling back to Alpha Vantage with 15-minute delayed data.",
-                    symbol, finnhub_error
+                    "WARNING: Alpha Vantage quote failed for {} ({}). Falling back to Finnhub real-time.",
+                    symbol, av_error
                 );
 
-                // Try Alpha Vantage fallback
-                self.get_current_price_alpha_vantage(symbol).await
+                // Try Finnhub fallback
+                self.get_current_price_finnhub(symbol).await.map(|q| q.c)
             }
         }
     }
@@ -340,6 +356,107 @@ impl DataFetcher {
         Ok(vix_values)
     }
 
+    /// Fetch the current SOFR (Secured Overnight Financing Rate) from FRED API
+    ///
+    /// Uses the SOFR30DAYAVG series for stability. Returns rate as a decimal (e.g., 0.0531 for 5.31%)
+    /// Caches result for 24 hours to avoid excessive API calls
+    pub async fn fetch_fred_sofr(&self) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        // Check cache (24-hour TTL)
+        let cache = self.sofr_cache.read().await;
+        if let Some((timestamp, rate)) = *cache {
+            if Utc::now() - timestamp < Duration::hours(24) {
+                return Ok(rate);
+            }
+        }
+        drop(cache);
+
+        // Fetch from FRED using SOFR30DAYAVG series (more stable than daily SOFR)
+        let url = format!(
+            "https://api.stlouisfed.org/fred/series/observations?series_id=SOFR30DAYAVG&api_key={}&file_type=json&limit=1&sort_order=desc",
+            &self.fred_key
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json::<FredResponse>()
+            .await?;
+
+        // Check if we received any observations
+        if response.observations.is_empty() {
+            return Err("No SOFR observations found in FRED response".into());
+        }
+
+        // Parse rate from latest observation
+        let rate_str = &response.observations[0].value;
+        let rate_pct: f64 = rate_str.parse().map_err(|e| {
+            format!("Failed to parse SOFR value '{}': {}", rate_str, e)
+        })?;
+
+        // Convert percentage to decimal (e.g., 5.31 -> 0.0531)
+        let rate = rate_pct / 100.0;
+
+        // Validate range (SOFR typically 0-15%)
+        if rate < 0.0 || rate > 0.15 {
+            return Err(format!("SOFR rate {:.4} outside expected range (0-0.15)", rate).into());
+        }
+
+        // Update cache
+        let mut cache = self.sofr_cache.write().await;
+        *cache = Some((Utc::now(), rate));
+
+        Ok(rate)
+    }
+
+    /// Fetch company fundamentals from Alpha Vantage OVERVIEW endpoint
+    ///
+    /// Returns dividend yield, dividend per share, and market cap
+    /// Caches result for 7 days as fundamentals don't change frequently
+    pub async fn fetch_company_fundamentals(
+        &self,
+        symbol: &str,
+    ) -> Result<CompanyFundamentals, Box<dyn std::error::Error + Send + Sync>> {
+        // Check cache (7-day TTL)
+        let cache = self.fundamentals_cache.read().await;
+        if let Some((timestamp, fundamentals)) = cache.get(symbol) {
+            if Utc::now() - *timestamp < Duration::days(7) {
+                return Ok(fundamentals.clone());
+            }
+        }
+        drop(cache);
+
+        // Fetch from Alpha Vantage OVERVIEW endpoint
+        let url = format!(
+            "https://www.alphavantage.co/query?function=OVERVIEW&symbol={}&apikey={}",
+            symbol, &self.alpha_vantage_key
+        );
+
+        let response = self.client.get(&url).send().await?;
+
+        // Check for error responses
+        let text = response.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+
+        if let Some(note) = json.get("Note") {
+            return Err(format!("Alpha Vantage rate limit: {}", note).into());
+        }
+
+        if let Some(error) = json.get("Error Message") {
+            return Err(format!("Alpha Vantage error: {}", error).into());
+        }
+
+        // Parse fundamentals
+        let fundamentals: CompanyFundamentals = serde_json::from_value(json)?;
+
+        // Update cache
+        let mut cache = self.fundamentals_cache.write().await;
+        cache.insert(symbol.to_string(), (Utc::now(), fundamentals.clone()));
+
+        Ok(fundamentals)
+    }
+
     fn detect_corporate_action(
         current_price: f64,
         yesterday_adjusted: f64,
@@ -377,6 +494,7 @@ impl DataFetcher {
             yesterday_adjusted_close: 0.0,
             corporate_action_detected: false,
             implied_volatility: None,
+            dividend_yield: None,
         });
 
         // Fetch from both APIs in parallel if we need both
@@ -388,9 +506,11 @@ impl DataFetcher {
 
             let hist_future = self.get_historical_data(symbol, lookback_days);
             let price_future = self.get_current_price_with_fallback(symbol);
+            let fundamentals_future = self.fetch_company_fundamentals(symbol);
 
-            // Execute both requests in parallel
-            let (hist_result, price_result) = tokio::join!(hist_future, price_future);
+            // Execute all requests in parallel
+            let (hist_result, price_result, fundamentals_result) =
+                tokio::join!(hist_future, price_future, fundamentals_future);
 
             // Process historical data
             let (prices, yesterday_close) = hist_result?;
@@ -417,6 +537,13 @@ impl DataFetcher {
             }
 
             data.last_price_update = now;
+
+            // Process fundamentals (non-critical, don't fail if it errors)
+            if let Ok(fundamentals) = fundamentals_result {
+                data.dividend_yield = fundamentals.dividend_yield
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|&v| v > 0.0);
+            }
         } else if needs_vol_update {
             // Only need historical data
             // eprintln!(
@@ -1467,5 +1594,69 @@ mod tests {
                 println!("    ... ({} more points)", points.len() - 5);
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_fred_sofr() {
+        let fetcher = DataFetcher::new();
+        let rate = fetcher
+            .fetch_fred_sofr()
+            .await
+            .expect("Failed to fetch SOFR");
+        assert!(
+            rate > 0.0 && rate < 0.15,
+            "SOFR rate {} outside reasonable range (0-0.15)",
+            rate
+        );
+        println!("Current SOFR: {:.4}% ({:.6} decimal)", rate * 100.0, rate);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_dividend_yield_aapl() {
+        let fetcher = DataFetcher::new();
+        let fundamentals = fetcher
+            .fetch_company_fundamentals("AAPL")
+            .await
+            .expect("Failed to fetch AAPL fundamentals");
+        assert!(
+            fundamentals.dividend_yield.is_some(),
+            "AAPL should have a dividend yield"
+        );
+        let div_str = fundamentals.dividend_yield.as_ref().unwrap();
+        let div = div_str.parse::<f64>().expect("Failed to parse dividend yield");
+        assert!(div > 0.0, "AAPL dividend yield should be positive");
+        println!("AAPL dividend yield: {}% ({} decimal)", div * 100.0, div);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_dividend_yield_no_dividend() {
+        let fetcher = DataFetcher::new();
+        let fundamentals = fetcher
+            .fetch_company_fundamentals("TSLA")
+            .await
+            .expect("Failed to fetch TSLA fundamentals");
+        if let Some(div_str) = fundamentals.dividend_yield.clone() {
+            let div = div_str.parse::<f64>().unwrap_or(0.0);
+            assert_eq!(
+                div, 0.0,
+                "TSLA should have no dividend (or zero dividend)"
+            );
+        }
+        println!("TSLA dividend yield: {:?}", fundamentals.dividend_yield);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_alpha_vantage_primary() {
+        let fetcher = DataFetcher::new();
+        let price = fetcher
+            .get_current_price_with_fallback("AAPL")
+            .await
+            .expect("Failed to fetch AAPL price");
+        assert!(price > 0.0, "AAPL price should be positive");
+        println!("AAPL price (via Alpha Vantage primary): ${:.2}", price);
     }
 }

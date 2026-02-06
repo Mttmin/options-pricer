@@ -4,6 +4,7 @@ import type {
   PriceRequest,
   PriceResponse,
   IVSmileData,
+  SofrResponse,
 } from "../types/index.ts";
 
 const BASE_URL = "/api";
@@ -83,4 +84,9 @@ export async function fetchOptionChain(
     `${BASE_URL}/options-chain/${encodeURIComponent(symbol)}`
   );
   return handleResponse<IVSmileData>(response);
+}
+
+export async function fetchSofr(): Promise<SofrResponse> {
+  const response = await fetch(`${BASE_URL}/sofr`);
+  return handleResponse<SofrResponse>(response);
 }

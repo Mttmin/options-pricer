@@ -33,5 +33,6 @@ pub async fn get_market_data(
         historical_volatility: market_data.volatility,
         implied_volatility: iv.or(market_data.implied_volatility),
         corporate_action_detected: market_data.corporate_action_detected,
+        dividend_yield: market_data.dividend_yield,
     }))
 }
