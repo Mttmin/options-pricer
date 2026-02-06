@@ -90,7 +90,7 @@ export function PayoffDiagram({
       const y =
         chartHeight -
         ((payoffs[i] - minPayoff + padding) / (payoffRange + 2 * padding)) *
-          chartHeight;
+        chartHeight;
       return `${x},${y}`;
     })
     .join(" ");
@@ -105,7 +105,7 @@ export function PayoffDiagram({
     const y =
       chartHeight -
       ((payoffs[i] - minPayoff + padding) / (payoffRange + 2 * padding)) *
-        chartHeight;
+      chartHeight;
 
     if (payoffs[i] >= 0) {
       if (isFirstPositive) {
@@ -145,7 +145,7 @@ export function PayoffDiagram({
     chartWidth;
 
   return (
-    <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
+    <div className="rounded-lg border border-slate-800 bg-slate-900 p-4 pb-8">
       <div className="flex items-center justify-between mb-3">
         <div>
           <span className="text-lg font-semibold text-white">
@@ -244,10 +244,10 @@ export function PayoffDiagram({
           })}
         </svg>
 
-        <div className="absolute left-0 top-0 text-xs text-slate-500">
+        <div className="absolute left-0 top-0 text-xs text-slate-500 bg-slate-900/50 px-1 rounded">
           ${maxPayoff.toFixed(2)}
         </div>
-        <div className="absolute left-0 bottom-0 text-xs text-slate-500">
+        <div className="absolute left-0 bottom-6 text-xs text-slate-500 bg-slate-900/50 px-1 rounded">
           ${minPayoff.toFixed(2)}
         </div>
         <div className="absolute right-0 bottom-0 text-xs text-slate-500">

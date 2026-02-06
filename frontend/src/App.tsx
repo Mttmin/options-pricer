@@ -301,8 +301,8 @@ export default function App() {
             conversion_price: parseFloat(exoticValues.conversion_price || "50"),
             stock_price: parseFloat(
               exoticValues.stock_price ||
-                singleValues.spotPrice ||
-                "100"
+              singleValues.spotPrice ||
+              "100"
             ),
             volatility: vol,
             time_to_maturity: parseFloat(
@@ -321,8 +321,8 @@ export default function App() {
             exotic_type: "chooser_option",
             spot_price: parseFloat(
               exoticValues.spot_price ||
-                singleValues.spotPrice ||
-                "100"
+              singleValues.spotPrice ||
+              "100"
             ),
             strike_price: parseFloat(exoticValues.strike_price || "100"),
             volatility: vol,
@@ -384,26 +384,7 @@ export default function App() {
           />
         </section>
 
-        {/* Market Data Display */}
-        {marketData && (
-          <section className="mb-6">
-            <MarketDataDisplay data={marketData} />
-          </section>
-        )}
 
-        {/* IV Smile Chart */}
-        {ivSmileData && (
-          <section className="mb-6">
-            <IVSmileChart data={ivSmileData} loading={marketLoading} />
-          </section>
-        )}
-
-        {/* Option Chain Display */}
-        {ivSmileData && (
-          <section className="mb-6">
-            <OptionChainDisplay data={ivSmileData} />
-          </section>
-        )}
 
         {/* Structure Selection */}
         <section className="mb-6 space-y-4">
@@ -444,6 +425,7 @@ export default function App() {
                       values={singleValues}
                       onChange={handleSingleChange}
                       manualOverride={manualOverride}
+                      isSpread={true}
                     />
                   </div>
                   <div>
@@ -523,6 +505,27 @@ export default function App() {
                   : 0.25
               }
             />
+          </section>
+        )}
+
+        {/* Market Data Display */}
+        {marketData && (
+          <section className="mb-6">
+            <MarketDataDisplay data={marketData} />
+          </section>
+        )}
+
+        {/* IV Smile Chart */}
+        {ivSmileData && (
+          <section className="mb-6">
+            <IVSmileChart data={ivSmileData} loading={marketLoading} />
+          </section>
+        )}
+
+        {/* Option Chain Display */}
+        {ivSmileData && (
+          <section className="mb-6">
+            <OptionChainDisplay data={ivSmileData} />
           </section>
         )}
       </div>

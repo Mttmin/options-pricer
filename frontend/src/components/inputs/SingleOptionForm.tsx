@@ -16,6 +16,7 @@ interface SingleOptionFormProps {
   values: SingleOptionValues;
   onChange: (field: string, value: string) => void;
   manualOverride: boolean;
+  isSpread?: boolean;
 }
 
 const OPTION_TYPE_OPTIONS = [
@@ -27,22 +28,27 @@ export function SingleOptionForm({
   values,
   onChange,
   manualOverride,
+  isSpread = false,
 }: SingleOptionFormProps) {
   return (
     <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
-      <Select
-        label="Option Type"
-        value={values.optionType}
-        onChange={(v) => onChange("optionType", v)}
-        options={OPTION_TYPE_OPTIONS}
-      />
-      <Input
-        label="Strike Price"
-        type="number"
-        value={values.strike}
-        onChange={(v) => onChange("strike", v)}
-        placeholder="100.00"
-      />
+      {!isSpread && (
+        <>
+          <Select
+            label="Option Type"
+            value={values.optionType}
+            onChange={(v) => onChange("optionType", v)}
+            options={OPTION_TYPE_OPTIONS}
+          />
+          <Input
+            label="Strike Price"
+            type="number"
+            value={values.strike}
+            onChange={(v) => onChange("strike", v)}
+            placeholder="100.00"
+          />
+        </>
+      )}
       <Input
         label="Expiration Date"
         type="date"

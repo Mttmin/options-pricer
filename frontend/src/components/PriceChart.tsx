@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import type { PricePoint } from "../api/client.ts";
 import { Spinner } from "./ui/Spinner.tsx";
 
@@ -11,10 +11,26 @@ interface PriceChartProps {
 
 export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartProps) {
   const [hoverPoint, setHoverPoint] = useState<{ price: number; date: string; x: number; y: number } | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
 
-  const chartHeight = 150;
-  const chartWidth = 400;
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    const resizeObserver = new ResizeObserver((entries) => {
+      if (!entries || entries.length === 0) return;
+      const { width, height } = entries[0].contentRect;
+      setDimensions({ width, height });
+    });
+
+    resizeObserver.observe(containerRef.current);
+
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  const chartWidth = dimensions.width || 800;
+  const chartHeight = dimensions.height || 400;
   const padding = { left: 50, right: 20, top: 20, bottom: 30 };
 
   const handleMouseMove = useCallback(
@@ -63,94 +79,98 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
     setHoverPoint(null);
   }, []);
 
-  if (!ticker) {
-    return (
-      <div className="relative h-48 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
+  const renderContent = () => {
+    if (!ticker) {
+      return (
         <div className="absolute inset-0 flex items-center justify-center">
-          <svg className="h-full w-full text-slate-800 opacity-30" viewBox="0 0 400 150" preserveAspectRatio="none">
-            <path
-              d="M0,100 Q50,80 100,90 T200,70 T300,85 T400,60"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-            />
-          </svg>
+          <div className="absolute inset-0 flex items-center justify-center">
+            <svg className="h-full w-full text-slate-800 opacity-30" viewBox="0 0 400 150" preserveAspectRatio="none">
+              <path
+                d="M0,100 Q50,80 100,90 T200,70 T300,85 T400,60"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+              />
+            </svg>
+          </div>
+          <p className="text-slate-500 text-sm z-10 bg-slate-900/80 px-3 py-1 rounded">
+            Search for a ticker to view price chart
+          </p>
         </div>
-        <p className="text-slate-500 text-sm z-10 bg-slate-900/80 px-3 py-1 rounded">
-          Search for a ticker to view price chart
-        </p>
-      </div>
-    );
-  }
+      );
+    }
 
-  if (loading) {
+    if (loading) {
+      return (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <Spinner />
+          <span className="ml-2 text-slate-400">Loading chart...</span>
+        </div>
+      );
+    }
+
+    if (data.length === 0) {
+      return (
+        <div className="absolute inset-0 flex items-center justify-center">
+          <p className="text-slate-500 text-sm">No price data available</p>
+        </div>
+      );
+    }
+
+    const prices = data.map((p) => p.price);
+    const minPrice = Math.min(...prices);
+    const maxPrice = Math.max(...prices);
+    const priceRange = maxPrice - minPrice || 1;
+
+    const getX = (index: number) =>
+      padding.left + (index / (data.length - 1)) * (chartWidth - padding.left - padding.right);
+
+    const getY = (price: number) =>
+      padding.top + (1 - (price - minPrice) / priceRange) * (chartHeight - padding.top - padding.bottom);
+
+    const points = data
+      .map((point, i) => `${getX(i)},${getY(point.price)}`)
+      .join(" ");
+
+    const numGridLinesY = 5;
+    const yTicks = Array.from({ length: numGridLinesY }, (_, i) =>
+      minPrice + (i * priceRange) / (numGridLinesY - 1)
+    );
+
+    const firstPrice = data[data.length - 1]?.price ?? 0;
+    const lastPrice = data[0]?.price ?? 0;
+    const priceChange = lastPrice - firstPrice;
+    const priceChangePercent = firstPrice ? (priceChange / firstPrice) * 100 : 0;
+    const isPositive = priceChange >= 0;
+
     return (
-      <div className="h-48 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
-        <Spinner />
-        <span className="ml-2 text-slate-400">Loading chart...</span>
-      </div>
-    );
-  }
-
-  if (data.length === 0) {
-    return (
-      <div className="h-48 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
-        <p className="text-slate-500 text-sm">No price data available</p>
-      </div>
-    );
-  }
-
-  const prices = data.map((p) => p.price);
-  const minPrice = Math.min(...prices);
-  const maxPrice = Math.max(...prices);
-  const priceRange = maxPrice - minPrice || 1;
-
-  const getX = (index: number) =>
-    padding.left + (index / (data.length - 1)) * (chartWidth - padding.left - padding.right);
-
-  const getY = (price: number) =>
-    padding.top + (1 - (price - minPrice) / priceRange) * (chartHeight - padding.top - padding.bottom);
-
-  const points = data
-    .map((point, i) => `${getX(i)},${getY(point.price)}`)
-    .join(" ");
-
-  const numGridLinesY = 5;
-  const yTicks = Array.from({ length: numGridLinesY }, (_, i) =>
-    minPrice + (i * priceRange) / (numGridLinesY - 1)
-  );
-
-  const firstPrice = data[data.length - 1]?.price ?? 0;
-  const lastPrice = data[0]?.price ?? 0;
-  const priceChange = lastPrice - firstPrice;
-  const priceChangePercent = firstPrice ? (priceChange / firstPrice) * 100 : 0;
-  const isPositive = priceChange >= 0;
-
-  return (
-    <div className="rounded-lg border border-slate-800 bg-slate-900 p-4">
-      <div className="flex items-center justify-between mb-3">
-        <div>
-          <span className="text-lg font-semibold text-white">{ticker}</span>
-          {currentPrice && (
-            <span className="ml-3 text-2xl font-bold text-white">
-              ${currentPrice.toFixed(2)}
-            </span>
-          )}
+      <>
+        <div className="absolute top-4 left-4 z-10">
+          <div className="flex items-center gap-3">
+            <div>
+              <span className="text-lg font-semibold text-white">{ticker}</span>
+              {currentPrice && (
+                <span className="ml-3 text-2xl font-bold text-white">
+                  ${currentPrice.toFixed(2)}
+                </span>
+              )}
+            </div>
+            <div className={`text-sm font-medium ${isPositive ? "text-green-400" : "text-red-400"}`}>
+              {isPositive ? "+" : ""}
+              {priceChange.toFixed(2)} ({isPositive ? "+" : ""}
+              {priceChangePercent.toFixed(2)}%)
+              <span className="text-slate-500 ml-1 text-xs">90d</span>
+            </div>
+          </div>
         </div>
-        <div className={`text-sm font-medium ${isPositive ? "text-green-400" : "text-red-400"}`}>
-          {isPositive ? "+" : ""}
-          {priceChange.toFixed(2)} ({isPositive ? "+" : ""}
-          {priceChangePercent.toFixed(2)}%)
-          <span className="text-slate-500 ml-1 text-xs">90d</span>
-        </div>
-      </div>
 
-      <div className="relative">
         <svg
           ref={svgRef}
+          width={chartWidth}
+          height={chartHeight}
           viewBox={`0 0 ${chartWidth} ${chartHeight}`}
-          className="w-full h-40"
-          preserveAspectRatio="xMidYMid meet"
+          className="w-full h-full absolute inset-0"
+          preserveAspectRatio="none"
           onMouseMove={handleMouseMove}
           onMouseLeave={handleMouseLeave}
         >
@@ -187,7 +207,7 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
                   y={y}
                   textAnchor="end"
                   dominantBaseline="middle"
-                  className="text-[8px] fill-slate-400"
+                  className="text-[10px] fill-slate-400"
                 >
                   ${tick.toFixed(2)}
                 </text>
@@ -253,7 +273,7 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
             x={chartWidth / 2}
             y={chartHeight - 5}
             textAnchor="middle"
-            className="text-[8px] fill-slate-400"
+            className="text-[10px] fill-slate-400"
           >
             Date
           </text>
@@ -263,8 +283,8 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
           <div
             className="absolute bg-slate-800 text-white text-xs px-2 py-1 rounded shadow-lg pointer-events-none z-10"
             style={{
-              left: `${(hoverPoint.x / chartWidth) * 100}%`,
-              top: `${(hoverPoint.y / chartHeight) * 100}%`,
+              left: hoverPoint.x,
+              top: hoverPoint.y,
               transform: "translate(-50%, -120%)",
             }}
           >
@@ -272,7 +292,16 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
             <div className="text-slate-400">{hoverPoint.date}</div>
           </div>
         )}
-      </div>
+      </>
+    );
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative w-full h-full min-h-[400px] rounded-lg border border-slate-800 bg-slate-900 overflow-hidden"
+    >
+      {renderContent()}
     </div>
   );
 }

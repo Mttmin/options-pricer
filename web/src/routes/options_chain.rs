@@ -13,24 +13,14 @@ pub async fn get_option_chain(
 
     let chain = state
         .fetcher
-        .fetch_option_chain(&symbol, OptionsEndpoint::Realtime)
-        .await;
-
-    let chain = match chain {
-        Ok(c) => c,
-        Err(_) => {
-            state
-                .fetcher
-                .fetch_option_chain(&symbol, OptionsEndpoint::Historical { date: None })
-                .await
-                .map_err(|e| {
-                    AppError::NotFound(format!(
-                        "Failed to fetch option chain for {}: {}",
-                        symbol, e
-                    ))
-                })?
-        }
-    };
+        .fetch_option_chain(&symbol, OptionsEndpoint::Historical { date: None })
+        .await
+        .map_err(|e| {
+            AppError::NotFound(format!(
+                "Failed to fetch option chain for {}: {}",
+                symbol, e
+            ))
+        })?;
 
     let smile = chain.extract_smile(None, 50);
 
