@@ -17,6 +17,11 @@ function formatGreek(val: number | undefined | null): string {
   return val.toFixed(6);
 }
 
+function formatMs(val: number | undefined | null): string {
+  if (val == null) return "-";
+  return `${val.toFixed(1)} ms`;
+}
+
 type GreekKey = "delta" | "gamma" | "theta" | "vega" | "rho";
 
 function greekStrengthClass(key: GreekKey, val: number | undefined | null): string {
@@ -58,6 +63,7 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
   if (!result) return null;
 
   const { pricing, greeks } = result;
+  const timings = pricing.timings;
 
   return (
     <div className="overflow-hidden rounded-lg border border-slate-800">
@@ -85,6 +91,11 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                 </td>
                 <td className="px-4 py-3 text-right text-slate-500">
                   Analytical
+                  {timings && (
+                    <div className="text-xs text-slate-500">
+                      Time: {formatMs(timings.black_scholes_ms)}
+                    </div>
+                  )}
                 </td>
               </tr>
 
@@ -101,6 +112,12 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                     </span>
                     <br />
                     <span>SE: {pricing.monte_carlo.std_error.toFixed(6)}</span>
+                    {timings && (
+                      <>
+                        <br />
+                        <span>Time: {formatMs(timings.monte_carlo_ms)}</span>
+                      </>
+                    )}
                   </td>
                 </tr>
               )}
@@ -115,6 +132,11 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                   </td>
                   <td className="px-4 py-3 text-right text-slate-500">
                     CRR Tree
+                    {timings && (
+                      <div className="text-xs text-slate-500">
+                        Time: {formatMs(timings.binomial_european_ms)}
+                      </div>
+                    )}
                   </td>
                 </tr>
               )}
@@ -133,6 +155,11 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                   </td>
                   <td className="px-4 py-3 text-right text-slate-500">
                     Early Exercise CRR
+                    {timings && (
+                      <div className="text-xs text-slate-500">
+                        Time: {formatMs(timings.binomial_american_ms)}
+                      </div>
+                    )}
                   </td>
                 </tr>
               )}
@@ -147,6 +174,11 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                   </td>
                   <td className="px-4 py-3 text-right text-slate-500">
                     Black's Formula
+                    {timings && (
+                      <div className="text-xs text-slate-500">
+                        Time: {formatMs(timings.bs_american_approx_ms)}
+                      </div>
+                    )}
                   </td>
                 </tr>
               )}
@@ -168,6 +200,12 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                     <span>
                       Avg iters/step: {pricing.penalty_solver.diagnostics.avg_iterations_per_step.toFixed(1)}
                     </span>
+                    {timings && (
+                      <>
+                        <br />
+                        <span>Time: {formatMs(timings.penalty_solver_ms)}</span>
+                      </>
+                    )}
                   </td>
                 </tr>
               )}
@@ -182,6 +220,11 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                   </td>
                   <td className="px-4 py-3 text-right text-slate-500 text-xs">
                     For comparison
+                    {timings && (
+                      <div className="text-xs text-slate-500">
+                        Time: {formatMs(timings.binomial_european_ms)}
+                      </div>
+                    )}
                   </td>
                 </tr>
               )}
@@ -189,6 +232,12 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
           )}
         </tbody>
       </table>
+
+      {timings && (
+        <div className="border-t border-slate-800 bg-slate-900 px-4 py-2 text-xs text-slate-500">
+          Total compute time: {formatMs(timings.total_ms)}
+        </div>
+      )}
 
       {greeks && (
         <div className="border-t border-slate-800 bg-slate-900 px-4 py-4">

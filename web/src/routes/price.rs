@@ -1,4 +1,5 @@
 use axum::Json;
+use std::time::Instant;
 use options::black_scholes::{black_scholes_approx_american, black_scholes_price};
 use options::exotics::{ChooserOption, ConvertibleBond};
 use options::optionspreads::{Direction, OptionSpreads};
@@ -25,6 +26,7 @@ pub async fn calculate_price(
 }
 
 fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
+    let total_start = Instant::now();
     let direction_sign = match req.direction {
         DirectionInput::Long => 1.0,
         DirectionInput::Short => -1.0,
@@ -42,13 +44,17 @@ fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
     };
 
     // Black-Scholes
+    let bs_start = Instant::now();
     let bs_price = black_scholes_price(option) * direction_sign;
+    let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
 
     // Monte Carlo (monomorphized for Call/Put)
+    let mc_start = Instant::now();
     let mc_result = match req.option_type {
         OptionTypeInput::Call => price_european::<Call>(&option, req.mc_simulations),
         OptionTypeInput::Put => price_european::<Put>(&option, req.mc_simulations),
     };
+    let mc_ms = mc_start.elapsed().as_secs_f64() * 1000.0;
     let (ci_lower, ci_upper) = mc_result.confidence_interval_95();
 
     // Binomial tree
@@ -57,6 +63,7 @@ fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
         req.volatility, req.risk_free_rate,
     );
 
+    let binomial_euro_start = Instant::now();
     let binomial_euro = match req.option_type {
         OptionTypeInput::Call => {
             let call = Call::new(req.strike_price, req.spot_price, req.volatility,
@@ -69,7 +76,9 @@ fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
             binomial_price(&put, &params, ExerciseStyle::European)
         }
     };
+    let binomial_euro_ms = binomial_euro_start.elapsed().as_secs_f64() * 1000.0;
 
+    let binomial_amer_start = Instant::now();
     let binomial_amer = match req.option_type {
         OptionTypeInput::Call => {
             let call = Call::new(req.strike_price, req.spot_price, req.volatility,
@@ -82,12 +91,21 @@ fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
             binomial_price(&put, &params, ExerciseStyle::American)
         }
     };
+    let binomial_amer_ms = binomial_amer_start.elapsed().as_secs_f64() * 1000.0;
 
     // Black's American approximation
+    let bs_amer_start = Instant::now();
     let bs_american = black_scholes_approx_american(option, None) * direction_sign;
+    let bs_amer_ms = bs_amer_start.elapsed().as_secs_f64() * 1000.0;
 
     // PenaltySolver (PDE method for American options)
+    let penalty_start = Instant::now();
     let penalty_result = compute_penalty_solver(&req, direction_sign).ok();
+    let penalty_ms = if penalty_result.is_some() {
+        Some(penalty_start.elapsed().as_secs_f64() * 1000.0)
+    } else {
+        None
+    };
 
     // Greeks
     let vol = req.volatility;
@@ -115,6 +133,15 @@ fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
             binomial_american: Some(binomial_amer * direction_sign),
             bs_american_approx: Some(bs_american),
             penalty_solver: penalty_result,
+            timings: Some(PricingTimings {
+                total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                black_scholes_ms: Some(bs_ms),
+                monte_carlo_ms: Some(mc_ms),
+                binomial_european_ms: Some(binomial_euro_ms),
+                binomial_american_ms: Some(binomial_amer_ms),
+                bs_american_approx_ms: Some(bs_amer_ms),
+                penalty_solver_ms: penalty_ms,
+            }),
         },
         greeks: Some(greeks),
     })
@@ -196,6 +223,7 @@ fn to_direction(d: DirectionInput) -> Direction {
 }
 
 fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
+    let total_start = Instant::now();
     let direction = to_direction(req.direction);
     let s = &req.strikes;
     let spot = req.spot_price;
@@ -261,12 +289,21 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
     };
 
     let binomial_depth: u16 = 1000;
+    let binomial_euro_start = Instant::now();
     let binomial_euro = spread_binomial(&spread, ExerciseStyle::European, binomial_depth);
+    let binomial_euro_ms = binomial_euro_start.elapsed().as_secs_f64() * 1000.0;
+
+    let binomial_amer_start = Instant::now();
     let binomial_amer = spread_binomial(&spread, ExerciseStyle::American, binomial_depth);
+    let binomial_amer_ms = binomial_amer_start.elapsed().as_secs_f64() * 1000.0;
 
+    let bs_start = Instant::now();
     let bs_price = spread.bs_pricing();
+    let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
 
+    let mc_start = Instant::now();
     let mc_result = monte_carlo(&spread, req.mc_simulations);
+    let mc_ms = mc_start.elapsed().as_secs_f64() * 1000.0;
     let (ci_lower, ci_upper) = mc_result.confidence_interval_95();
 
     let greeks = GreeksResult {
@@ -277,8 +314,14 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
         rho: spread.rho(vol, spot, rfr),
     };
 
+    let penalty_start = Instant::now();
     let penalty_result = if allow_pde {
         compute_spread_penalty_solver(spread).ok()
+    } else {
+        None
+    };
+    let penalty_ms = if penalty_result.is_some() {
+        Some(penalty_start.elapsed().as_secs_f64() * 1000.0)
     } else {
         None
     };
@@ -297,6 +340,15 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
             binomial_american: Some(binomial_amer),
             bs_american_approx: None,
             penalty_solver: penalty_result,
+            timings: Some(PricingTimings {
+                total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                black_scholes_ms: Some(bs_ms),
+                monte_carlo_ms: Some(mc_ms),
+                binomial_european_ms: Some(binomial_euro_ms),
+                binomial_american_ms: Some(binomial_amer_ms),
+                bs_american_approx_ms: None,
+                penalty_solver_ms: penalty_ms,
+            }),
         },
         greeks: Some(greeks),
     })
@@ -341,6 +393,7 @@ fn spread_binomial(spread: &OptionSpreads, style: ExerciseStyle, depth: u16) -> 
 fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
     match req.exotic_type {
         ExoticTypeInput::ConvertibleBond => {
+            let total_start = Instant::now();
             let params: ConvertibleBondRequest = serde_json::from_value(req.params)
                 .map_err(|e| AppError::BadRequest(format!("Invalid convertible bond params: {}", e)))?;
 
@@ -358,20 +411,34 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                 dividend_yield: params.dividend_yield,
             };
 
+            let bs_start = Instant::now();
+            let bs_price = cb.bs_pricing();
+            let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
+
             Ok(PriceResponse {
                 structure_type: "exotic".to_string(),
                 pricing: PricingResult {
-                    black_scholes: cb.bs_pricing(),
+                    black_scholes: bs_price,
                     monte_carlo: None,
                     binomial_european: None,
                     binomial_american: None,
                     bs_american_approx: None,
                     penalty_solver: None,
+                    timings: Some(PricingTimings {
+                        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                        black_scholes_ms: Some(bs_ms),
+                        monte_carlo_ms: None,
+                        binomial_european_ms: None,
+                        binomial_american_ms: None,
+                        bs_american_approx_ms: None,
+                        penalty_solver_ms: None,
+                    }),
                 },
                 greeks: None,
             })
         }
         ExoticTypeInput::ChooserOption => {
+            let total_start = Instant::now();
             let params: ChooserOptionRequest = serde_json::from_value(req.params)
                 .map_err(|e| AppError::BadRequest(format!("Invalid chooser option params: {}", e)))?;
 
@@ -381,15 +448,28 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                 params.choose_time,
             );
 
+            let bs_start = Instant::now();
+            let bs_price = chooser.bs_pricing();
+            let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
+
             Ok(PriceResponse {
                 structure_type: "exotic".to_string(),
                 pricing: PricingResult {
-                    black_scholes: chooser.bs_pricing(),
+                    black_scholes: bs_price,
                     monte_carlo: None,
                     binomial_european: None,
                     binomial_american: None,
                     bs_american_approx: None,
                     penalty_solver: None,
+                    timings: Some(PricingTimings {
+                        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                        black_scholes_ms: Some(bs_ms),
+                        monte_carlo_ms: None,
+                        binomial_european_ms: None,
+                        binomial_american_ms: None,
+                        bs_american_approx_ms: None,
+                        penalty_solver_ms: None,
+                    }),
                 },
                 greeks: None,
             })

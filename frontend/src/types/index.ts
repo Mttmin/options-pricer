@@ -122,6 +122,17 @@ export type PricingResult = {
   binomial_american?: number;
   bs_american_approx?: number;
   penalty_solver?: PenaltySolverResult;
+  timings?: PricingTimings;
+};
+
+export type PricingTimings = {
+  total_ms: number;
+  black_scholes_ms?: number | null;
+  monte_carlo_ms?: number | null;
+  binomial_european_ms?: number | null;
+  binomial_american_ms?: number | null;
+  bs_american_approx_ms?: number | null;
+  penalty_solver_ms?: number | null;
 };
 
 export type GreeksResult = {

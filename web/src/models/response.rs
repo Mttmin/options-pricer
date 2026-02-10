@@ -42,6 +42,25 @@ pub struct PricingResult {
     pub bs_american_approx: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub penalty_solver: Option<PenaltySolverResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<PricingTimings>,
+}
+
+#[derive(Serialize)]
+pub struct PricingTimings {
+    pub total_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub black_scholes_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monte_carlo_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binomial_european_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binomial_american_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bs_american_approx_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub penalty_solver_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
