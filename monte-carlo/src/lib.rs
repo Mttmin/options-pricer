@@ -361,7 +361,6 @@ where
         self.coefficients[i - 1]
     }
 
-
     /// Initialize first timestep for adaptive mode (equation 10.1 heuristic)
     fn initialize_adaptive_timesteps(&mut self) {
         self.time_grid.times[0] = 0.0;
@@ -442,7 +441,10 @@ where
         }
 
         if iterations >= max_iterations {
-            eprintln!("Warning: Penalty iteration did not converge at timestep {}", n);
+            eprintln!(
+                "Warning: Penalty iteration did not converge at timestep {}",
+                n
+            );
         }
         self.values[n + 1] = v_current.as_slice().to_vec();
 
@@ -453,19 +455,16 @@ where
     fn compute_next_timestep(&self, n: usize, dnorm: f64, scale_d: f64) -> f64 {
         let n_nodes = self.spatial_grid.num_nodes;
         let mut min_ratio = f64::INFINITY;
-        
         for i in 0..n_nodes {
             let v_new = self.values[n + 1][i];
             let v_old = self.values[n][i];
             let change = (v_new - v_old).abs();
             let denom = v_new.abs().max(v_old.abs()).max(scale_d);
-            
             if change > 1e-10 {
                 let ratio = dnorm * denom / change;
                 min_ratio = min_ratio.min(ratio);
             }
         }
-        
         let dt_current = self.time_grid.delta_tau(n);
         (min_ratio * dt_current).min(dt_current * 2.0) // Cap growth at 2x
     }
@@ -474,8 +473,10 @@ where
     pub fn solve(&mut self) {
         self.initialize();
 
-        println!("Solving with {} spatial nodes, {} timesteps...",
-                 self.spatial_grid.num_nodes, self.time_grid.num_steps);
+        println!(
+            "Solving with {} spatial nodes, {} timesteps...",
+            self.spatial_grid.num_nodes, self.time_grid.num_steps
+        );
 
         // Rannacher smoothing: 2 fully implicit steps, then Crank-Nicolson (Section 7)
         let rannacher_steps = 2;
@@ -497,35 +498,34 @@ where
             // }
 
             // Update timestep for adaptive mode
-            if let TimestepMode::Adaptive { dnorm, scale_d } = self.timestep_mode {
-                if n + 2 <= self.time_grid.num_steps {
-                    let tau_max = self.derivative.time_to_maturity();
-                    let tau_current = self.time_grid.times[n + 1];
-                    let remaining_time = tau_max - tau_current;
-                    let remaining_steps = self.time_grid.num_steps - (n + 1);
+            if let TimestepMode::Adaptive { dnorm, scale_d } = self.timestep_mode
+                && n + 2 <= self.time_grid.num_steps
+            {
+                let tau_max = self.derivative.time_to_maturity();
+                let tau_current = self.time_grid.times[n + 1];
+                let remaining_time = tau_max - tau_current;
+                let remaining_steps = self.time_grid.num_steps - (n + 1);
 
-                    // For last few steps, ensure we reach tau_max exactly
-                    if remaining_steps <= 3 {
-                        self.time_grid.times[n + 2] = tau_current + remaining_time / remaining_steps as f64;
-                    } else {
-                        let dt_next = self.compute_next_timestep(n, dnorm, scale_d);
-                        // Don't let timestep overshoot remaining time
-                        let dt_safe = dt_next.min(remaining_time / remaining_steps as f64 * 2.0);
-                        self.time_grid.times[n + 2] = (tau_current + dt_safe).min(tau_max);
-                    }
+                // For last few steps, ensure we reach tau_max exactly
+                if remaining_steps <= 3 {
+                    self.time_grid.times[n + 2] =
+                        tau_current + remaining_time / remaining_steps as f64;
+                } else {
+                    let dt_next = self.compute_next_timestep(n, dnorm, scale_d);
+                    // Don't let timestep overshoot remaining time
+                    let dt_safe = dt_next.min(remaining_time / remaining_steps as f64 * 2.0);
+                    self.time_grid.times[n + 2] = (tau_current + dt_safe).min(tau_max);
                 }
             }
         }
 
         println!("Solving complete!");
-}
-
+    }
 
     #[allow(dead_code)]
     /// Compute max American constraint error (equation 4.20)
     fn compute_american_error(&self) -> f64 {
         let mut max_error: f64 = 0.0;
-        
         for n in 0..=self.time_grid.num_steps {
             for i in 0..self.spatial_grid.num_nodes {
                 let violation = (self.payoff[i] - self.values[n][i]).max(0.0);
@@ -533,11 +533,11 @@ where
                 max_error = max_error.max(normalized);
             }
         }
-        
+
         max_error
     }
 
-        /// Get option value at initial spot price
+    /// Get option value at initial spot price
     pub fn option_value(&self) -> f64 {
         // Find bracketing nodes for spot price
         let spot = self.derivative.spot_price();
@@ -564,16 +564,21 @@ where
     /// Print solver diagnostics
     pub fn print_diagnostics(&mut self) {
         println!("\n=== Solver Diagnostics ===");
-        println!("Spatial grid: {} nodes from ${:.2} to ${:.2}",
-                 self.spatial_grid.num_nodes,
-                 self.spatial_grid.prices[0],
-                 self.spatial_grid.prices[self.spatial_grid.num_nodes - 1]);
-        println!("Time grid: {} steps, final τ = {:.6}",
-                 self.time_grid.num_steps,
-                 self.time_grid.times[self.time_grid.num_steps]);
+        println!(
+            "Spatial grid: {} nodes from ${:.2} to ${:.2}",
+            self.spatial_grid.num_nodes,
+            self.spatial_grid.prices[0],
+            self.spatial_grid.prices[self.spatial_grid.num_nodes - 1]
+        );
+        println!(
+            "Time grid: {} steps, final τ = {:.6}",
+            self.time_grid.num_steps, self.time_grid.times[self.time_grid.num_steps]
+        );
         println!("Total iterations: {}", self.total_iterations);
-        println!("Avg iterations/step: {:.2}",
-                 self.total_iterations as f64 / self.time_grid.num_steps as f64);
+        println!(
+            "Avg iterations/step: {:.2}",
+            self.total_iterations as f64 / self.time_grid.num_steps as f64
+        );
 
         // Compute and print max American error
         let error = self.compute_american_error();
@@ -581,7 +586,6 @@ where
         self.max_american_error = error;
     }
 }
-
 
 #[cfg(test)]
 mod tests {
