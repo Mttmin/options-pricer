@@ -3,9 +3,10 @@ import type { IVSmileData } from "../types/index.ts";
 
 interface OptionChainDisplayProps {
   data: IVSmileData;
+  underlyingPrice?: number | null;
 }
 
-export function OptionChainDisplay({ data }: OptionChainDisplayProps) {
+export function OptionChainDisplay({ data, underlyingPrice }: OptionChainDisplayProps) {
   const expirations = useMemo(() => {
     return Object.keys(data.smiles_by_expiry).sort();
   }, [data]);
@@ -35,9 +36,12 @@ export function OptionChainDisplay({ data }: OptionChainDisplayProps) {
     );
   }
 
+  const spot = underlyingPrice ?? data.underlying_price;
+
   const isATM = (strike: number) => {
-    const diff = Math.abs(strike - data.underlying_price);
-    const pct = diff / data.underlying_price;
+    if (!spot) return false;
+    const diff = Math.abs(strike - spot);
+    const pct = diff / spot;
     return pct < 0.02;
   };
 
@@ -182,7 +186,7 @@ export function OptionChainDisplay({ data }: OptionChainDisplayProps) {
       </div>
 
       <div className="mt-4 text-xs text-slate-500 text-center">
-        Data as of {data.data_date} • Underlying: ${data.underlying_price.toFixed(2)}
+        Data as of {data.data_date} • Underlying: {spot ? `$${spot.toFixed(2)}` : "-"}
       </div>
     </div>
   );

@@ -37,13 +37,14 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
     (e: React.MouseEvent<SVGSVGElement>) => {
       if (!svgRef.current || data.length === 0) return;
 
-      const prices = data.map((p) => p.price);
+      const sortedData = [...data].reverse();
+      const prices = sortedData.map((p) => p.price);
       const minPrice = Math.min(...prices);
       const maxPrice = Math.max(...prices);
       const priceRange = maxPrice - minPrice || 1;
 
       const getX = (index: number) =>
-        padding.left + (index / (data.length - 1)) * (chartWidth - padding.left - padding.right);
+        padding.left + (index / (sortedData.length - 1)) * (chartWidth - padding.left - padding.right);
 
       const getY = (price: number) =>
         padding.top + (1 - (price - minPrice) / priceRange) * (chartHeight - padding.top - padding.bottom);
@@ -58,11 +59,11 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
         return;
       }
 
-      const dataX = ((normalizedX - padding.left) / (chartWidth - padding.left - padding.right)) * (data.length - 1);
+      const dataX = ((normalizedX - padding.left) / (chartWidth - padding.left - padding.right)) * (sortedData.length - 1);
       const index = Math.round(dataX);
-      const clampedIndex = Math.max(0, Math.min(data.length - 1, index));
+      const clampedIndex = Math.max(0, Math.min(sortedData.length - 1, index));
 
-      const point = data[clampedIndex];
+      const point = sortedData[clampedIndex];
       if (point) {
         setHoverPoint({
           price: point.price,
@@ -117,7 +118,8 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
       );
     }
 
-    const prices = data.map((p) => p.price);
+    const sortedData = [...data].reverse();
+    const prices = sortedData.map((p) => p.price);
     const minPrice = Math.min(...prices);
     const maxPrice = Math.max(...prices);
     const priceRange = maxPrice - minPrice || 1;
@@ -128,7 +130,7 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
     const getY = (price: number) =>
       padding.top + (1 - (price - minPrice) / priceRange) * (chartHeight - padding.top - padding.bottom);
 
-    const points = data
+    const points = sortedData
       .map((point, i) => `${getX(i)},${getY(point.price)}`)
       .join(" ");
 
@@ -137,8 +139,8 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
       minPrice + (i * priceRange) / (numGridLinesY - 1)
     );
 
-    const firstPrice = data[data.length - 1]?.price ?? 0;
-    const lastPrice = data[0]?.price ?? 0;
+    const firstPrice = sortedData[0]?.price ?? 0;
+    const lastPrice = sortedData[sortedData.length - 1]?.price ?? 0;
     const priceChange = lastPrice - firstPrice;
     const priceChangePercent = firstPrice ? (priceChange / firstPrice) * 100 : 0;
     const isPositive = priceChange >= 0;

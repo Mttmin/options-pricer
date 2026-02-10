@@ -20,12 +20,17 @@ pub async fn get_market_data(
         .await
         .map_err(|e| AppError::NotFound(format!("Failed to fetch data for {}: {}", symbol, e)))?;
 
-    // Fetch IV in background, don't fail if unavailable
+    // Fetch IV in background, don't fail if unavailable. Use live spot for ATM selection.
     let iv = state
         .fetcher
-        .fetch_implied_volatility(&symbol, OptionsEndpoint::Historical { date: None })
+        .fetch_option_chain_with_underlying(
+            &symbol,
+            OptionsEndpoint::Historical { date: None },
+            market_data.spot_price,
+        )
         .await
-        .ok();
+        .ok()
+        .and_then(|chain| chain.summary_implied_volatility);
 
     Ok(Json(MarketDataResponse {
         symbol,

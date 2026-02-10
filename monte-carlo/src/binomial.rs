@@ -80,6 +80,7 @@ fn binomial_american<P: Payoff>(product: &P, parameters: &BinomialParameters) ->
     values[0]
 }
 
+#[derive(Clone, Copy)]
 pub enum ExerciseStyle {
     European,
     American,

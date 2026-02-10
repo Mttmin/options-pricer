@@ -31,25 +31,42 @@ pub async fn get_volatility(
     // VIX-correlated volatility (requires cloning DataFetcher since vix_volatility takes ownership)
     let fetcher_clone = state.fetcher.clone();
     let symbol_clone = symbol.clone();
-    let vix_correlated = tokio::task::spawn(async move {
-        volatility::vix_volatility(&symbol_clone, fetcher_clone, 120).await.ok()
+    let (vix_correlated, vix_fallback_used) = tokio::task::spawn(async move {
+        match volatility::vix_volatility(&symbol_clone, fetcher_clone, 120).await {
+            Ok(vix) => (Some(vix), Some(false)),
+            Err(fallback) => (Some(fallback), Some(true)),
+        }
     })
     .await
     .ok()
-    .flatten();
+    .unwrap_or((None, None));
 
-    // Implied volatility from options chain
-    let implied = state
+    // Implied volatility from options chain using live spot for ATM selection
+    let implied = if let Ok(market) = state
         .fetcher
-        .fetch_implied_volatility(&symbol, OptionsEndpoint::Historical { date: None })
+        .update_symbol(&symbol, query.lookback_days)
         .await
-        .ok();
+    {
+        state
+            .fetcher
+            .fetch_option_chain_with_underlying(
+                &symbol,
+                OptionsEndpoint::Historical { date: None },
+                market.spot_price,
+            )
+            .await
+            .ok()
+            .and_then(|chain| chain.summary_implied_volatility)
+    } else {
+        None
+    };
 
     Ok(Json(VolatilityResponse {
         symbol,
         historical,
         ema,
         vix_correlated,
+        vix_fallback_used,
         implied,
     }))
 }

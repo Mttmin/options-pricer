@@ -16,6 +16,8 @@ pub struct VolatilityResponse {
     pub historical: f64,
     pub ema: Option<f64>,
     pub vix_correlated: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vix_fallback_used: Option<bool>,
     pub implied: Option<f64>,
 }
 
@@ -38,6 +40,8 @@ pub struct PricingResult {
     pub binomial_american: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bs_american_approx: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub penalty_solver: Option<PenaltySolverResult>,
 }
 
 #[derive(Serialize)]
@@ -55,4 +59,21 @@ pub struct GreeksResult {
     pub theta: f64,
     pub vega: f64,
     pub rho: f64,
+}
+
+#[derive(Serialize)]
+pub struct PenaltySolverResult {
+    pub price: f64,
+    pub diagnostics: PenaltySolverDiagnostics,
+}
+
+#[derive(Serialize)]
+pub struct PenaltySolverDiagnostics {
+    pub total_iterations: usize,
+    pub avg_iterations_per_step: f64,
+    pub max_american_error: f64,
+    pub spatial_nodes: usize,
+    pub timesteps: usize,
+    pub grid_min_price: f64,
+    pub grid_max_price: f64,
 }

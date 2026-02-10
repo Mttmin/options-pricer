@@ -100,12 +100,28 @@ export type MonteCarloResult = {
   ci_upper: number;
 };
 
+export type PenaltySolverDiagnostics = {
+  total_iterations: number;
+  avg_iterations_per_step: number;
+  max_american_error: number;
+  spatial_nodes: number;
+  timesteps: number;
+  grid_min_price: number;
+  grid_max_price: number;
+};
+
+export type PenaltySolverResult = {
+  price: number;
+  diagnostics: PenaltySolverDiagnostics;
+};
+
 export type PricingResult = {
   black_scholes: number;
   monte_carlo?: MonteCarloResult;
   binomial_european?: number;
   binomial_american?: number;
   bs_american_approx?: number;
+  penalty_solver?: PenaltySolverResult;
 };
 
 export type GreeksResult = {
@@ -141,6 +157,7 @@ export type VolatilityResponse = {
   historical: number;
   ema: number | null;
   vix_correlated: number | null;
+  vix_fallback_used?: boolean | null;
   implied: number | null;
 };
 

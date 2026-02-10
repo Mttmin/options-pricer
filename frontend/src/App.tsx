@@ -84,7 +84,7 @@ export default function App() {
   });
 
   // Volatility source
-  const [volSource, setVolSource] = useState<VolSource>("implied");
+  const [volSource, setVolSource] = useState<VolSource>("ema");
 
   // Pricing state
   const [priceResult, setPriceResult] = useState<PriceResponse | null>(null);
@@ -429,7 +429,7 @@ export default function App() {
             {structureType !== "exotic" && (
               <DirectionToggle direction={direction} onChange={setDirection} />
             )}
-            {structureType === "single" && (
+            {structureType !== "exotic" && (
               <ExerciseStyleToggle
                 style={exerciseStyle}
                 onChange={setExerciseStyle}
@@ -510,7 +510,7 @@ export default function App() {
             <PricingTable
               result={priceResult}
               loading={priceLoading}
-              exerciseStyle={structureType === "single" ? exerciseStyle : "european"}
+              exerciseStyle={structureType === "exotic" ? "european" : exerciseStyle}
             />
           </section>
         )}
@@ -562,7 +562,10 @@ export default function App() {
         {/* Option Chain Display */}
         {ivSmileData && (
           <section className="mb-6">
-            <OptionChainDisplay data={ivSmileData} />
+            <OptionChainDisplay
+              data={ivSmileData}
+              underlyingPrice={marketData?.spot_price ?? null}
+            />
           </section>
         )}
       </div>

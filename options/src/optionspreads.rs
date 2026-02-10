@@ -58,6 +58,10 @@ impl OptionSpreads {
         OptionSpreads { components }
     }
 
+    pub fn components(&self) -> &[Position] {
+        &self.components
+    }
+
     pub fn new_straddle(
         direction: Direction,
         strike_price: f64,

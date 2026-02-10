@@ -7,9 +7,9 @@ interface VolatilityToggleProps {
 }
 
 const VOL_SOURCES: { value: VolSource; label: string; shortLabel: string }[] = [
+  { value: "ema", label: "EMA Vol", shortLabel: "EMA" },
   { value: "implied", label: "Implied Vol", shortLabel: "IV" },
   { value: "historical", label: "Historical", shortLabel: "Hist" },
-  { value: "ema", label: "EMA Vol", shortLabel: "EMA" },
   { value: "vix_correlated", label: "VIX Correlated", shortLabel: "VIX" },
 ];
 
@@ -36,6 +36,8 @@ export function VolatilityToggle({
                 ? volData?.ema
                 : volData?.vix_correlated;
         const isAvailable = vol != null;
+        const showVixFallback =
+          opt.value === "vix_correlated" && volData?.vix_fallback_used;
 
         return (
           <button
@@ -49,10 +51,15 @@ export function VolatilityToggle({
                   ? "bg-slate-800 text-slate-300 hover:bg-slate-700"
                   : "cursor-not-allowed bg-slate-900 text-slate-600"
             }`}
-            title={opt.label}
+            title={showVixFallback ? `${opt.label} (fallback: EMA)` : opt.label}
           >
             <span className="text-xs opacity-80">{opt.shortLabel}</span>
             <span className="font-semibold">{formatVol(vol)}</span>
+            {showVixFallback && (
+              <span className="mt-0.5 text-[10px] uppercase tracking-wide text-amber-300">
+                EMA fallback
+              </span>
+            )}
           </button>
         );
       })}

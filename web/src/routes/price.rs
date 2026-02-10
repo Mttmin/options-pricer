@@ -2,9 +2,9 @@ use axum::Json;
 use options::black_scholes::{black_scholes_approx_american, black_scholes_price};
 use options::exotics::{ChooserOption, ConvertibleBond};
 use options::optionspreads::{Direction, OptionSpreads};
-use options::{BlackScholesPrice, Call, Greeks, Options, Put};
+use options::{BlackScholesPrice, Call, Greeks, MonteCarloParameters, Options, Payoff, Put};
 use monte_carlo::binomial::{binomial_price, BinomialParameters, ExerciseStyle};
-use monte_carlo::{monte_carlo, price_european};
+use monte_carlo::{monte_carlo, price_european, PenaltySolver, TimestepMode};
 
 use crate::error::AppError;
 use crate::models::request::*;
@@ -86,6 +86,9 @@ fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
     // Black's American approximation
     let bs_american = black_scholes_approx_american(option, None) * direction_sign;
 
+    // PenaltySolver (PDE method for American options)
+    let penalty_result = compute_penalty_solver(&req, direction_sign).ok();
+
     // Greeks
     let vol = req.volatility;
     let spot = req.spot_price;
@@ -111,8 +114,77 @@ fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
             binomial_european: Some(binomial_euro * direction_sign),
             binomial_american: Some(binomial_amer * direction_sign),
             bs_american_approx: Some(bs_american),
+            penalty_solver: penalty_result,
         },
         greeks: Some(greeks),
+    })
+}
+
+fn compute_penalty_solver(
+    req: &SingleOptionRequest,
+    direction_sign: f64,
+) -> Result<PenaltySolverResult, AppError> {
+    let spatial_nodes = 200;
+    let timesteps = 100;
+    let penalty_tolerance = 1e-6;
+    let timestep_mode = TimestepMode::Adaptive { dnorm: 0.02, scale_d: 1.0 };
+
+    match req.option_type {
+        OptionTypeInput::Call => {
+            let call = Call::new(
+                req.strike_price, req.spot_price, req.volatility,
+                req.risk_free_rate, req.time_to_maturity, req.dividend_yield
+            );
+            solve_and_extract(call, spatial_nodes, timesteps, penalty_tolerance, timestep_mode, direction_sign)
+        }
+        OptionTypeInput::Put => {
+            let put = Put::new(
+                req.strike_price, req.spot_price, req.volatility,
+                req.risk_free_rate, req.time_to_maturity, req.dividend_yield
+            );
+            solve_and_extract(put, spatial_nodes, timesteps, penalty_tolerance, timestep_mode, direction_sign)
+        }
+    }
+}
+
+fn solve_and_extract<T>(
+    derivative: T,
+    spatial_nodes: usize,
+    timesteps: usize,
+    penalty_tolerance: f64,
+    timestep_mode: TimestepMode,
+    direction_sign: f64,
+) -> Result<PenaltySolverResult, AppError>
+where
+    T: Payoff + MonteCarloParameters,
+{
+    let mut solver = PenaltySolver::new(
+        derivative,
+        spatial_nodes,
+        timesteps,
+        penalty_tolerance,
+        timestep_mode,
+    );
+
+    solver.initialize();
+    solver.solve();
+
+    let price = solver.option_value() * direction_sign;
+    let avg_iters = solver.total_iterations as f64 / solver.time_grid.num_steps as f64;
+    let grid_min = solver.spatial_grid.prices[0];
+    let grid_max = solver.spatial_grid.prices[solver.spatial_grid.num_nodes - 1];
+
+    Ok(PenaltySolverResult {
+        price,
+        diagnostics: PenaltySolverDiagnostics {
+            total_iterations: solver.total_iterations,
+            avg_iterations_per_step: avg_iters,
+            max_american_error: solver.max_american_error,
+            spatial_nodes: solver.spatial_grid.num_nodes,
+            timesteps: solver.time_grid.num_steps,
+            grid_min_price: grid_min,
+            grid_max_price: grid_max,
+        },
     })
 }
 
@@ -132,61 +204,65 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
     let ttm = req.time_to_maturity;
     let div = req.dividend_yield;
 
-    let spread = match req.spread_type {
+    let (spread, allow_pde) = match req.spread_type {
         SpreadTypeInput::Straddle => {
             let strike = s.strike.ok_or(AppError::BadRequest("straddle requires 'strike'".into()))?;
-            OptionSpreads::new_straddle(direction, strike, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_straddle(direction, strike, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::Strangle => {
             let sc = s.strike_call.ok_or(AppError::BadRequest("strangle requires 'strike_call'".into()))?;
             let sp = s.strike_put.ok_or(AppError::BadRequest("strangle requires 'strike_put'".into()))?;
-            OptionSpreads::new_strangle(direction, sc, sp, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_strangle(direction, sc, sp, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::Strip => {
             let strike = s.strike.ok_or(AppError::BadRequest("strip requires 'strike'".into()))?;
-            OptionSpreads::new_strip(strike, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_strip(strike, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::Strap => {
             let strike = s.strike.ok_or(AppError::BadRequest("strap requires 'strike'".into()))?;
-            OptionSpreads::new_strap(strike, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_strap(strike, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::SyntheticStock => {
             let strike = s.strike.ok_or(AppError::BadRequest("synthetic_stock requires 'strike'".into()))?;
-            OptionSpreads::new_synthetic_stock(direction, strike, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_synthetic_stock(direction, strike, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::BullSpreadCall => {
             let sl = s.strike_low.ok_or(AppError::BadRequest("bull_spread_call requires 'strike_low'".into()))?;
             let sh = s.strike_high.ok_or(AppError::BadRequest("bull_spread_call requires 'strike_high'".into()))?;
-            OptionSpreads::new_bull_spread_call(sl, sh, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_bull_spread_call(sl, sh, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::BullSpreadPut => {
             let sl = s.strike_low.ok_or(AppError::BadRequest("bull_spread_put requires 'strike_low'".into()))?;
             let sh = s.strike_high.ok_or(AppError::BadRequest("bull_spread_put requires 'strike_high'".into()))?;
-            OptionSpreads::new_bull_spread_put(sl, sh, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_bull_spread_put(sl, sh, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::BearSpreadCall => {
             let sl = s.strike_low.ok_or(AppError::BadRequest("bear_spread_call requires 'strike_low'".into()))?;
             let sh = s.strike_high.ok_or(AppError::BadRequest("bear_spread_call requires 'strike_high'".into()))?;
-            OptionSpreads::new_bear_spread_call(sl, sh, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_bear_spread_call(sl, sh, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::BearSpreadPut => {
             let sl = s.strike_low.ok_or(AppError::BadRequest("bear_spread_put requires 'strike_low'".into()))?;
             let sh = s.strike_high.ok_or(AppError::BadRequest("bear_spread_put requires 'strike_high'".into()))?;
-            OptionSpreads::new_bear_spread_put(sl, sh, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_bear_spread_put(sl, sh, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::Butterfly => {
             let sl = s.strike_low.ok_or(AppError::BadRequest("butterfly requires 'strike_low'".into()))?;
             let sh = s.strike_high.ok_or(AppError::BadRequest("butterfly requires 'strike_high'".into()))?;
             let sm = s.strike_medium.ok_or(AppError::BadRequest("butterfly requires 'strike_medium'".into()))?;
-            OptionSpreads::new_butterfly(direction, sl, sh, sm, spot, vol, rfr, ttm, div)
+            (OptionSpreads::new_butterfly(direction, sl, sh, sm, spot, vol, rfr, ttm, div), true)
         }
         SpreadTypeInput::CalendarSpread => {
             let strike = s.strike.ok_or(AppError::BadRequest("calendar_spread requires 'strike'".into()))?;
             let st = req.short_term_maturity.ok_or(AppError::BadRequest("calendar_spread requires 'short_term_maturity'".into()))?;
             let lt = req.long_term_maturity.ok_or(AppError::BadRequest("calendar_spread requires 'long_term_maturity'".into()))?;
-            OptionSpreads::new_calendar_spread(direction, strike, spot, vol, rfr, st, lt, div)
+            (OptionSpreads::new_calendar_spread(direction, strike, spot, vol, rfr, st, lt, div), false)
         }
     };
+
+    let binomial_depth: u16 = 1000;
+    let binomial_euro = spread_binomial(&spread, ExerciseStyle::European, binomial_depth);
+    let binomial_amer = spread_binomial(&spread, ExerciseStyle::American, binomial_depth);
 
     let bs_price = spread.bs_pricing();
 
@@ -201,6 +277,12 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
         rho: spread.rho(vol, spot, rfr),
     };
 
+    let penalty_result = if allow_pde {
+        compute_spread_penalty_solver(spread).ok()
+    } else {
+        None
+    };
+
     Ok(PriceResponse {
         structure_type: "spread".to_string(),
         pricing: PricingResult {
@@ -211,12 +293,49 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
                 ci_lower,
                 ci_upper,
             }),
-            binomial_european: None,
-            binomial_american: None,
+            binomial_european: Some(binomial_euro),
+            binomial_american: Some(binomial_amer),
             bs_american_approx: None,
+            penalty_solver: penalty_result,
         },
         greeks: Some(greeks),
     })
+}
+
+fn compute_spread_penalty_solver(
+    spread: OptionSpreads,
+) -> Result<PenaltySolverResult, AppError> {
+    let spatial_nodes = 200;
+    let timesteps = 100;
+    let penalty_tolerance = 1e-6;
+    let timestep_mode = TimestepMode::Adaptive { dnorm: 0.02, scale_d: 1.0 };
+
+    solve_and_extract(
+        spread,
+        spatial_nodes,
+        timesteps,
+        penalty_tolerance,
+        timestep_mode,
+        1.0,
+    )
+}
+
+fn spread_binomial(spread: &OptionSpreads, style: ExerciseStyle, depth: u16) -> f64 {
+    spread
+        .components()
+        .iter()
+        .map(|position| {
+            let option = position.option;
+            let params = BinomialParameters::new(
+                option.spot_price(),
+                depth,
+                option.time_to_maturity(),
+                option.volatility(),
+                option.risk_free_rate(),
+            );
+            binomial_price(&option, &params, style) * position.weight as f64
+        })
+        .sum()
 }
 
 fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
@@ -247,6 +366,7 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                     binomial_european: None,
                     binomial_american: None,
                     bs_american_approx: None,
+                    penalty_solver: None,
                 },
                 greeks: None,
             })
@@ -269,6 +389,7 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                     binomial_european: None,
                     binomial_american: None,
                     bs_american_approx: None,
+                    penalty_solver: None,
                 },
                 greeks: None,
             })

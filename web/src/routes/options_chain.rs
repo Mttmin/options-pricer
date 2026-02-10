@@ -11,9 +11,24 @@ pub async fn get_option_chain(
 ) -> Result<Json<VolatilitySmile>, AppError> {
     let symbol = symbol.to_uppercase();
 
+    let market_data = state
+        .fetcher
+        .update_symbol(&symbol, 90)
+        .await
+        .map_err(|e| {
+            AppError::NotFound(format!(
+                "Failed to fetch spot price for {}: {}",
+                symbol, e
+            ))
+        })?;
+
     let chain = state
         .fetcher
-        .fetch_option_chain(&symbol, OptionsEndpoint::Historical { date: None })
+        .fetch_option_chain_with_underlying(
+            &symbol,
+            OptionsEndpoint::Historical { date: None },
+            market_data.spot_price,
+        )
         .await
         .map_err(|e| {
             AppError::NotFound(format!(

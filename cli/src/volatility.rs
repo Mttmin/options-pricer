@@ -88,24 +88,55 @@ fn ema_volatility_all(data: &[(String, f64)],n_days_per: u16, lambda: f64) -> Re
     }
 }
 
-pub async fn vix_volatility(symbol: &str, data_fetcher:  DataFetcher, num_days: u16) -> Result<f64,f64>{
-    // get historical VIX data and close price
-    let mut vix_data: Vec<f64> = data_fetcher.fetch_fred_vix(num_days).await.expect("Vix not possible");
+pub async fn vix_volatility(symbol: &str, data_fetcher: DataFetcher, num_days: u16) -> Result<f64, f64> {
+    let (stock_data, _) = match data_fetcher
+        .get_historical_data(symbol, num_days.into())
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => return Err(0.0),
+    };
+
+    let fallback = ema_volatility(&stock_data, 30, 0.9).unwrap_or_else(|v| v);
+
+    let mut vix_data = match data_fetcher.fetch_fred_vix(num_days).await {
+        Ok(data) => data,
+        Err(_) => return Err(fallback),
+    };
+
+    if vix_data.len() < 2 || stock_data.len() <= num_days as usize {
+        return Err(fallback);
+    }
+
     vix_data.iter_mut().for_each(|x| *x /= 100.0);
-    let stock_data: Vec<(String, f64)> = data_fetcher.get_historical_data(symbol, num_days.into()).await.expect("Stock data not available").0;
-    let mut ema_vol: Vec<f64> = ema_volatility_all(&stock_data, num_days, 0.9).unwrap();
-    // extract latest vix and volatility
-    let last_vix = vix_data.pop().unwrap_or(-1.0);
+
+    let mut ema_vol = match ema_volatility_all(&stock_data, num_days, 0.9) {
+        Ok(data) => data,
+        Err(_) => return Err(fallback),
+    };
+
+    if ema_vol.is_empty() {
+        return Err(fallback);
+    }
+
+    let last_vix = vix_data.pop().unwrap_or(0.0);
     let latest_ema_vol = ema_vol[0];
     ema_vol.remove(0);
-    // calculate the correlation between previous vix and price vol for next day
-    let correlation = calculate_pearson_correlation(&ema_vol, &vix_data);
-    // use the ema and correlation to construct and estimate of today's volatility
-    if correlation < 0.2{
-        eprintln!("Not using vix correlation as it is too low");
-        return Err(latest_ema_vol)
+
+    let min_len = ema_vol.len().min(vix_data.len());
+    if min_len == 0 {
+        return Err(fallback);
     }
-    Ok(last_vix*correlation + (1.0-correlation)*latest_ema_vol)
+
+    let ema_slice = &ema_vol[ema_vol.len() - min_len..];
+    let vix_slice = &vix_data[vix_data.len() - min_len..];
+    let correlation = calculate_pearson_correlation(ema_slice, vix_slice);
+
+    if correlation < 0.2 {
+        return Err(latest_ema_vol);
+    }
+
+    Ok(last_vix * correlation + (1.0 - correlation) * latest_ema_vol)
 }
 #[cfg(test)]
 mod tests {
