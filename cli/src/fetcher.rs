@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use crate::options_chain::{OptionChain, OptionContract, OptionType, OptionsEndpoint};
+use options::black_scholes::calculate_iv;
 
 /// Configuration struct for API keys loaded from api_keys.json
 #[derive(Debug, Deserialize)]
@@ -20,7 +21,7 @@ pub struct ApiConfig {
 }
 
 /// Load API keys from api_keys.json in the project root
-pub fn load_api_keys() -> Result<ApiConfig, Box<dyn std::error::Error>> {
+pub fn load_api_keys() -> Result<ApiConfig, Box<dyn std::error::Error + Send + Sync>> {
     let possible_paths = vec![
         "api_keys.json",    // Current directory
         "../api_keys.json", // Parent directory (when running from cli/)
@@ -73,8 +74,11 @@ pub struct MarketData {
     pub corporate_action_detected: bool,
     /// Implied volatility from option chain (None if not fetched)
     pub implied_volatility: Option<f64>,
+    /// Dividend yield as decimal (e.g., 0.0044 for 0.44%)
+    pub dividend_yield: Option<f64>,
 }
 
+#[derive(Clone)]
 pub struct DataFetcher {
     alpha_vantage_key: String,
     finnhub_key: String,
@@ -82,12 +86,24 @@ pub struct DataFetcher {
     cache: Arc<RwLock<HashMap<String, MarketData>>>,
     fred_key: String,
     options_cache: Arc<RwLock<HashMap<String, OptionChain>>>,
+    sofr_cache: Arc<RwLock<Option<(DateTime<Utc>, f64)>>>,
+    fundamentals_cache: Arc<RwLock<HashMap<String, (DateTime<Utc>, CompanyFundamentals)>>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Observation {
     date: String,
     value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompanyFundamentals {
+    #[serde(rename = "DividendYield")]
+    pub dividend_yield: Option<String>,
+    #[serde(rename = "DividendPerShare")]
+    pub dividend_per_share: Option<String>,
+    #[serde(rename = "MarketCapitalization")]
+    pub market_cap: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,13 +131,15 @@ impl DataFetcher {
             client: reqwest::Client::new(),
             cache: Arc::new(RwLock::new(HashMap::new())),
             options_cache: Arc::new(RwLock::new(HashMap::new())),
+            sofr_cache: Arc::new(RwLock::new(None)),
+            fundamentals_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     async fn get_current_price_finnhub(
         &self,
         symbol: &str,
-    ) -> Result<FinnhubQuote, Box<dyn std::error::Error>> {
+    ) -> Result<FinnhubQuote, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://finnhub.io/api/v1/quote?symbol={}",
             symbol
@@ -143,7 +161,7 @@ impl DataFetcher {
     async fn get_current_price_alpha_vantage(
         &self,
         symbol: &str,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={}&entitlement=delayed&apikey={}",
             symbol, self.alpha_vantage_key
@@ -176,19 +194,19 @@ impl DataFetcher {
     async fn get_current_price_with_fallback(
         &self,
         symbol: &str,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
-        // Try Finnhub first
-        match self.get_current_price_finnhub(symbol).await {
-            Ok(quote) => Ok(quote.c),
-            Err(finnhub_error) => {
-                // Finnhub failed, fall back to Alpha Vantage
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        // Try Alpha Vantage first (user has premium key = real-time data)
+        match self.get_current_price_alpha_vantage(symbol).await {
+            Ok(price) => Ok(price),
+            Err(av_error) => {
+                // Alpha Vantage failed, fall back to Finnhub
                 eprintln!(
-                    "WARNING: Finnhub real-time quote failed for {} ({}). Falling back to Alpha Vantage with 15-minute delayed data.",
-                    symbol, finnhub_error
+                    "WARNING: Alpha Vantage quote failed for {} ({}). Falling back to Finnhub real-time.",
+                    symbol, av_error
                 );
 
-                // Try Alpha Vantage fallback
-                self.get_current_price_alpha_vantage(symbol).await
+                // Try Finnhub fallback
+                self.get_current_price_finnhub(symbol).await.map(|q| q.c)
             }
         }
     }
@@ -197,7 +215,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         lookback_days: usize,
-    ) -> Result<(Vec<(String, f64)>, f64), Box<dyn std::error::Error>> {
+    ) -> Result<(Vec<(String, f64)>, f64), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={}&outputsize=full&apikey={}",
             symbol, self.alpha_vantage_key
@@ -293,7 +311,7 @@ impl DataFetcher {
     pub async fn fetch_fred_vix(
         &self,
         num_days: u16,
-    ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<f64>, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!(
             "https://api.stlouisfed.org/fred/series/observations?series_id=VIXCLS&api_key={}&file_type=json&limit={}&sort_order=desc",
             &self.fred_key, &num_days
@@ -338,6 +356,107 @@ impl DataFetcher {
         Ok(vix_values)
     }
 
+    /// Fetch the current SOFR (Secured Overnight Financing Rate) from FRED API
+    ///
+    /// Uses the SOFR30DAYAVG series for stability. Returns rate as a decimal (e.g., 0.0531 for 5.31%)
+    /// Caches result for 24 hours to avoid excessive API calls
+    pub async fn fetch_fred_sofr(&self) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        // Check cache (24-hour TTL)
+        let cache = self.sofr_cache.read().await;
+        if let Some((timestamp, rate)) = *cache {
+            if Utc::now() - timestamp < Duration::hours(24) {
+                return Ok(rate);
+            }
+        }
+        drop(cache);
+
+        // Fetch from FRED using SOFR30DAYAVG series (more stable than daily SOFR)
+        let url = format!(
+            "https://api.stlouisfed.org/fred/series/observations?series_id=SOFR30DAYAVG&api_key={}&file_type=json&limit=1&sort_order=desc",
+            &self.fred_key
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json::<FredResponse>()
+            .await?;
+
+        // Check if we received any observations
+        if response.observations.is_empty() {
+            return Err("No SOFR observations found in FRED response".into());
+        }
+
+        // Parse rate from latest observation
+        let rate_str = &response.observations[0].value;
+        let rate_pct: f64 = rate_str.parse().map_err(|e| {
+            format!("Failed to parse SOFR value '{}': {}", rate_str, e)
+        })?;
+
+        // Convert percentage to decimal (e.g., 5.31 -> 0.0531)
+        let rate = rate_pct / 100.0;
+
+        // Validate range (SOFR typically 0-15%)
+        if rate < 0.0 || rate > 0.15 {
+            return Err(format!("SOFR rate {:.4} outside expected range (0-0.15)", rate).into());
+        }
+
+        // Update cache
+        let mut cache = self.sofr_cache.write().await;
+        *cache = Some((Utc::now(), rate));
+
+        Ok(rate)
+    }
+
+    /// Fetch company fundamentals from Alpha Vantage OVERVIEW endpoint
+    ///
+    /// Returns dividend yield, dividend per share, and market cap
+    /// Caches result for 7 days as fundamentals don't change frequently
+    pub async fn fetch_company_fundamentals(
+        &self,
+        symbol: &str,
+    ) -> Result<CompanyFundamentals, Box<dyn std::error::Error + Send + Sync>> {
+        // Check cache (7-day TTL)
+        let cache = self.fundamentals_cache.read().await;
+        if let Some((timestamp, fundamentals)) = cache.get(symbol) {
+            if Utc::now() - *timestamp < Duration::days(7) {
+                return Ok(fundamentals.clone());
+            }
+        }
+        drop(cache);
+
+        // Fetch from Alpha Vantage OVERVIEW endpoint
+        let url = format!(
+            "https://www.alphavantage.co/query?function=OVERVIEW&symbol={}&apikey={}",
+            symbol, &self.alpha_vantage_key
+        );
+
+        let response = self.client.get(&url).send().await?;
+
+        // Check for error responses
+        let text = response.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+
+        if let Some(note) = json.get("Note") {
+            return Err(format!("Alpha Vantage rate limit: {}", note).into());
+        }
+
+        if let Some(error) = json.get("Error Message") {
+            return Err(format!("Alpha Vantage error: {}", error).into());
+        }
+
+        // Parse fundamentals
+        let fundamentals: CompanyFundamentals = serde_json::from_value(json)?;
+
+        // Update cache
+        let mut cache = self.fundamentals_cache.write().await;
+        cache.insert(symbol.to_string(), (Utc::now(), fundamentals.clone()));
+
+        Ok(fundamentals)
+    }
+
     fn detect_corporate_action(
         current_price: f64,
         yesterday_adjusted: f64,
@@ -351,7 +470,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         lookback_days: usize,
-    ) -> Result<MarketData, Box<dyn std::error::Error>> {
+    ) -> Result<MarketData, Box<dyn std::error::Error + Send + Sync>> {
         let now = Utc::now();
         let today = now.date_naive();
 
@@ -375,6 +494,7 @@ impl DataFetcher {
             yesterday_adjusted_close: 0.0,
             corporate_action_detected: false,
             implied_volatility: None,
+            dividend_yield: None,
         });
 
         // Fetch from both APIs in parallel if we need both
@@ -386,9 +506,11 @@ impl DataFetcher {
 
             let hist_future = self.get_historical_data(symbol, lookback_days);
             let price_future = self.get_current_price_with_fallback(symbol);
+            let fundamentals_future = self.fetch_company_fundamentals(symbol);
 
-            // Execute both requests in parallel
-            let (hist_result, price_result) = tokio::join!(hist_future, price_future);
+            // Execute all requests in parallel
+            let (hist_result, price_result, fundamentals_result) =
+                tokio::join!(hist_future, price_future, fundamentals_future);
 
             // Process historical data
             let (prices, yesterday_close) = hist_result?;
@@ -415,6 +537,13 @@ impl DataFetcher {
             }
 
             data.last_price_update = now;
+
+            // Process fundamentals (non-critical, don't fail if it errors)
+            if let Ok(fundamentals) = fundamentals_result {
+                data.dividend_yield = fundamentals.dividend_yield
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|&v| v > 0.0);
+            }
         } else if needs_vol_update {
             // Only need historical data
             // eprintln!(
@@ -495,7 +624,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         lookback_days: usize,
-    ) -> Result<MarketData, Box<dyn std::error::Error>> {
+    ) -> Result<MarketData, Box<dyn std::error::Error + Send + Sync>> {
         self.update_single_symbol(symbol, lookback_days).await
     }
 
@@ -508,7 +637,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         endpoint: OptionsEndpoint,
-    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+    ) -> Result<OptionChain, Box<dyn std::error::Error + Send + Sync>> {
         let cache_key = match endpoint {
             OptionsEndpoint::Historical { date } => match date {
                 Some(d) => format!("{}:hist:{}", symbol, d),
@@ -531,8 +660,8 @@ impl DataFetcher {
         let url = match endpoint {
             OptionsEndpoint::Historical { date } => {
                 let mut u = format!(
-                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}",
-                    symbol
+                    "https://www.alphavantage.co/query?function=HISTORICAL_OPTIONS&symbol={}&require_greeks=true&apikey={}",
+                    symbol, self.alpha_vantage_key
                 );
                 if let Some(d) = date {
                     u.push_str(&format!("&date={}", d));
@@ -541,8 +670,8 @@ impl DataFetcher {
             }
             OptionsEndpoint::Realtime => {
                 format!(
-                    "https://www.alphavantage.co/query?function=REALTIME_OPTIONS&symbol={}&require_greeks=true",
-                    symbol
+                    "https://www.alphavantage.co/query?function=REALTIME_OPTIONS&symbol={}&require_greeks=true&apikey={}",
+                    symbol, self.alpha_vantage_key
                 )
             }
         };
@@ -550,7 +679,6 @@ impl DataFetcher {
         let response = self
             .client
             .get(&url)
-            .header("X-API-KEY", &self.alpha_vantage_key)
             .send()
             .await?
             .json::<serde_json::Value>()
@@ -594,7 +722,7 @@ impl DataFetcher {
     fn parse_options_response(
         symbol: &str,
         response: &serde_json::Value,
-    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+    ) -> Result<OptionChain, Box<dyn std::error::Error + Send + Sync>> {
         let data_array = response
             .get("data")
             .and_then(|d| d.as_array())
@@ -630,6 +758,39 @@ impl DataFetcher {
             summary_implied_volatility: None,
         };
 
+        // Fallback IV Calculation
+        for c in chain.contracts.iter_mut() {
+            if c.implied_volatility == 0.0 || c.implied_volatility.abs() < 1e-6 {
+                let t = (c.expiration - chain.data_date).num_days() as f64 / 365.0;
+                let r = 0.05;
+                let q = 0.0;
+                let is_call = match c.option_type {
+                    OptionType::Call => true,
+                    OptionType::Put => false,
+                };
+
+                let price = if c.mark > 0.0 {
+                    c.mark
+                } else if c.bid > 0.0 && c.ask > 0.0 {
+                    (c.bid + c.ask) / 2.0
+                } else {
+                    c.last
+                };
+
+                if t > 0.0 && price > 0.0 {
+                    c.implied_volatility = calculate_iv(
+                        price,
+                        chain.underlying_price,
+                        c.strike,
+                        t,
+                        r,
+                        q,
+                        is_call,
+                    );
+                }
+            }
+        }
+
         chain.compute_summary_iv();
 
         Ok(chain)
@@ -638,7 +799,7 @@ impl DataFetcher {
     /// Parse a single contract JSON object from the Alpha Vantage response.
     fn parse_option_contract(
         item: &serde_json::Value,
-    ) -> Result<OptionContract, Box<dyn std::error::Error>> {
+    ) -> Result<OptionContract, Box<dyn std::error::Error + Send + Sync>> {
         let parse_f64 = |key: &str| -> f64 {
             item.get(key)
                 .and_then(|v| {
@@ -747,7 +908,7 @@ impl DataFetcher {
         &self,
         symbol: &str,
         endpoint: OptionsEndpoint,
-    ) -> Result<f64, Box<dyn std::error::Error>> {
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         let chain = self.fetch_option_chain(symbol, endpoint).await?;
 
         let iv = chain
@@ -772,7 +933,7 @@ impl DataFetcher {
         symbol: &str,
         endpoint: OptionsEndpoint,
         underlying_price: f64,
-    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+    ) -> Result<OptionChain, Box<dyn std::error::Error + Send + Sync>> {
         let mut chain = self.fetch_option_chain(symbol, endpoint).await?;
         chain.underlying_price = underlying_price;
         chain.compute_summary_iv();
@@ -783,7 +944,7 @@ impl DataFetcher {
     pub async fn fetch_option_chain_with_fallback(
         &self,
         symbol: &str,
-    ) -> Result<OptionChain, Box<dyn std::error::Error>> {
+    ) -> Result<OptionChain, Box<dyn std::error::Error + Send + Sync>> {
         match self
             .fetch_option_chain(symbol, OptionsEndpoint::Realtime)
             .await
@@ -803,6 +964,63 @@ impl DataFetcher {
                 }
             }
         }
+    }
+
+    /// Search for ticker symbols using Finnhub API
+    /// Returns a vector of (symbol, description, type) tuples
+    pub async fn search_symbols(
+        &self,
+        query: &str,
+    ) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!(
+            "https://finnhub.io/api/v1/search?q={}",
+            query
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-Finnhub-Token", &self.finnhub_key)
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+
+        let results = response["result"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        let symbol = item["symbol"].as_str()?.to_string();
+                        let description = item["description"].as_str().unwrap_or("").to_string();
+                        let security_type = item["type"].as_str().unwrap_or("").to_string();
+                        // Filter to only US stocks for simplicity
+                        if security_type == "Common Stock" || security_type.is_empty() {
+                            Some((symbol, description, security_type))
+                        } else {
+                            None
+                        }
+                    })
+                    .take(10)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(results)
+    }
+
+    /// Get historical prices for charting
+    /// Returns a vector of (date, price) tuples, most recent first
+    pub async fn get_historical_prices(
+        &self,
+        symbol: &str,
+        days: usize,
+    ) -> Result<Vec<(String, f64)>, Box<dyn std::error::Error + Send + Sync>> {
+        let (mut prices, _) = self.get_historical_data(symbol, days.max(30)).await?;
+        // get_historical_data returns oldest first after reversal, we want newest first
+        prices.reverse();
+        prices.truncate(days);
+        Ok(prices)
     }
 }
 
@@ -1376,5 +1594,69 @@ mod tests {
                 println!("    ... ({} more points)", points.len() - 5);
             }
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_fred_sofr() {
+        let fetcher = DataFetcher::new();
+        let rate = fetcher
+            .fetch_fred_sofr()
+            .await
+            .expect("Failed to fetch SOFR");
+        assert!(
+            rate > 0.0 && rate < 0.15,
+            "SOFR rate {} outside reasonable range (0-0.15)",
+            rate
+        );
+        println!("Current SOFR: {:.4}% ({:.6} decimal)", rate * 100.0, rate);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_dividend_yield_aapl() {
+        let fetcher = DataFetcher::new();
+        let fundamentals = fetcher
+            .fetch_company_fundamentals("AAPL")
+            .await
+            .expect("Failed to fetch AAPL fundamentals");
+        assert!(
+            fundamentals.dividend_yield.is_some(),
+            "AAPL should have a dividend yield"
+        );
+        let div_str = fundamentals.dividend_yield.as_ref().unwrap();
+        let div = div_str.parse::<f64>().expect("Failed to parse dividend yield");
+        assert!(div > 0.0, "AAPL dividend yield should be positive");
+        println!("AAPL dividend yield: {}% ({} decimal)", div * 100.0, div);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_dividend_yield_no_dividend() {
+        let fetcher = DataFetcher::new();
+        let fundamentals = fetcher
+            .fetch_company_fundamentals("TSLA")
+            .await
+            .expect("Failed to fetch TSLA fundamentals");
+        if let Some(div_str) = fundamentals.dividend_yield.clone() {
+            let div = div_str.parse::<f64>().unwrap_or(0.0);
+            assert_eq!(
+                div, 0.0,
+                "TSLA should have no dividend (or zero dividend)"
+            );
+        }
+        println!("TSLA dividend yield: {:?}", fundamentals.dividend_yield);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_alpha_vantage_primary() {
+        let fetcher = DataFetcher::new();
+        let price = fetcher
+            .get_current_price_with_fallback("AAPL")
+            .await
+            .expect("Failed to fetch AAPL price");
+        assert!(price > 0.0, "AAPL price should be positive");
+        println!("AAPL price (via Alpha Vantage primary): ${:.2}", price);
     }
 }

@@ -1,5 +1,5 @@
 use crate::Options;
-use statrs::distribution::{ContinuousCDF, Normal};
+use statrs::distribution::{Continuous, ContinuousCDF, Normal};
 
 // calculate d1 for the Black-Scholes formula
 pub fn d_plus(t: f64, r: f64, q: Option<f64>, sigma: f64, spot: f64, strike: f64) -> f64 {
@@ -105,6 +105,63 @@ pub fn black_scholes_approx_american(option: Options, dividend_date: Option<f64>
     } else {
         european_price
     }
+}
+
+/// Calculate Implied Volatility using Newton-Raphson method
+pub fn calculate_iv(
+    price: f64,
+    s: f64, // spot price
+    k: f64, // strike price
+    t: f64, // time to maturity (years)
+    r: f64, // risk-free rate
+    q: f64, // dividend yield
+    is_call: bool,
+) -> f64 {
+    if price <= 0.0 || t <= 0.0 || s <= 0.0 || k <= 0.0 {
+        return 0.0;
+    }
+
+    let mut sigma = 0.5; // Initial guess
+    let max_iterations = 50;
+    let tolerance = 1e-4;
+    let std_norm = Normal::new(0.0, 1.0).unwrap();
+
+    for _ in 0..max_iterations {
+        let d1 = d_plus(t, r, Some(q), sigma, s, k);
+        let d2 = d_minus(t, r, Some(q), sigma, s, k);
+
+        let (price_implied, vega) = if is_call {
+            let nd1 = std_norm.cdf(d1);
+            let nd2 = std_norm.cdf(d2);
+            let p = s * (-q * t).exp() * nd1 - k * (-r * t).exp() * nd2;
+            let v = s * (-q * t).exp() * std_norm.pdf(d1) * t.sqrt();
+            (p, v)
+        } else {
+             let n_neg_d1 = std_norm.cdf(-d1);
+             let n_neg_d2 = std_norm.cdf(-d2);
+             let p = k * (-r * t).exp() * n_neg_d2 - s * (-q * t).exp() * n_neg_d1;
+             let v = s * (-q * t).exp() * std_norm.pdf(d1) * t.sqrt();
+             (p, v)
+        };
+
+        let diff = price_implied - price;
+
+        if diff.abs() < tolerance {
+            return sigma;
+        }
+
+        if vega.abs() < 1e-8 {
+            break;
+        }
+
+        sigma = sigma - diff / vega;
+
+        if sigma <= 0.0 {
+            sigma = 1e-5;
+        }
+    }
+
+    sigma
 }
 
 #[cfg(test)]
@@ -300,5 +357,24 @@ mod tests {
             (gamma - 0.01897).abs() < 0.00001,
             "Gamma with div incorrect"
         );
+    }
+
+    #[test]
+    fn test_calculate_iv_convergence() {
+        let spot = 100.0;
+        let strike = 100.0;
+        let time = 1.0;
+        let rate = 0.05;
+        let div = 0.0;
+        let target_vol = 0.25;
+
+        // Calculate price using Black-Scholes
+        let call = Options::new_call(strike, spot, target_vol, rate, time, Some(div));
+        let price = crate::black_scholes::black_scholes_price(call);
+
+        // Calculate IV from price
+        let implied_vol = calculate_iv(price, spot, strike, time, rate, div, true);
+
+        assert!((implied_vol - target_vol).abs() < 1e-4, "IV should converge to input vol. Got: {}, Expected: {}", implied_vol, target_vol);
     }
 }

@@ -441,10 +441,7 @@ where
         }
 
         if iterations >= max_iterations {
-            eprintln!(
-                "Warning: Penalty iteration did not converge at timestep {}",
-                n
-            );
+            // Keep running silently; caller can inspect diagnostics for convergence details.
         }
         self.values[n + 1] = v_current.as_slice().to_vec();
 
@@ -473,10 +470,7 @@ where
     pub fn solve(&mut self) {
         self.initialize();
 
-        println!(
-            "Solving with {} spatial nodes, {} timesteps...",
-            self.spatial_grid.num_nodes, self.time_grid.num_steps
-        );
+        // Intentionally silent; avoid noisy console output in server logs.
 
         // Rannacher smoothing: 2 fully implicit steps, then Crank-Nicolson (Section 7)
         let rannacher_steps = 2;
@@ -519,8 +513,9 @@ where
             }
         }
 
-        println!("Solving complete!");
-    }
+        // Intentionally silent; avoid noisy console output in server logs.
+}
+
 
     #[allow(dead_code)]
     /// Compute max American constraint error (equation 4.20)

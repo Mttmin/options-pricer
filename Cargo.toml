@@ -1,8 +1,9 @@
 [workspace]
 members = [
     "options",
-    "cli", 
+    "cli",
     "monte-carlo",
+    "web",
 ]
 resolver = "2"
 
