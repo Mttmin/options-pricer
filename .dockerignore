@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target
+
+# Node artifacts
+**/node_modules
+/frontend/dist
+
+# VCS/editor
+/.git
+/.github
+/.vscode
+/.idea
+
+# OS junk
+.DS_Store
+
+# Logs
+*.log
+
+# Secrets
+api_keys.json
+.env
+railway.toml
+run-docker.sh

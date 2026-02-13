@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useEffect } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import type { IVSmileData } from "../types/index.ts";
 import { Spinner } from "./ui/Spinner.tsx";
 import { Select } from "./ui/Select.tsx";
@@ -9,9 +9,29 @@ interface IVSmileChartProps {
   underlyingPrice?: number | null;
 }
 
+interface HoverPoint {
+  strike: number;
+  iv: number;
+  optionType: string;
+  moneyness: number;
+  x: number;
+  y: number;
+}
+
+interface ZoomState {
+  scale: number;
+  translateX: number;
+  translateY: number;
+}
+
 export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartProps) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const [hoverPoint, setHoverPoint] = useState<HoverPoint | null>(null);
+  const [zoom, setZoom] = useState<ZoomState>({ scale: 1, translateX: 0, translateY: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
@@ -30,6 +50,18 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
 
     resizeObserver.observe(chartContainerRef.current);
     return () => resizeObserver.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const container = chartContainerRef.current;
+    if (!container) return;
+
+    const preventScroll = (e: WheelEvent) => {
+      e.preventDefault();
+    };
+
+    container.addEventListener('wheel', preventScroll, { passive: false });
+    return () => container.removeEventListener('wheel', preventScroll);
   }, []);
 
   const chartWidth = dimensions.width || 500;
@@ -55,6 +87,138 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
 
   const currentExpiration = selectedExpiration || expirations[0] || "";
   const smileData = data?.smiles_by_expiry[currentExpiration] || [];
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<SVGSVGElement>) => {
+      if (!svgRef.current || smileData.length === 0 || isDragging) return;
+
+      const allStrikes = smileData.map((p) => p.strike);
+      const allIVs = smileData.map((p) => p.implied_volatility * 100);
+      const minStrike = Math.min(...allStrikes);
+      const maxStrike = Math.max(...allStrikes);
+      const minIV = Math.min(...allIVs);
+      const maxIV = Math.max(...allIVs);
+      const strikeRange = maxStrike === minStrike ? 10 : maxStrike - minStrike;
+      const ivRange = maxIV === minIV ? 10 : maxIV - minIV;
+
+      const getX = (strike: number) =>
+        padding.left +
+        ((strike - minStrike) / strikeRange) * (chartWidth - padding.left - padding.right);
+
+      const getY = (iv: number) =>
+        padding.top +
+        (1 - (iv - minIV) / ivRange) * (chartHeight - padding.top - padding.bottom);
+
+      const rect = svgRef.current.getBoundingClientRect();
+      const svgX = e.clientX - rect.left;
+      const svgY = e.clientY - rect.top;
+      const svgWidth = rect.width;
+      const svgHeight = rect.height;
+      let normalizedX = (svgX / svgWidth) * chartWidth;
+      let normalizedY = (svgY / svgHeight) * chartHeight;
+
+      normalizedX = (normalizedX - zoom.translateX) / zoom.scale;
+      normalizedY = (normalizedY - zoom.translateY) / zoom.scale;
+
+      if (
+        normalizedX < padding.left ||
+        normalizedX > chartWidth - padding.right ||
+        normalizedY < padding.top ||
+        normalizedY > chartHeight - padding.bottom
+      ) {
+        setHoverPoint(null);
+        return;
+      }
+
+      let closestPoint: typeof smileData[0] | null = null;
+      let minDistance = Infinity;
+
+      for (const point of smileData) {
+        const px = getX(point.strike);
+        const py = getY(point.implied_volatility * 100);
+        const distance = Math.sqrt(
+          Math.pow(normalizedX - px, 2) + Math.pow(normalizedY - py, 2)
+        );
+
+        if (distance < minDistance && distance < 30) {
+          minDistance = distance;
+          closestPoint = point;
+        }
+      }
+
+      if (closestPoint) {
+        setHoverPoint({
+          strike: closestPoint.strike,
+          iv: closestPoint.implied_volatility * 100,
+          optionType: closestPoint.option_type,
+          moneyness: closestPoint.moneyness,
+          x: getX(closestPoint.strike),
+          y: getY(closestPoint.implied_volatility * 100),
+        });
+      } else {
+        setHoverPoint(null);
+      }
+    },
+    [smileData, chartWidth, chartHeight, padding, zoom, isDragging]
+  );
+
+  const handleMouseLeave = useCallback(() => {
+    setHoverPoint(null);
+  }, []);
+
+  const handleWheel = useCallback(
+    (e: React.WheelEvent<SVGSVGElement>) => {
+      e.preventDefault();
+      if (!svgRef.current) return;
+
+      const rect = svgRef.current.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      const delta = e.deltaY > 0 ? 0.9 : 1.1;
+      const newScale = Math.max(1, Math.min(10, zoom.scale * delta));
+
+      if (newScale === 1) {
+        setZoom({ scale: 1, translateX: 0, translateY: 0 });
+      } else {
+        const factor = newScale / zoom.scale;
+        const newTranslateX = mouseX - factor * (mouseX - zoom.translateX);
+        const newTranslateY = mouseY - factor * (mouseY - zoom.translateY);
+        setZoom({ scale: newScale, translateX: newTranslateX, translateY: newTranslateY });
+      }
+    },
+    [zoom]
+  );
+
+  const handleMouseDown = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+    if (e.button === 0 && zoom.scale > 1) {
+      setIsDragging(true);
+      setDragStart({ x: e.clientX - zoom.translateX, y: e.clientY - zoom.translateY });
+      e.preventDefault();
+    }
+  }, [zoom]);
+
+  const handleMouseMoveForPan = useCallback(
+    (e: React.MouseEvent<SVGSVGElement>) => {
+      if (isDragging && dragStart && zoom.scale > 1) {
+        setZoom({
+          ...zoom,
+          translateX: e.clientX - dragStart.x,
+          translateY: e.clientY - dragStart.y,
+        });
+      }
+    },
+    [isDragging, dragStart, zoom]
+  );
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false);
+    setDragStart(null);
+  }, []);
+
+  const handleDoubleClick = useCallback(() => {
+    setZoom({ scale: 1, translateX: 0, translateY: 0 });
+  }, []);
 
   const renderContent = () => {
     if (!data) {
@@ -155,14 +319,29 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
             <span className="ml-3 text-sm text-slate-400">
               {data.symbol} @ ${spotPrice.toFixed(2)}
             </span>
+            {zoom.scale > 1 && (
+              <span className="ml-3 text-xs text-purple-400">
+                {zoom.scale.toFixed(1)}x zoom
+              </span>
+            )}
           </div>
-          <div className="w-48">
-            <Select
-              label="Expiration"
-              value={currentExpiration}
-              onChange={setSelectedExpiration}
-              options={expirations.map((exp) => ({ value: exp, label: exp }))}
-            />
+          <div className="flex items-center gap-3">
+            {zoom.scale > 1 && (
+              <button
+                onClick={() => setZoom({ scale: 1, translateX: 0, translateY: 0 })}
+                className="px-3 py-1 text-xs text-purple-400 hover:text-purple-300 border border-purple-500/30 hover:border-purple-500/50 rounded transition-colors"
+              >
+                Reset Zoom
+              </button>
+            )}
+            <div className="w-48">
+              <Select
+                label="Expiration"
+                value={currentExpiration}
+                onChange={setSelectedExpiration}
+                options={expirations.map((exp) => ({ value: exp, label: exp }))}
+              />
+            </div>
           </div>
         </div>
 
@@ -171,12 +350,27 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
           className="relative flex-1 min-h-[240px]"
         >
           <svg
+            ref={svgRef}
             width={chartWidth}
             height={chartHeight}
             viewBox={`0 0 ${chartWidth} ${chartHeight}`}
-            className="w-full h-full absolute inset-0"
+            className="w-full h-full absolute inset-0 cursor-crosshair"
+            style={{ cursor: isDragging ? "grabbing" : zoom.scale > 1 ? "grab" : "crosshair" }}
             preserveAspectRatio="none"
+            onMouseMove={(e) => {
+              handleMouseMoveForPan(e);
+              handleMouseMove(e);
+            }}
+            onMouseDown={handleMouseDown}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={() => {
+              handleMouseLeave();
+              handleMouseUp();
+            }}
+            onWheel={handleWheel}
+            onDoubleClick={handleDoubleClick}
           >
+            <g transform={`translate(${zoom.translateX}, ${zoom.translateY}) scale(${zoom.scale})`}>
             {yTicks.map((tick, i) => {
               const y = getY(tick);
               return (
@@ -298,6 +492,40 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
               />
             ))}
 
+            {hoverPoint && (
+              <>
+                <line
+                  x1={hoverPoint.x}
+                  y1={padding.top}
+                  x2={hoverPoint.x}
+                  y2={chartHeight - padding.bottom}
+                  stroke="#8b5cf6"
+                  strokeWidth="1"
+                  strokeDasharray="4 4"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <line
+                  x1={padding.left}
+                  y1={hoverPoint.y}
+                  x2={chartWidth - padding.right}
+                  y2={hoverPoint.y}
+                  stroke="#8b5cf6"
+                  strokeWidth="1"
+                  strokeDasharray="4 4"
+                  vectorEffect="non-scaling-stroke"
+                />
+                <circle
+                  cx={hoverPoint.x}
+                  cy={hoverPoint.y}
+                  r="5"
+                  fill={hoverPoint.optionType === "Call" ? "#3b82f6" : "#ef4444"}
+                  stroke="white"
+                  strokeWidth="2"
+                />
+              </>
+            )}
+            </g>
+
             <text
               x={chartWidth / 2}
               y={chartHeight - 5}
@@ -316,6 +544,33 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
               Implied Volatility (%)
             </text>
           </svg>
+
+          {hoverPoint && (
+            <div
+              className="absolute bg-slate-800 text-white text-xs px-3 py-2 rounded shadow-lg pointer-events-none z-20"
+              style={{
+                left: hoverPoint.x,
+                top: hoverPoint.y,
+                transform: "translate(-50%, -120%)",
+              }}
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <div
+                  className={`w-2 h-2 rounded-full ${
+                    hoverPoint.optionType === "Call" ? "bg-blue-500" : "bg-red-500"
+                  }`}
+                />
+                <span className="font-semibold">{hoverPoint.optionType}</span>
+              </div>
+              <div className="text-slate-300">
+                <div>Strike: ${hoverPoint.strike.toFixed(2)}</div>
+                <div>IV: {hoverPoint.iv.toFixed(2)}%</div>
+                <div className="text-slate-400 text-[10px] mt-1">
+                  Moneyness: {hoverPoint.moneyness.toFixed(3)}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="flex items-center justify-center gap-6 text-sm mt-4">

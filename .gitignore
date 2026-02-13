@@ -14,6 +14,8 @@
 
 # Ignore api keys and secrets
 api_keys.json
+railway.toml
+run-docker.sh
 
 # Logs
 logs
