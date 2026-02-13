@@ -1,4 +1,5 @@
 use crate::Options;
+use crate::optionspreads::Position;
 use statrs::distribution::{Continuous, ContinuousCDF, Normal};
 
 // calculate d1 for the Black-Scholes formula
@@ -70,18 +71,20 @@ pub fn black_scholes_price(option: Options) -> f64 {
 }
 
 /// Approximate the price of an American option using Black's approximation method
-/// 
-/// If a dividend date is provided, the option price is calculated just before the last dividend payment and compare it to exercising at maturity
+///
+/// If dividend information is provided, the option price is calculated just before the next dividend payment and compared to exercising at maturity
 /// If a stock doesn't pay dividends, the option should in theory not be exercised early, so the European price is returned.
-pub fn black_scholes_approx_american(option: Options, dividend_date: Option<f64>) -> f64 {
-    // we use the Black approximation for American options
+pub fn black_scholes_approx_american(
+    option: Options,
+    dividend_info: Option<(f64, f64)>
+) -> f64 {
     let european_price = black_scholes_price(option);
-    if let Some(div_date) = dividend_date {
-        // If there's a dividend before maturity, calculate the black scholes price just before the dividend date
+
+    if let Some((div_date, div_pct)) = dividend_info {
         let adjusted_option = match option {
             Options::Call(call) => Options::Call(crate::Call {
                 strike_price: call.strike_price,
-                spot_price: call.spot_price - (call.spot_price * 0.02), // assuming a 2% dividend for simplicity
+                spot_price: call.spot_price - (call.spot_price * div_pct),
                 volatility: call.volatility,
                 risk_free_rate: call.risk_free_rate,
                 time_to_maturity: div_date,
@@ -89,19 +92,16 @@ pub fn black_scholes_approx_american(option: Options, dividend_date: Option<f64>
             }),
             Options::Put(put) => Options::Put(crate::Put {
                 strike_price: put.strike_price,
-                spot_price: put.spot_price - (put.spot_price * 0.02), // assuming a 2% dividend for simplicity
+                spot_price: put.spot_price - (put.spot_price * div_pct),
                 volatility: put.volatility,
                 risk_free_rate: put.risk_free_rate,
                 time_to_maturity: div_date,
                 dividend_yield: put.dividend_yield,
             }),
         };
+
         let pre_div_price = black_scholes_price(adjusted_option);
-        if pre_div_price > european_price {
-            pre_div_price
-        } else {
-            european_price
-        }
+        pre_div_price.max(european_price)
     } else {
         european_price
     }
@@ -162,6 +162,18 @@ pub fn calculate_iv(
     }
 
     sigma
+}
+
+pub fn spread_black_scholes_approx_american(
+    components: &[Position],
+    dividend_info: Option<(f64, f64)>
+) -> f64 {
+    components.iter()
+        .map(|position| {
+            black_scholes_approx_american(position.option, dividend_info)
+                * position.weight as f64
+        })
+        .sum()
 }
 
 #[cfg(test)]
@@ -376,5 +388,52 @@ mod tests {
         let implied_vol = calculate_iv(price, spot, strike, time, rate, div, true);
 
         assert!((implied_vol - target_vol).abs() < 1e-4, "IV should converge to input vol. Got: {}, Expected: {}", implied_vol, target_vol);
+    }
+
+    #[test]
+    fn test_black_approx_with_actual_dividend() {
+        let call = Options::new_call(100.0, 105.0, 0.2, 0.05, 1.0, None);
+
+        let price_with_div = black_scholes_approx_american(call, Some((0.25, 0.02)));
+        let price_no_div = black_scholes_approx_american(call, None);
+
+        assert!(price_with_div >= price_no_div);
+    }
+
+    #[test]
+    fn test_spread_black_approx() {
+        use crate::optionspreads::OptionSpreads;
+
+        let spread = OptionSpreads::new_bull_spread_call(
+            95.0, 105.0, 100.0, 0.2, 0.05, 1.0, None
+        );
+
+        let price = spread_black_scholes_approx_american(
+            spread.components(),
+            Some((0.25, 0.02))
+        );
+
+        assert!(price > 0.0);
+    }
+
+    #[test]
+    fn test_spread_black_approx_no_dividend() {
+        use crate::optionspreads::OptionSpreads;
+
+        let spread = OptionSpreads::new_bull_spread_call(
+            95.0, 105.0, 100.0, 0.2, 0.05, 1.0, None
+        );
+
+        let price_with_div = spread_black_scholes_approx_american(
+            spread.components(),
+            Some((0.25, 0.02))
+        );
+
+        let price_no_div = spread_black_scholes_approx_american(
+            spread.components(),
+            None
+        );
+
+        assert!(price_with_div >= price_no_div);
     }
 }

@@ -7,6 +7,7 @@ interface ExoticFormProps {
   onExoticTypeChange: (type: ExoticType) => void;
   values: Record<string, string>;
   onChange: (field: string, value: string) => void;
+  manualOverride: boolean;
 }
 
 const EXOTIC_OPTIONS = [
@@ -19,6 +20,7 @@ export function ExoticForm({
   onExoticTypeChange,
   values,
   onChange,
+  manualOverride,
 }: ExoticFormProps) {
   return (
     <div className="space-y-4">
@@ -87,20 +89,24 @@ export function ExoticForm({
             onChange={(v) => onChange("time_to_maturity", v)}
             placeholder="5"
           />
-          <Input
-            label="Risk-Free Rate"
-            type="number"
-            value={values.risk_free_rate ?? ""}
-            onChange={(v) => onChange("risk_free_rate", v)}
-            placeholder="0.05"
-          />
-          <Input
-            label="Dividend Yield"
-            type="number"
-            value={values.dividend_yield ?? ""}
-            onChange={(v) => onChange("dividend_yield", v)}
-            placeholder="0.00"
-          />
+          {manualOverride && (
+            <>
+              <Input
+                label="Risk-Free Rate"
+                type="number"
+                value={values.risk_free_rate ?? ""}
+                onChange={(v) => onChange("risk_free_rate", v)}
+                placeholder="0.05"
+              />
+              <Input
+                label="Dividend Yield"
+                type="number"
+                value={values.dividend_yield ?? ""}
+                onChange={(v) => onChange("dividend_yield", v)}
+                placeholder="0.00"
+              />
+            </>
+          )}
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
@@ -132,20 +138,24 @@ export function ExoticForm({
             onChange={(v) => onChange("choose_time", v)}
             placeholder="0.5"
           />
-          <Input
-            label="Risk-Free Rate"
-            type="number"
-            value={values.risk_free_rate ?? ""}
-            onChange={(v) => onChange("risk_free_rate", v)}
-            placeholder="0.05"
-          />
-          <Input
-            label="Dividend Yield"
-            type="number"
-            value={values.dividend_yield ?? ""}
-            onChange={(v) => onChange("dividend_yield", v)}
-            placeholder="0.00"
-          />
+          {manualOverride && (
+            <>
+              <Input
+                label="Risk-Free Rate"
+                type="number"
+                value={values.risk_free_rate ?? ""}
+                onChange={(v) => onChange("risk_free_rate", v)}
+                placeholder="0.05"
+              />
+              <Input
+                label="Dividend Yield"
+                type="number"
+                value={values.dividend_yield ?? ""}
+                onChange={(v) => onChange("dividend_yield", v)}
+                placeholder="0.00"
+              />
+            </>
+          )}
         </div>
       )}
     </div>

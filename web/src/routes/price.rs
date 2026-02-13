@@ -1,6 +1,8 @@
+use axum::extract::State;
 use axum::Json;
+use std::sync::Arc;
 use std::time::Instant;
-use options::black_scholes::{black_scholes_approx_american, black_scholes_price};
+use options::black_scholes::{black_scholes_approx_american, black_scholes_price, spread_black_scholes_approx_american};
 use options::exotics::{ChooserOption, ConvertibleBond};
 use options::optionspreads::{Direction, OptionSpreads};
 use options::{BlackScholesPrice, Call, Greeks, MonteCarloParameters, Options, Payoff, Put};
@@ -10,13 +12,51 @@ use monte_carlo::{monte_carlo, price_european, PenaltySolver, TimestepMode};
 use crate::error::AppError;
 use crate::models::request::*;
 use crate::models::response::*;
+use crate::state::AppState;
+
+async fn fetch_dividend_for_request(
+    fetcher: &cli::fetcher::DataFetcher,
+    symbol: Option<&String>,
+    spot_price: f64,
+) -> Option<(f64, f64)> {
+    if let Some(sym) = symbol {
+        match fetcher.get_dividend_info(sym, spot_price).await {
+            Ok(Some(div)) => Some((
+                div.time_to_dividend,
+                div.dividend_amount / spot_price
+            )),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("Failed to fetch dividend info for {}: {}", sym, e);
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
 
 pub async fn calculate_price(
+    State(state): State<Arc<AppState>>,
     Json(request): Json<PriceRequest>,
 ) -> Result<Json<PriceResponse>, AppError> {
+    let dividend_info = match &request {
+        PriceRequest::Single(req) => fetch_dividend_for_request(
+            &state.fetcher,
+            req.symbol.as_ref(),
+            req.spot_price
+        ).await,
+        PriceRequest::Spread(req) => fetch_dividend_for_request(
+            &state.fetcher,
+            req.symbol.as_ref(),
+            req.spot_price
+        ).await,
+        PriceRequest::Exotic(_) => None,
+    };
+
     let response = tokio::task::spawn_blocking(move || match request {
-        PriceRequest::Single(req) => price_single(req),
-        PriceRequest::Spread(req) => price_spread(req),
+        PriceRequest::Single(req) => price_single(req, dividend_info),
+        PriceRequest::Spread(req) => price_spread(req, dividend_info),
         PriceRequest::Exotic(req) => price_exotic(req),
     })
     .await
@@ -25,7 +65,7 @@ pub async fn calculate_price(
     Ok(Json(response))
 }
 
-fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
+fn price_single(req: SingleOptionRequest, dividend_info: Option<(f64, f64)>) -> Result<PriceResponse, AppError> {
     let total_start = Instant::now();
     let direction_sign = match req.direction {
         DirectionInput::Long => 1.0,
@@ -95,7 +135,7 @@ fn price_single(req: SingleOptionRequest) -> Result<PriceResponse, AppError> {
 
     // Black's American approximation
     let bs_amer_start = Instant::now();
-    let bs_american = black_scholes_approx_american(option, None) * direction_sign;
+    let bs_american = black_scholes_approx_american(option, dividend_info) * direction_sign;
     let bs_amer_ms = bs_amer_start.elapsed().as_secs_f64() * 1000.0;
 
     // PenaltySolver (PDE method for American options)
@@ -222,7 +262,7 @@ fn to_direction(d: DirectionInput) -> Direction {
     }
 }
 
-fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
+fn price_spread(req: SpreadRequest, dividend_info: Option<(f64, f64)>) -> Result<PriceResponse, AppError> {
     let total_start = Instant::now();
     let direction = to_direction(req.direction);
     let s = &req.strikes;
@@ -314,6 +354,13 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
         rho: spread.rho(vol, spot, rfr),
     };
 
+    let bs_amer_spread_start = Instant::now();
+    let bs_american_approx_spread = spread_black_scholes_approx_american(
+        spread.components(),
+        dividend_info
+    );
+    let bs_amer_spread_ms = bs_amer_spread_start.elapsed().as_secs_f64() * 1000.0;
+
     let penalty_start = Instant::now();
     let penalty_result = if allow_pde {
         compute_spread_penalty_solver(spread).ok()
@@ -338,7 +385,7 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
             }),
             binomial_european: Some(binomial_euro),
             binomial_american: Some(binomial_amer),
-            bs_american_approx: None,
+            bs_american_approx: Some(bs_american_approx_spread),
             penalty_solver: penalty_result,
             timings: Some(PricingTimings {
                 total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
@@ -346,7 +393,7 @@ fn price_spread(req: SpreadRequest) -> Result<PriceResponse, AppError> {
                 monte_carlo_ms: Some(mc_ms),
                 binomial_european_ms: Some(binomial_euro_ms),
                 binomial_american_ms: Some(binomial_amer_ms),
-                bs_american_approx_ms: None,
+                bs_american_approx_ms: Some(bs_amer_spread_ms),
                 penalty_solver_ms: penalty_ms,
             }),
         },

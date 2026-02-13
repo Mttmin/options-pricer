@@ -21,6 +21,8 @@ pub struct SingleOptionRequest {
     pub risk_free_rate: f64,
     pub time_to_maturity: f64,
     pub dividend_yield: Option<f64>,
+    #[serde(default)]
+    pub symbol: Option<String>,
     #[serde(default = "default_mc_simulations")]
     pub mc_simulations: u32,
     #[serde(default = "default_binomial_depth")]
@@ -36,6 +38,8 @@ pub struct SpreadRequest {
     pub risk_free_rate: f64,
     pub time_to_maturity: f64,
     pub dividend_yield: Option<f64>,
+    #[serde(default)]
+    pub symbol: Option<String>,
     pub strikes: SpreadStrikes,
     #[serde(default)]
     pub short_term_maturity: Option<f64>,

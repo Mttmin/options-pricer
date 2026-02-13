@@ -104,11 +104,37 @@ pub struct CompanyFundamentals {
     pub dividend_per_share: Option<String>,
     #[serde(rename = "MarketCapitalization")]
     pub market_cap: Option<String>,
+    #[serde(rename = "DividendDate")]
+    pub dividend_date: Option<String>,
+    #[serde(rename = "ExDividendDate")]
+    pub ex_dividend_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FredResponse {
     observations: Vec<Observation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DividendInfo {
+    pub time_to_dividend: f64,
+    pub dividend_amount: f64,
+    pub dividend_yield: f64,
+}
+
+fn calculate_time_to_dividend(
+    dividend_date_str: &str
+) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+    let dividend_date = NaiveDate::parse_from_str(dividend_date_str, "%Y-%m-%d")?;
+    let today = Utc::now().date_naive();
+
+    let days_diff = (dividend_date - today).num_days();
+
+    if days_diff < 0 {
+        return Err("Dividend date is in the past".into());
+    }
+
+    Ok(days_diff as f64 / 365.25)
 }
 
 impl Default for DataFetcher {
@@ -455,6 +481,50 @@ impl DataFetcher {
         cache.insert(symbol.to_string(), (Utc::now(), fundamentals.clone()));
 
         Ok(fundamentals)
+    }
+
+    /// Fetch dividend information for a given symbol
+    ///
+    /// Returns processed dividend data including time to next dividend and amount.
+    /// Leverages the 7-day cache from fetch_company_fundamentals.
+    pub async fn get_dividend_info(
+        &self,
+        symbol: &str,
+        spot_price: f64,
+    ) -> Result<Option<DividendInfo>, Box<dyn std::error::Error + Send + Sync>> {
+        let fundamentals = self.fetch_company_fundamentals(symbol).await?;
+
+        let date_str = fundamentals.ex_dividend_date
+            .as_ref()
+            .or(fundamentals.dividend_date.as_ref());
+
+        let div_per_share_str = fundamentals.dividend_per_share.as_ref();
+
+        match (date_str, div_per_share_str) {
+            (Some(date), Some(amount_str)) => {
+                let dividend_amount = match amount_str.parse::<f64>() {
+                    Ok(amt) if amt > 0.0 => amt,
+                    _ => return Ok(None),
+                };
+
+                let time_to_dividend = match calculate_time_to_dividend(date) {
+                    Ok(t) => t,
+                    Err(_) => return Ok(None),
+                };
+
+                let dividend_yield = fundamentals.dividend_yield
+                    .as_ref()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(dividend_amount / spot_price);
+
+                Ok(Some(DividendInfo {
+                    time_to_dividend,
+                    dividend_amount,
+                    dividend_yield,
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn detect_corporate_action(
@@ -1658,5 +1728,42 @@ mod tests {
             .expect("Failed to fetch AAPL price");
         assert!(price > 0.0, "AAPL price should be positive");
         println!("AAPL price (via Alpha Vantage primary): ${:.2}", price);
+    }
+
+    #[test]
+    fn test_calculate_time_to_dividend_valid() {
+        let future_date = (Utc::now().date_naive() + Duration::days(90))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let result = calculate_time_to_dividend(&future_date).unwrap();
+        assert!((result - 0.246).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_calculate_time_to_dividend_past_date() {
+        let result = calculate_time_to_dividend("2020-01-01");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_calculate_time_to_dividend_invalid_format() {
+        let result = calculate_time_to_dividend("invalid-date");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_get_dividend_info_aapl() {
+        let fetcher = DataFetcher::new();
+        let result = fetcher.get_dividend_info("AAPL", 150.0).await;
+        assert!(result.is_ok());
+        if let Ok(Some(div_info)) = result {
+            assert!(div_info.time_to_dividend >= 0.0);
+            assert!(div_info.dividend_amount > 0.0);
+            assert!(div_info.dividend_yield > 0.0);
+            println!("AAPL Dividend Info: time_to_div={:.3} years, amount=${:.2}, yield={:.2}%",
+                div_info.time_to_dividend, div_info.dividend_amount, div_info.dividend_yield * 100.0);
+        }
     }
 }

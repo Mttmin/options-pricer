@@ -451,27 +451,36 @@ export default function App() {
               />
             )}
             {structureType === "spread" && (
-              <div className="space-y-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <SingleOptionForm
-                      values={singleValues}
-                      onChange={handleSingleChange}
-                      manualOverride={manualOverride}
-                      isSpread={true}
-                    />
-                  </div>
-                  <div>
-                    <SpreadForm
-                      spreadType={spreadType}
-                      onSpreadTypeChange={setSpreadType}
-                      strikes={strikes}
-                      onStrikesChange={setStrikes}
-                      shortTermMaturity={shortTermMaturity}
-                      longTermMaturity={longTermMaturity}
-                      onMaturityChange={handleMaturityChange}
-                    />
-                  </div>
+              <div className="grid grid-cols-1 md:grid-cols-[40%_60%] gap-4">
+                <div className="space-y-4">
+                  <SpreadForm
+                    spreadType={spreadType}
+                    onSpreadTypeChange={setSpreadType}
+                    strikes={strikes}
+                    onStrikesChange={setStrikes}
+                    shortTermMaturity={shortTermMaturity}
+                    longTermMaturity={longTermMaturity}
+                    onMaturityChange={handleMaturityChange}
+                    showTypeSelector={true}
+                  />
+                  <SingleOptionForm
+                    values={singleValues}
+                    onChange={handleSingleChange}
+                    manualOverride={manualOverride}
+                    isSpread={true}
+                  />
+                </div>
+                <div>
+                  <SpreadForm
+                    spreadType={spreadType}
+                    onSpreadTypeChange={setSpreadType}
+                    strikes={strikes}
+                    onStrikesChange={setStrikes}
+                    shortTermMaturity={shortTermMaturity}
+                    longTermMaturity={longTermMaturity}
+                    onMaturityChange={handleMaturityChange}
+                    showTypeSelector={false}
+                  />
                 </div>
               </div>
             )}
@@ -481,6 +490,7 @@ export default function App() {
                 onExoticTypeChange={setExoticType}
                 values={exoticValues}
                 onChange={handleExoticChange}
+                manualOverride={manualOverride}
               />
             )}
           </div>

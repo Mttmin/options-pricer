@@ -30,8 +30,10 @@ export function SingleOptionForm({
   manualOverride,
   isSpread = false,
 }: SingleOptionFormProps) {
+  const shouldUseGrid = !isSpread || manualOverride;
+
   return (
-    <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
+    <div className={shouldUseGrid ? "grid grid-cols-2 gap-4 sm:grid-cols-3" : ""}>
       {!isSpread && (
         <>
           <Select
@@ -71,22 +73,22 @@ export function SingleOptionForm({
             onChange={(v) => onChange("volatility", v)}
             placeholder="0.20"
           />
+          <Input
+            label="Risk-Free Rate"
+            type="number"
+            value={values.riskFreeRate}
+            onChange={(v) => onChange("riskFreeRate", v)}
+            placeholder="0.05"
+          />
+          <Input
+            label="Dividend Yield"
+            type="number"
+            value={values.dividendYield}
+            onChange={(v) => onChange("dividendYield", v)}
+            placeholder="0.00"
+          />
         </>
       )}
-      <Input
-        label="Risk-Free Rate"
-        type="number"
-        value={values.riskFreeRate}
-        onChange={(v) => onChange("riskFreeRate", v)}
-        placeholder="0.05"
-      />
-      <Input
-        label="Dividend Yield"
-        type="number"
-        value={values.dividendYield}
-        onChange={(v) => onChange("dividendYield", v)}
-        placeholder="0.00"
-      />
     </div>
   );
 }

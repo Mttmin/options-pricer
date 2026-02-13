@@ -11,6 +11,7 @@ interface SpreadFormProps {
   shortTermMaturity: string;
   longTermMaturity: string;
   onMaturityChange: (field: string, value: string) => void;
+  showTypeSelector: boolean;
 }
 
 const SPREAD_OPTIONS = Object.entries(SPREAD_LABELS).map(([value, label]) => ({
@@ -49,6 +50,7 @@ export function SpreadForm({
   shortTermMaturity,
   longTermMaturity,
   onMaturityChange,
+  showTypeSelector,
 }: SpreadFormProps) {
   const strikeFields = STRIKE_FIELDS[spreadType];
   const needsMaturity = spreadType === "calendar_spread";
@@ -58,15 +60,19 @@ export function SpreadForm({
     onStrikesChange({ ...strikes, [field]: num });
   }
 
-  return (
-    <div className="space-y-4">
+  if (showTypeSelector) {
+    return (
       <Select
         label="Spread Type"
         value={spreadType}
         onChange={(v) => onSpreadTypeChange(v as SpreadType)}
         options={SPREAD_OPTIONS}
       />
+    );
+  }
 
+  return (
+    <div className="space-y-4">
       <div className="grid grid-cols-2 gap-4">
         {strikeFields.map((field) => (
           <Input
