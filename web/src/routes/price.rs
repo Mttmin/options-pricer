@@ -6,8 +6,8 @@ use options::black_scholes::{black_scholes_approx_american, black_scholes_price,
 use options::exotics::{ChooserOption, ConvertibleBond};
 use options::optionspreads::{Direction, OptionSpreads};
 use options::{BlackScholesPrice, Call, Greeks, MonteCarloParameters, Options, Payoff, Put};
-use monte_carlo::binomial::{binomial_price, BinomialParameters, ExerciseStyle};
-use monte_carlo::{monte_carlo, price_european, PenaltySolver, TimestepMode};
+use numerical_methods::binomial::{binomial_price, BinomialParameters, ExerciseStyle};
+use numerical_methods::{monte_carlo, price_european, PenaltySolver, TimestepMode};
 
 use crate::error::AppError;
 use crate::models::request::*;

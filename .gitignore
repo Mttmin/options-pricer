@@ -1,5 +1,6 @@
 # Ignore build output directory
 /target
+run-docker.sh
 
 # Ignore IDE specific files
 /.vscode/
@@ -14,6 +15,7 @@
 
 # Ignore api keys and secrets
 api_keys.json
+railway.toml
 
 # Logs
 logs

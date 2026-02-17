@@ -2,7 +2,7 @@ pub mod fetcher;
 pub mod options_chain;
 pub mod volatility; 
 use options::{BlackScholesPrice, Options, black_scholes::black_scholes_price, exotics::ConvertibleBond};
-use monte_carlo::{PenaltySolver, TimestepMode};
+use numerical_methods::{PenaltySolver, TimestepMode};
 
 #[tokio::main]
 async fn main() {
