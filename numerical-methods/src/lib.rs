@@ -1,4 +1,5 @@
 pub mod binomial;
+pub mod ctmc;
 use nalgebra::{DMatrix, DVector};
 use options::{MonteCarloParameters, Options, Payoff};
 use rand::SeedableRng;
