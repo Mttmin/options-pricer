@@ -91,6 +91,12 @@ impl Options {
             Options::Put(put) => put.spot_price,
         }
     }
+    pub fn dividend_yield(&self) -> Option<f64> {
+        match self {
+            Options::Call(call) => call.dividend_yield,
+            Options::Put(put) => put.dividend_yield,
+        }
+    }
 }
 impl Greeks for Options {
     fn delta(&self, imply_vol: f64, spot_price: f64) -> f64 {
