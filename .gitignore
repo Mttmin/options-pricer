@@ -6,6 +6,7 @@ run-docker.sh
 /.vscode/
 /.claude/
 /.pycache/
+CLAUDE.md
 
 # Ignore python tests
 *.py
