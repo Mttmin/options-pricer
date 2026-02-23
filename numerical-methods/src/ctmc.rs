@@ -341,9 +341,10 @@ pub struct VarianceGeneratorCOO {
 
 fn build_variance_generator(slv_model: &SLVModelVariant, v_grid: &[f64]) -> VarianceGeneratorCOO {
     let m = v_grid.len();
-    let mut rows = Vec::new();
-    let mut cols = Vec::new();
-    let mut vals = Vec::new();
+    let capacity = 3 * m.saturating_sub(2);
+    let mut rows = Vec::with_capacity(capacity);
+    let mut cols = Vec::with_capacity(capacity);
+    let mut vals = Vec::with_capacity(capacity);
 
     for l in 1..(m - 1) {
         let dv_up = v_grid[l + 1] - v_grid[l];
@@ -379,10 +380,11 @@ impl VarianceGeneratorDense {
 }
 
 fn sigma_tilde_sq(slv_model: &SLVModelVariant, vol_grid: &[f64]) -> Vec<f64> {
+    let rho = slv_model.rho();
+    let rho_factor = 1.0 - rho * rho;
     vol_grid.iter().map(|&v| {
         let m = slv_model.m(v);
-        let rho = slv_model.rho();
-        m * m * (1.0 - rho * rho)
+        m * m * rho_factor
     }).collect()
 }
 
@@ -393,18 +395,20 @@ fn psi_v(slv_model: &SLVModelVariant, v: f64) -> f64 {
         + 0.5 * (sigma * slv_model.m_prime(v) - slv_model.sigma_prime_v(v) * m)
 }
 
-fn theta(slv_model: &SLVModelVariant, x_grid: &[f64], vol_grid: &[f64]) -> DMatrix<f64> {
-    let mut t = DMatrix::zeros(vol_grid.len(), x_grid.len());
-    for (i, &vol) in vol_grid.iter().enumerate() {
-        let psi = psi_v(slv_model, vol);
-        for j in 0..x_grid.len() {
-            let s = slv_model.g_inverse(x_grid[j] + slv_model.rho() * slv_model.f_integral(vol));
-            t[(i, j)] = slv_model.omega(s, vol) / slv_model.gamma(s)
-                - slv_model.gamma_prime(s) * slv_model.m(vol).powi(2) * 0.5
-                - slv_model.rho() * psi;
-        }
-    }
-    t
+fn theta(slv_model: &SLVModelVariant, x_grid: &[f64], vol_grid: &[f64]) -> Vec<Vec<f64>> {
+    let rho = slv_model.rho();
+    vol_grid.iter().map(|&vol| {
+        let f_vl  = slv_model.f_integral(vol);
+        let psi   = psi_v(slv_model, vol);
+        let m_sq  = slv_model.m(vol).powi(2);
+        let rho_psi = rho * psi;
+        x_grid.iter().map(|&x| {
+            let s = slv_model.g_inverse(x + rho * f_vl);
+            slv_model.omega(s, vol) / slv_model.gamma(s)
+                - slv_model.gamma_prime(s) * m_sq * 0.5
+                - rho_psi
+        }).collect()
+    }).collect()
 }
 
 // N×N spatial generator for variance state v_l.
@@ -515,10 +519,7 @@ pub fn assemble_generator(slv_model: &SLVModelVariant, x_grid: &[f64], x_spacing
 
     let g_l_matrices: Vec<DMatrix<f64>> = (0..m)
         .into_par_iter()
-        .map(|l| {
-            let theta_col: Vec<f64> = (0..n).map(|i| theta_mat[(l, i)]).collect();
-            build_g_l_matrix_inner(x_spacings, &theta_col, sigma_tilde[l], n)
-        })
+        .map(|l| build_g_l_matrix_inner(x_spacings, &theta_mat[l], sigma_tilde[l], n))
         .collect();
 
     let var_coo = build_variance_generator(slv_model, v_grid);
@@ -561,68 +562,54 @@ pub struct CTMCResult {
 }
 
 // H^(1): European put payoff vector.
-// Element at φ(i,l) = l·N+i: max(K − g^{−1}(x_i + ρ·f(v_l)), 0)
-fn build_h1(ctmc: &CombinedCTMC, config: &CTMCPricerConfig, model: &SLVModelVariant) -> Vec<f64> {
-    let n = ctmc.n;
-    let m = ctmc.m;
-    let rho = model.rho();
-    (0..m)
-        .into_par_iter()
-        .flat_map_iter(|l| {
-            let f_vl = model.f_integral(ctmc.v_grid[l]);
-            (0..n).map(move |i| {
-                (config.strike - model.g_inverse(ctmc.x_grid[i] + rho * f_vl)).max(0.0)
-            })
-        })
-        .collect()
+// Element at φ(i,l) = l·N+i: max(K − S(x_i, v_l), 0).
+// excess[l*n+i] = K − S(x_i, v_l) (pre-computed, not clamped).
+fn build_h1(excess: &[f64]) -> Vec<f64> {
+    excess.iter().map(|&e| e.max(0.0)).collect()
 }
 
 // H^(3)_k: early exercise integrand. For nodes in the exercise region (x_i ≤ b_k(v_l)):
-//   rK − φ(x_i, v_l)  where  φ = r·S − ω(S, v_l)
-// For Heston: ω = (r−q)·S, so φ = q·S and the integrand is rK − q·S.
-fn build_h3(ctmc: &CombinedCTMC, config: &CTMCPricerConfig, model: &SLVModelVariant, boundary: &[f64], f_vals: &[f64]) -> Vec<f64> {
-    let n = ctmc.n;
-    let m = ctmc.m;
-    let r = config.risk_free;
-    let k = config.strike;
-    let rho = model.rho();
+//   h3_coeff[l*n+i] = rK − (rS − ω(S, v_l)), pre-computed; zero outside exercise region.
+fn build_h3(h3_coeff: &[f64], x_grid: &[f64], boundary: &[f64], m: usize, n: usize) -> Vec<f64> {
     (0..m)
         .into_par_iter()
         .flat_map_iter(|l| {
             let b = boundary[l];
-            let f_vl = f_vals[l];
-            let v_l = ctmc.v_grid[l];
             (0..n).map(move |i| {
-                if ctmc.x_grid[i] <= b {
-                    let s = model.g_inverse(ctmc.x_grid[i] + rho * f_vl);
-                    r * k - (r * s - model.omega(s, v_l))
-                } else {
-                    0.0
-                }
+                if x_grid[i] <= b { h3_coeff[l * n + i] } else { 0.0 }
             })
         })
         .collect()
 }
 
 // Find b_k(v_l): X-space boundary where intrinsic = continuation for variance state l.
-// Scans right-to-left for the first crossing of K − S_i − J_k[l·N+i] ≥ 0,
-// then refines with linear interpolation.
-fn find_boundary_for_state(j_k: &[f64], x_grid: &[f64], l: usize, n: usize, strike: f64, rho: f64, f_vl: f64, model: &SLVModelVariant) -> f64 {
+// f(i) = excess[base+i] − J_k[base+i]; monotone decreasing in i (deep ITM → OTM).
+// Binary-search for the rightmost i where f(i) ≥ 0, then refine with linear interpolation.
+fn find_boundary_for_state(j_k: &[f64], excess: &[f64], x_grid: &[f64], l: usize, n: usize) -> f64 {
     let base = l * n;
-    let mut cross = 0;
-    for i in (0..n).rev() {
-        if (strike - model.g_inverse(x_grid[i] + rho * f_vl)) - j_k[base + i] >= 0.0 {
-            cross = i;
-            break;
-        }
+    let f = |i: usize| excess[base + i] - j_k[base + i];
+
+    // Edge cases: entire range in-the-money or none at all.
+    if f(n - 1) >= 0.0 {
+        return x_grid[n - 1];
     }
-    if cross < n - 1 {
-        let f_lo = (strike - model.g_inverse(x_grid[cross] + rho * f_vl)) - j_k[base + cross];
-        let f_hi = (strike - model.g_inverse(x_grid[cross + 1] + rho * f_vl)) - j_k[base + cross + 1];
-        if (f_lo - f_hi).abs() > 1e-30 {
-            let alpha = f_lo / (f_lo - f_hi);
-            return x_grid[cross] + alpha * (x_grid[cross + 1] - x_grid[cross]);
-        }
+    if f(0) < 0.0 {
+        return x_grid[0];
+    }
+    // Invariant: f(lo) >= 0, f(hi) < 0. Converge to rightmost crossing.
+    let mut lo = 0;
+    let mut hi = n - 1;
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if f(mid) >= 0.0 { lo = mid; } else { hi = mid; }
+    }
+    let cross = lo;
+
+    let f_lo = f(cross);
+    let f_hi = f(cross + 1);
+    if (f_lo - f_hi).abs() > 1e-30 {
+        let alpha = f_lo / (f_lo - f_hi);
+        return x_grid[cross] + alpha * (x_grid[cross + 1] - x_grid[cross]);
     }
     x_grid[cross]
 }
@@ -672,7 +659,30 @@ pub fn run_algorithm_31(
 
     let f_vals: Vec<f64> = ctmc.v_grid.iter().map(|&v| model.f_integral(v)).collect();
 
-    let mut j = build_h1(ctmc, config, model);
+    // Pre-compute per-grid tables — constant across all time steps.
+    let s_grid: Vec<f64> = (0..m)
+        .flat_map(|l| {
+            let f_vl = f_vals[l];
+            (0..n).map(move |i| model.g_inverse(ctmc.x_grid[i] + rho * f_vl))
+        })
+        .collect();
+    // excess[l*n+i] = K − S(x_i, v_l), unclamped, used for exercise boundary search.
+    let excess: Vec<f64> = s_grid.iter().map(|&s| config.strike - s).collect();
+    // h3_coeff[l*n+i] = rK − (rS − ω(S, v_l)), the early-exercise integrand value.
+    let r = config.risk_free;
+    let k_strike = config.strike;
+    let s_sl: &[f64] = &s_grid;   // &[f64] is Copy, safe to move into inner closure
+    let h3_coeff: Vec<f64> = (0..m)
+        .flat_map(|l| {
+            let v_l = ctmc.v_grid[l];
+            (0..n).map(move |i| {
+                let s = s_sl[l * n + i];
+                r * k_strike - (r * s - model.omega(s, v_l))
+            })
+        })
+        .collect();
+
+    let mut j = build_h1(&excess);
     let mut boundary_x: Vec<Vec<f64>> = vec![vec![0.0; m]; n_steps + 1];
 
     let b_term_g = model.g_integral(config.terminal_boundary_s());
@@ -680,16 +690,17 @@ pub fn run_algorithm_31(
         boundary_x[n_steps][l] = b_term_g - rho * f_vals[l];
     }
 
+    let mut rhs = vec![0.0_f64; nm];
     for k in (0..n_steps).rev() {
-        let h3 = build_h3(ctmc, config, model, &boundary_x[k + 1], &f_vals);
-        let mut rhs = vec![0.0; nm];
-        for idx in 0..nm {
-            rhs[idx] = j[idx] + dt * h3[idx];
-        }
+        let h3 = build_h3(&h3_coeff, &ctmc.x_grid, &boundary_x[k + 1], m, n);
+        rhs.iter_mut()
+            .zip(j.iter())
+            .zip(h3.iter())
+            .for_each(|((r, &jv), &h)| *r = jv + dt * h);
         j = operator.apply(&rhs);
         boundary_x[k] = (0..m)
             .into_par_iter()
-            .map(|l| find_boundary_for_state(&j, &ctmc.x_grid, l, n, config.strike, rho, f_vals[l], model))
+            .map(|l| find_boundary_for_state(&j, &excess, &ctmc.x_grid, l, n))
             .collect();
     }
 
@@ -752,8 +763,16 @@ mod tests {
         let v_grid = vec![0.02, 0.04, 0.06];
         let model = SLVModelVariant::Heston(Heston::new(-0.7, 0.3, 0.05, Some(0.02), 2.0, 0.04));
         let ctmc = assemble_generator(&model, &x_grid, &x_spacings, &v_grid);
-        let config = CTMCPricerConfig { strike: 100.0, risk_free: 0.05, dividend: 0.02, maturity: 1.0, n_time_steps: 10 };
-        let h1 = build_h1(&ctmc, &config, &model);
+        let strike = 100.0_f64;
+        let rho = model.rho();
+        let f_vals: Vec<f64> = ctmc.v_grid.iter().map(|&v| model.f_integral(v)).collect();
+        let x_sl: &[f64] = &ctmc.x_grid;
+        let model_ref = &model;
+        let excess: Vec<f64> = (0..ctmc.m).flat_map(|l| {
+            let f_vl = f_vals[l];
+            (0..ctmc.n).map(move |i| strike - model_ref.g_inverse(x_sl[i] + rho * f_vl))
+        }).collect();
+        let h1 = build_h1(&excess);
         assert_eq!(h1.len(), 15);
         for &v in &h1 { assert!(v >= 0.0, "Negative payoff: {v}"); }
         assert!(h1[0] > h1[4]);
@@ -777,7 +796,7 @@ mod tests {
         let result = price_american_put_heston(
             100.0, 100.0, 0.04, 1.0, 0.05, 0.02,
             2.0, 0.04, 0.3, -0.7,
-            100, 25, 50,
+            100, 25, 75,
         );
         println!("American put price: {:.6}", result.price);
         println!("Boundary at t=0, mid v-state: {:.4}", result.boundary_s[0][12]);
@@ -798,12 +817,12 @@ mod tests {
         let configs: &[(usize, usize, usize)] = &[
             (20,  5,  50),   // NM=100   — very fast baseline
             (40,  5,  50),   // NM=200
-            (40, 10,  50),   // NM=400
-            (60, 10,  50),   // NM=600
+            (40, 10,  50),   // NM=400   — Dense→Krylov threshold boundary
+            (60, 10,  50),   // NM=600   — Krylov
             (80, 10,  50),   // NM=800
             (80, 15,  50),   // NM=1200
-            (80, 20,  50),   // NM=1600  — crosses Dense→Krylov threshold at 1500
-            (100, 15, 50),   // NM=1500  — threshold boundary
+            (80, 20,  50),   // NM=1600
+            (100, 15, 50),   // NM=1500
             (100, 20, 50),   // NM=2000
             (100, 25, 50),   // NM=2500  — "default" paper grid
             (120, 25, 50),   // NM=3000
@@ -818,7 +837,10 @@ mod tests {
 
         for &(n_x, m_v, n_time) in configs {
             let nm = n_x * m_v;
-            let strategy = if nm <= 600 { "Dense" } else { "Krylov" };
+            let strategy = match MatExpOperator::suggest_strategy(nm) {
+                crate::expm::MatExpStrategy::DensePade => "Dense",
+                crate::expm::MatExpStrategy::Krylov { .. } => "Krylov",
+            };
             let t0 = Instant::now();
             let result = price_american_put_heston(
                 100.0, 100.0, 0.04, 1.0, 0.05, 0.02,

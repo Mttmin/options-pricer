@@ -343,10 +343,11 @@ pub fn expm_generator_action_sparse(
 /// Strategy for computing the matrix exponential action.
 pub enum MatExpStrategy {
     /// Precompute A = exp((G-r·I)·dt) once (dense), reuse A·v each step.
-    /// Best for NM ≲ 1000. One-time O(n^3), per-step O(n^2).
+    /// Best for NM ≲ 600. One-time O(n^3), per-step O(n^2).
     DensePade,
     /// Krylov at every step; never form A.
-    /// Best for NM ≳ 1000. Per-step O(k·nnz) with k = krylov_dim.
+    /// Best for NM ≳ 600. Per-step O(k·nnz) with k = krylov_dim.
+    /// Calibrated for sparse generators (nnz ≈ 5·NM) and n_time ≈ 50–100.
     Krylov { krylov_dim: usize },
 }
 
@@ -389,6 +390,11 @@ impl MatExpOperator {
     }
 
     /// Choose strategy based on problem size.
+    ///
+    /// Threshold nm=600 is calibrated for sparse generators (nnz ≈ 5·NM) and n_time ≈ 50–100.
+    /// Dense: one-time O(n³) precompute, per-step O(n²) matvec (cheap amortized for small NM).
+    /// Krylov: per-step O(k·nnz) = O(200·NM), no precompute.
+    /// Krylov wins once the Dense precompute cost exceeds the Krylov per-step savings × n_steps.
     pub fn suggest_strategy(nm: usize) -> MatExpStrategy {
         if nm <= 600 {
             MatExpStrategy::DensePade
