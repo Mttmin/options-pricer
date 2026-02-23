@@ -16,7 +16,7 @@ Includes Greeks calculations ($\Delta, \Gamma, \theta, \rho, vega$) for European
 
 APIs call automatically for most information on the underlying
 
-Front-end offers some functionnalities and exploration for options research but is still work in progress
+Front-end offers some functionalities and exploration for options research but is still work in progress
 
 ## Project Status
 
@@ -34,4 +34,4 @@ In case the online connectivity doesn't interest you, simply input your own vol 
 
 Tests in the code, were written through claude (Opus 4.5) but main logic was not. Checks on safety are also run by AI Github agents regularly for things I could have missed.
 
-As a back-end/math oriented programmer, front-end dev is not my speciality and as such the frontend was vibe coded
+As a back-end/math oriented programmer, front-end dev is not my specialty and as such the frontend was vibe coded

@@ -2,7 +2,7 @@
 members = [
     "options",
     "cli",
-    "monte-carlo",
+    "numerical-methods",
     "web",
 ]
 resolver = "2"
