@@ -3,6 +3,7 @@ mod models;
 mod routes;
 mod state;
 
+use std::env;
 use std::sync::Arc;
 use cli::fetcher::DataFetcher;
 use tower_http::cors::{Any, CorsLayer};
@@ -26,11 +27,16 @@ async fn main() {
         .with_state(state)
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let port = env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(3000);
+    let bind_addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
-        .expect("Failed to bind to port 3000");
+        .unwrap_or_else(|_| panic!("Failed to bind to {bind_addr}"));
 
-    println!("Server running on http://localhost:3000");
+    println!("Server running on http://localhost:{port}");
 
     axum::serve(listener, app)
         .await

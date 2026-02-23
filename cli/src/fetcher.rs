@@ -20,33 +20,37 @@ pub struct ApiConfig {
     pub fred: String,
 }
 
-/// Load API keys from api_keys.json in the project root
+/// Load API keys from api_keys.json or environment variables
 pub fn load_api_keys() -> Result<ApiConfig, Box<dyn std::error::Error + Send + Sync>> {
+    // Try file-based loading first (local development)
     let possible_paths = vec![
-        "api_keys.json",    // Current directory
-        "../api_keys.json", // Parent directory (when running from cli/)
+        "api_keys.json",
+        "../api_keys.json",
     ];
 
-    let mut config_content: Option<String> = None;
-    let mut last_error: String = String::new();
-
     for path in &possible_paths {
-        match std::fs::read_to_string(path) {
-            Ok(content) => {
-                config_content = Some(content);
-                break;
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(config) = serde_json::from_str::<ApiConfig>(&content) {
+                return Ok(config);
             }
-            Err(e) => last_error = format!("{}: {}", path, e),
         }
     }
 
-    let config_content = config_content
-        .ok_or_else(|| format!("Failed to read api_keys.json. Last error: {}", last_error))?;
+    // Fall back to environment variables (Docker / Railway)
+    let alpha_vantage = std::env::var("ALPHA_VANTAGE_API_KEY");
+    let finnhub = std::env::var("FINNHUB_API_KEY");
+    let fred = std::env::var("FRED_API_KEY");
 
-    let config: ApiConfig = serde_json::from_str(&config_content)
-        .map_err(|e| format!("Failed to parse api_keys.json: {}", e))?;
+    if let (Ok(alpha_vantage), Ok(finnhub), Ok(fred)) = (alpha_vantage, finnhub, fred) {
+        return Ok(ApiConfig {
+            alpha_vantage,
+            finnhub,
+            finnhub_secret: String::new(),
+            fred,
+        });
+    }
 
-    Ok(config)
+    Err("No API keys found. Provide api_keys.json or set ALPHA_VANTAGE_API_KEY, FINNHUB_API_KEY, and FRED_API_KEY environment variables.".into())
 }
 
 #[derive(Debug, Deserialize)]
