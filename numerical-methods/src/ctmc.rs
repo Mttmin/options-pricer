@@ -1,5 +1,6 @@
 use nalgebra::DMatrix;
 use options::Options;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use crate::expm::MatExpOperator;
 
 // SLV model interface
@@ -323,6 +324,7 @@ pub fn assemble_generator(slv_model: &SLVModelVariant, x_grid: &[f64], x_spacing
     let sigma_tilde = sigma_tilde_sq(slv_model, v_grid);
 
     let g_l_matrices: Vec<DMatrix<f64>> = (0..m)
+        .into_par_iter()
         .map(|l| {
             let theta_col: Vec<f64> = (0..n).map(|i| theta_mat[(l, i)]).collect();
             build_g_l_matrix_inner(x_spacings, &theta_col, sigma_tilde[l], n)
@@ -374,14 +376,15 @@ fn build_h1(ctmc: &CombinedCTMC, config: &CTMCPricerConfig, model: &SLVModelVari
     let n = ctmc.n;
     let m = ctmc.m;
     let rho = model.rho();
-    let mut h1 = vec![0.0; n * m];
-    for l in 0..m {
-        let f_vl = model.f_integral(ctmc.v_grid[l]);
-        for i in 0..n {
-            h1[l * n + i] = (config.strike - model.g_inverse(ctmc.x_grid[i] + rho * f_vl)).max(0.0);
-        }
-    }
-    h1
+    (0..m)
+        .into_par_iter()
+        .flat_map_iter(|l| {
+            let f_vl = model.f_integral(ctmc.v_grid[l]);
+            (0..n).map(move |i| {
+                (config.strike - model.g_inverse(ctmc.x_grid[i] + rho * f_vl)).max(0.0)
+            })
+        })
+        .collect()
 }
 
 // H^(3)_k: early exercise integrand. For nodes in the exercise region (x_i ≤ b_k(v_l)):
@@ -393,34 +396,39 @@ fn build_h3(ctmc: &CombinedCTMC, config: &CTMCPricerConfig, model: &SLVModelVari
     let r = config.risk_free;
     let k = config.strike;
     let rho = model.rho();
-    let mut h3 = vec![0.0; n * m];
-    for l in 0..m {
-        let b = boundary[l];
-        for i in 0..n {
-            if ctmc.x_grid[i] <= b {
-                let s = model.g_inverse(ctmc.x_grid[i] + rho * f_vals[l]);
-                h3[l * n + i] = r * k - (r * s - model.omega(s, ctmc.v_grid[l]));
-            }
-        }
-    }
-    h3
+    (0..m)
+        .into_par_iter()
+        .flat_map_iter(|l| {
+            let b = boundary[l];
+            let f_vl = f_vals[l];
+            let v_l = ctmc.v_grid[l];
+            (0..n).map(move |i| {
+                if ctmc.x_grid[i] <= b {
+                    let s = model.g_inverse(ctmc.x_grid[i] + rho * f_vl);
+                    r * k - (r * s - model.omega(s, v_l))
+                } else {
+                    0.0
+                }
+            })
+        })
+        .collect()
 }
 
 // Find b_k(v_l): X-space boundary where intrinsic = continuation for variance state l.
 // Scans right-to-left for the first crossing of K − S_i − J_k[l·N+i] ≥ 0,
 // then refines with linear interpolation.
-fn find_boundary_for_state(j_k: &[f64], x_grid: &[f64], l: usize, n: usize, strike: f64, rho: f64, f_vl: f64, g_inv: &dyn Fn(f64) -> f64) -> f64 {
+fn find_boundary_for_state(j_k: &[f64], x_grid: &[f64], l: usize, n: usize, strike: f64, rho: f64, f_vl: f64, model: &SLVModelVariant) -> f64 {
     let base = l * n;
     let mut cross = 0;
     for i in (0..n).rev() {
-        if (strike - g_inv(x_grid[i] + rho * f_vl)) - j_k[base + i] >= 0.0 {
+        if (strike - model.g_inverse(x_grid[i] + rho * f_vl)) - j_k[base + i] >= 0.0 {
             cross = i;
             break;
         }
     }
     if cross < n - 1 {
-        let f_lo = (strike - g_inv(x_grid[cross] + rho * f_vl)) - j_k[base + cross];
-        let f_hi = (strike - g_inv(x_grid[cross + 1] + rho * f_vl)) - j_k[base + cross + 1];
+        let f_lo = (strike - model.g_inverse(x_grid[cross] + rho * f_vl)) - j_k[base + cross];
+        let f_hi = (strike - model.g_inverse(x_grid[cross + 1] + rho * f_vl)) - j_k[base + cross + 1];
         if (f_lo - f_hi).abs() > 1e-30 {
             let alpha = f_lo / (f_lo - f_hi);
             return x_grid[cross] + alpha * (x_grid[cross + 1] - x_grid[cross]);
@@ -473,7 +481,6 @@ pub fn run_algorithm_31(
     let rho = model.rho();
 
     let f_vals: Vec<f64> = ctmc.v_grid.iter().map(|&v| model.f_integral(v)).collect();
-    let g_inv = |x: f64| model.g_inverse(x);
 
     let mut j = build_h1(ctmc, config, model);
     let mut boundary_x: Vec<Vec<f64>> = vec![vec![0.0; m]; n_steps + 1];
@@ -490,9 +497,10 @@ pub fn run_algorithm_31(
             rhs[idx] = j[idx] + dt * h3[idx];
         }
         j = operator.apply(&rhs);
-        for l in 0..m {
-            boundary_x[k][l] = find_boundary_for_state(&j, &ctmc.x_grid, l, n, config.strike, rho, f_vals[l], &g_inv);
-        }
+        boundary_x[k] = (0..m)
+            .into_par_iter()
+            .map(|l| find_boundary_for_state(&j, &ctmc.x_grid, l, n, config.strike, rho, f_vals[l], model))
+            .collect();
     }
 
     let boundary_s = boundary_x.iter()

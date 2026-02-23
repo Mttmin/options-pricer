@@ -16,6 +16,7 @@
 //!   exponential operator." SIAM J. Numer. Anal. 29(1), 209-228.
 
 use nalgebra::{DMatrix, DVector};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
 /// Padé(13) coefficients b_0, ..., b_13 from Higham (2005) Table 1.
 const PADE13_COEFFS: [f64; 14] = [
@@ -155,14 +156,21 @@ where
     for j in 0..k_max {
         let mut w = matvec(&v_cols[j]);
 
-        // Modified Gram-Schmidt
-        for i in 0..=j {
-            let hij = vec_dot(&w, &v_cols[i]);
+        // Classical Gram-Schmidt: compute all projections from original w (parallel),
+        // then apply all corrections simultaneously (parallel axpy).
+        let hij_vec: Vec<f64> = (0..=j)
+            .into_par_iter()
+            .map(|i| vec_dot(&w, &v_cols[i]))
+            .collect();
+        for (i, &hij) in hij_vec.iter().enumerate() {
             h[i][j] = hij;
-            for l in 0..n {
-                w[l] -= hij * v_cols[i][l];
-            }
         }
+        let v_cols_ref = &v_cols;
+        w.par_iter_mut().enumerate().for_each(|(l, wl)| {
+            for i in 0..=j {
+                *wl -= hij_vec[i] * v_cols_ref[i][l];
+            }
+        });
 
         let h_next = vec_norm(&w);
         h[j + 1][j] = h_next;
@@ -285,15 +293,16 @@ impl CsrMatrix {
     /// Sparse matrix-vector product y = A · x.
     pub fn matvec(&self, x: &[f64]) -> Vec<f64> {
         debug_assert_eq!(x.len(), self.ncols);
-        let mut y = vec![0.0; self.nrows];
-        for i in 0..self.nrows {
-            let mut sum = 0.0;
-            for idx in self.row_ptr[i]..self.row_ptr[i + 1] {
-                sum += self.values[idx] * x[self.col_idx[idx]];
-            }
-            y[i] = sum;
-        }
-        y
+        (0..self.nrows)
+            .into_par_iter()
+            .map(|i| {
+                let mut sum = 0.0;
+                for idx in self.row_ptr[i]..self.row_ptr[i + 1] {
+                    sum += self.values[idx] * x[self.col_idx[idx]];
+                }
+                sum
+            })
+            .collect()
     }
 
     /// Shifted mat-vec y = (A - shift·I) · x without modifying the matrix.
