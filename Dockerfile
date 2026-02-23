@@ -8,11 +8,11 @@ RUN apt-get update \
 # Cache dependencies first
 COPY Cargo.toml Cargo.lock ./
 COPY options/Cargo.toml options/Cargo.toml
-COPY monte-carlo/Cargo.toml monte-carlo/Cargo.toml
+COPY numerical-methods/Cargo.toml numerical-methods/Cargo.toml
 COPY cli/Cargo.toml cli/Cargo.toml
 COPY web/Cargo.toml web/Cargo.toml
 COPY options/src options/src
-COPY monte-carlo/src monte-carlo/src
+COPY numerical-methods/src numerical-methods/src
 COPY cli/src cli/src
 COPY web/src web/src
 RUN cargo fetch
