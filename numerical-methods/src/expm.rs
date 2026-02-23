@@ -390,7 +390,7 @@ impl MatExpOperator {
 
     /// Choose strategy based on problem size.
     pub fn suggest_strategy(nm: usize) -> MatExpStrategy {
-        if nm <= 1500 {
+        if nm <= 600 {
             MatExpStrategy::DensePade
         } else {
             MatExpStrategy::Krylov { krylov_dim: 40.min(nm) }

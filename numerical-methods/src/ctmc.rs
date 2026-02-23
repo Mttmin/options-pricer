@@ -44,6 +44,14 @@ impl Heston {
     fn heston_m_prime(&self, v: f64) -> f64 { 0.5 / v.sqrt() }
     fn heston_sigma_prime_v(&self, v: f64) -> f64 { 0.5 * self.sigma / v.sqrt() }
     fn heston_gamma_prime(&self, _s: f64) -> f64 { 1.0 }
+    // Uniform dispatch names (used by the dispatch! macro in SLVModelVariant)
+    fn g_integral(&self, s: f64) -> f64 { self.heston_g_integral(s) }
+    fn f_integral(&self, v: f64) -> f64 { self.heston_f_integral(v) }
+    fn g_inverse(&self, x: f64) -> f64  { self.heston_g_inverse(x) }
+    fn f_inverse(&self, y: f64) -> f64  { self.heston_f_inverse(y) }
+    fn m_prime(&self, v: f64) -> f64    { self.heston_m_prime(v) }
+    fn sigma_prime_v(&self, v: f64) -> f64 { self.heston_sigma_prime_v(v) }
+    fn gamma_prime(&self, s: f64) -> f64   { self.heston_gamma_prime(s) }
 }
 
 impl SLVModel for Heston {
@@ -55,65 +63,246 @@ impl SLVModel for Heston {
     fn rho(&self) -> f64 { self.rho }
 }
 
+// 4/2 model (Grasselli 2017): dS = (r-q)S dt + S[a√v + b/√v] dW^(1), dv = η(ϑ-v)dt + σ_v√v dW^(2)
+pub struct FourTwo {
+    pub rho: f64,
+    pub sigma: f64,
+    pub r_f: f64,
+    pub q: Option<f64>,
+    pub eta: f64,
+    pub ref_vol: f64,
+    pub a: f64,
+    pub b: f64,
+}
+
+impl FourTwo {
+    pub fn new(rho: f64, sigma: f64, r_f: f64, q: Option<f64>, eta: f64, ref_vol: f64, a: f64, b: f64) -> Self {
+        Self { rho, sigma, r_f, q, eta, ref_vol, a, b }
+    }
+    fn g_integral(&self, s: f64) -> f64 { s.ln() }
+    fn f_integral(&self, v: f64) -> f64 { (self.a * v + self.b * v.ln()) / self.sigma }
+    fn g_inverse(&self, x: f64) -> f64 { x.exp() }
+    fn f_inverse(&self, y: f64) -> f64 {
+        // Newton: solve a*v + b*ln(v) = sigma*y
+        let target = self.sigma * y;
+        let mut v = (target / self.a).max(1e-6);
+        for _ in 0..60 {
+            let fv = self.a * v + self.b * v.ln() - target;
+            let dfv = self.a + self.b / v;
+            let dv = fv / dfv;
+            v = (v - dv).max(1e-10);
+            if dv.abs() < 1e-12 * v { break; }
+        }
+        v
+    }
+    fn m_prime(&self, v: f64) -> f64 { (self.a * v - self.b) / (2.0 * v.powf(1.5)) }
+    fn sigma_prime_v(&self, v: f64) -> f64 { 0.5 * self.sigma / v.sqrt() }
+    fn gamma_prime(&self, _s: f64) -> f64 { 1.0 }
+}
+
+impl SLVModel for FourTwo {
+    fn omega(&self, s: f64, _v: f64) -> f64 { s * (self.r_f - self.q.unwrap_or(0.0)) }
+    fn m(&self, v: f64) -> f64 { self.a * v.sqrt() + self.b / v.sqrt() }
+    fn gamma(&self, s: f64) -> f64 { s }
+    fn mu(&self, v: f64) -> f64 { self.eta * (self.ref_vol - v) }
+    fn sigma_v(&self, v: f64) -> f64 { self.sigma * v.sqrt() }
+    fn rho(&self) -> f64 { self.rho }
+}
+
+// α-Hyper (Da Fonseca and Martini 2016): dS = (r-q)S dt + S·exp(v) dW^(1), dv = (η−ϑ·exp(α·v))dt + σ_v dW^(2)
+pub struct AlphaHyper {
+    pub rho: f64,
+    pub sigma: f64,
+    pub r_f: f64,
+    pub q: Option<f64>,
+    pub eta: f64,
+    pub theta_lr: f64,
+    pub alpha: f64,
+}
+
+impl AlphaHyper {
+    pub fn new(rho: f64, sigma: f64, r_f: f64, q: Option<f64>, eta: f64, theta_lr: f64, alpha: f64) -> Self {
+        Self { rho, sigma, r_f, q, eta, theta_lr, alpha }
+    }
+    fn g_integral(&self, s: f64) -> f64 { s.ln() }
+    fn f_integral(&self, v: f64) -> f64 { v.exp() / self.sigma }
+    fn g_inverse(&self, x: f64) -> f64 { x.exp() }
+    fn f_inverse(&self, y: f64) -> f64 { (self.sigma * y).ln() }
+    fn m_prime(&self, v: f64) -> f64 { v.exp() }
+    fn sigma_prime_v(&self, _v: f64) -> f64 { 0.0 }
+    fn gamma_prime(&self, _s: f64) -> f64 { 1.0 }
+}
+
+impl SLVModel for AlphaHyper {
+    fn omega(&self, s: f64, _v: f64) -> f64 { s * (self.r_f - self.q.unwrap_or(0.0)) }
+    fn m(&self, v: f64) -> f64 { v.exp() }
+    fn gamma(&self, s: f64) -> f64 { s }
+    fn mu(&self, v: f64) -> f64 { self.eta - self.theta_lr * (self.alpha * v).exp() }
+    fn sigma_v(&self, _v: f64) -> f64 { self.sigma }
+    fn rho(&self) -> f64 { self.rho }
+}
+
+// SABR (Hagan et al. 2002): dS = (r-q)S dt + v·S^β dW^(1), dv = σ_v·v dW^(2)
+pub struct SABR {
+    pub rho: f64,
+    pub sigma: f64,
+    pub r_f: f64,
+    pub q: Option<f64>,
+    pub beta: f64,
+}
+
+impl SABR {
+    pub fn new(rho: f64, sigma: f64, r_f: f64, q: Option<f64>, beta: f64) -> Self {
+        assert!((0.0..=1.0).contains(&beta), "SABR beta must be in [0, 1]");
+        Self { rho, sigma, r_f, q, beta }
+    }
+    fn g_integral(&self, s: f64) -> f64 {
+        if (self.beta - 1.0).abs() < 1e-10 { s.ln() }
+        else { s.powf(1.0 - self.beta) / (1.0 - self.beta) }
+    }
+    fn f_integral(&self, v: f64) -> f64 { v / self.sigma }
+    fn g_inverse(&self, x: f64) -> f64 {
+        if (self.beta - 1.0).abs() < 1e-10 { x.exp() }
+        else { (x * (1.0 - self.beta)).powf(1.0 / (1.0 - self.beta)) }
+    }
+    fn f_inverse(&self, y: f64) -> f64 { y * self.sigma }
+    fn m_prime(&self, _v: f64) -> f64 { 1.0 }
+    fn sigma_prime_v(&self, _v: f64) -> f64 { self.sigma }
+    fn gamma_prime(&self, s: f64) -> f64 { self.beta * s.powf(self.beta - 1.0) }
+}
+
+impl SLVModel for SABR {
+    fn omega(&self, s: f64, _v: f64) -> f64 { s * (self.r_f - self.q.unwrap_or(0.0)) }
+    fn m(&self, v: f64) -> f64 { v }
+    fn gamma(&self, s: f64) -> f64 { s.powf(self.beta) }
+    fn mu(&self, _v: f64) -> f64 { 0.0 }
+    fn sigma_v(&self, v: f64) -> f64 { self.sigma * v }
+    fn rho(&self) -> f64 { self.rho }
+}
+
+// Heston-SABR (Van der Stoep et al. 2014): dS = (r-q)S dt + S·v dW^(1), dv = η(ϑ-v)dt + σ_v·v dW^(2)
+pub struct HestonSABR {
+    pub rho: f64,
+    pub sigma: f64,
+    pub r_f: f64,
+    pub q: Option<f64>,
+    pub eta: f64,
+    pub ref_vol: f64,
+}
+
+impl HestonSABR {
+    pub fn new(rho: f64, sigma: f64, r_f: f64, q: Option<f64>, eta: f64, ref_vol: f64) -> Self {
+        Self { rho, sigma, r_f, q, eta, ref_vol }
+    }
+    fn g_integral(&self, s: f64) -> f64 { s.ln() }
+    fn f_integral(&self, v: f64) -> f64 { v / self.sigma }
+    fn g_inverse(&self, x: f64) -> f64 { x.exp() }
+    fn f_inverse(&self, y: f64) -> f64 { y * self.sigma }
+    fn m_prime(&self, _v: f64) -> f64 { 1.0 }
+    fn sigma_prime_v(&self, _v: f64) -> f64 { self.sigma }
+    fn gamma_prime(&self, _s: f64) -> f64 { 1.0 }
+}
+
+impl SLVModel for HestonSABR {
+    fn omega(&self, s: f64, _v: f64) -> f64 { s * (self.r_f - self.q.unwrap_or(0.0)) }
+    fn m(&self, v: f64) -> f64 { v }
+    fn gamma(&self, s: f64) -> f64 { s }
+    fn mu(&self, v: f64) -> f64 { self.eta * (self.ref_vol - v) }
+    fn sigma_v(&self, v: f64) -> f64 { self.sigma * v }
+    fn rho(&self) -> f64 { self.rho }
+}
+
+// Quadratic SLV (Lipton 2002): dS = (r-q)S dt + √v·(aS²+bS+c) dW^(1), dv = η(ϑ-v)dt + σ_v√v dW^(2)
+// Requires 4ac > b² so the quadratic is positive definite.
+pub struct QuadraticSLV {
+    pub rho: f64,
+    pub sigma: f64,
+    pub r_f: f64,
+    pub q: Option<f64>,
+    pub eta: f64,
+    pub ref_vol: f64,
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+}
+
+impl QuadraticSLV {
+    pub fn new(rho: f64, sigma: f64, r_f: f64, q: Option<f64>, eta: f64, ref_vol: f64, a: f64, b: f64, c: f64) -> Self {
+        assert!(4.0 * a * c > b * b, "QuadraticSLV requires 4ac > b²");
+        Self { rho, sigma, r_f, q, eta, ref_vol, a, b, c }
+    }
+    fn disc(&self) -> f64 { (4.0 * self.a * self.c - self.b * self.b).sqrt() }
+    fn g_integral(&self, s: f64) -> f64 {
+        let d = self.disc();
+        2.0 / d * ((2.0 * self.a * s + self.b) / d).atan()
+    }
+    fn f_integral(&self, v: f64) -> f64 { v / self.sigma }
+    fn g_inverse(&self, x: f64) -> f64 {
+        let d = self.disc();
+        (d * (d * x / 2.0).tan() - self.b) / (2.0 * self.a)
+    }
+    fn f_inverse(&self, y: f64) -> f64 { y * self.sigma }
+    fn m_prime(&self, v: f64) -> f64 { 0.5 / v.sqrt() }
+    fn sigma_prime_v(&self, v: f64) -> f64 { 0.5 * self.sigma / v.sqrt() }
+    fn gamma_prime(&self, s: f64) -> f64 { 2.0 * self.a * s + self.b }
+}
+
+impl SLVModel for QuadraticSLV {
+    fn omega(&self, s: f64, _v: f64) -> f64 { s * (self.r_f - self.q.unwrap_or(0.0)) }
+    fn m(&self, v: f64) -> f64 { v.sqrt() }
+    fn gamma(&self, s: f64) -> f64 { self.a * s * s + self.b * s + self.c }
+    fn mu(&self, v: f64) -> f64 { self.eta * (self.ref_vol - v) }
+    fn sigma_v(&self, v: f64) -> f64 { self.sigma * v.sqrt() }
+    fn rho(&self) -> f64 { self.rho }
+}
+
+macro_rules! dispatch {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            SLVModelVariant::Heston(m)      => m.$method($($arg),*),
+            SLVModelVariant::FourTwo(m)     => m.$method($($arg),*),
+            SLVModelVariant::AlphaHyper(m)  => m.$method($($arg),*),
+            SLVModelVariant::SABR(m)        => m.$method($($arg),*),
+            SLVModelVariant::HestonSABR(m)  => m.$method($($arg),*),
+            SLVModelVariant::QuadraticSLV(m) => m.$method($($arg),*),
+        }
+    };
+}
+
 pub enum SLVModelVariant {
     Heston(Heston),
-    // SABR(SABR),
+    FourTwo(FourTwo),
+    AlphaHyper(AlphaHyper),
+    SABR(SABR),
+    HestonSABR(HestonSABR),
+    QuadraticSLV(QuadraticSLV),
 }
 
 impl SLVModelVariant {
     pub fn from_options(option: &Options, model_type: SLVModelVariant) -> Self {
         match model_type {
             SLVModelVariant::Heston(_) => SLVModelVariant::Heston(Heston::from_options(option)),
+            other => other,
         }
     }
-    pub fn g_integral(&self, s: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.heston_g_integral(s) }
-    }
-    pub fn f_integral(&self, v: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.heston_f_integral(v) }
-    }
-    pub fn g_inverse(&self, x: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.heston_g_inverse(x) }
-    }
-    pub fn f_inverse(&self, x: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.heston_f_inverse(x) }
-    }
-    pub fn m_prime(&self, v: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.heston_m_prime(v) }
-    }
-    pub fn sigma_prime_v(&self, v: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.heston_sigma_prime_v(v) }
-    }
-    pub fn gamma_prime(&self, s: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.heston_gamma_prime(s) }
-    }
-    pub fn rho(&self) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.rho() }
-    }
-    pub fn omega(&self, s: f64, v: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.omega(s, v) }
-    }
+    pub fn g_integral(&self, s: f64) -> f64 { dispatch!(self, g_integral, s) }
+    pub fn f_integral(&self, v: f64) -> f64 { dispatch!(self, f_integral, v) }
+    pub fn g_inverse(&self, x: f64) -> f64  { dispatch!(self, g_inverse, x) }
+    pub fn f_inverse(&self, y: f64) -> f64  { dispatch!(self, f_inverse, y) }
+    pub fn m_prime(&self, v: f64) -> f64    { dispatch!(self, m_prime, v) }
+    pub fn sigma_prime_v(&self, v: f64) -> f64 { dispatch!(self, sigma_prime_v, v) }
+    pub fn gamma_prime(&self, s: f64) -> f64   { dispatch!(self, gamma_prime, s) }
+    pub fn rho(&self) -> f64                { dispatch!(self, rho) }
+    pub fn omega(&self, s: f64, v: f64) -> f64 { dispatch!(self, omega, s, v) }
 }
 
 impl SLVModel for SLVModelVariant {
-    fn omega(&self, s: f64, v: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.omega(s, v) }
-    }
-    fn m(&self, v: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.m(v) }
-    }
-    fn gamma(&self, s: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.gamma(s) }
-    }
-    fn mu(&self, v: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.mu(v) }
-    }
-    fn sigma_v(&self, v: f64) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.sigma_v(v) }
-    }
-    fn rho(&self) -> f64 {
-        match self { SLVModelVariant::Heston(h) => h.rho() }
-    }
+    fn omega(&self, s: f64, v: f64) -> f64  { dispatch!(self, omega, s, v) }
+    fn m(&self, v: f64) -> f64              { dispatch!(self, m, v) }
+    fn gamma(&self, s: f64) -> f64          { dispatch!(self, gamma, s) }
+    fn mu(&self, v: f64) -> f64             { dispatch!(self, mu, v) }
+    fn sigma_v(&self, v: f64) -> f64        { dispatch!(self, sigma_v, v) }
+    fn rho(&self) -> f64                    { dispatch!(self, rho) }
 }
 
 // Grid construction
@@ -125,11 +314,13 @@ pub fn uniform_variance_grid(vol_0: f64, n_vol_steps: i32) -> Vec<f64> {
     (1..=n_vol_steps).map(|i| i as f64 * step).collect()
 }
 
+#[allow(dead_code)]
 /// Sinh-stretched variance grid per Cui, Zhenyu 2018.
 fn sinh_variance_grid(_vol: f64, _n_vol_steps: i32) -> Vec<f64> {
     todo!()
 }
 
+#[allow(dead_code)]
 fn x_space_grid(slv_model: &SLVModelVariant, m_steps: i32, spot_0: f64, vol_0: f64) -> (Vec<f64>, Vec<f64>) {
     let x_0 = slv_model.g_integral(spot_0) - slv_model.rho() * slv_model.f_integral(vol_0);
     if x_0 <= 0.0 {
@@ -141,7 +332,6 @@ fn x_space_grid(slv_model: &SLVModelVariant, m_steps: i32, spot_0: f64, vol_0: f
 }
 
 // Generator assembly
-
 pub struct VarianceGeneratorCOO {
     pub rows: Vec<usize>,
     pub cols: Vec<usize>,
@@ -579,19 +769,65 @@ mod tests {
         assert_eq!(bracket_search(&grid, 2.7), 2);
         assert_eq!(bracket_search(&grid, 5.0), 3);
     }
-
     #[test]
     #[ignore]
     fn american_put_heston_smoke() {
+        // Realistic Heston params: kappa=2, theta=0.04 (LR var), sigma_v=0.3 (vol-of-vol), rho=-0.7
+        // ATM American put S=K=100, T=1yr, r=5%, q=2%; expected ~$7-11 from literature
         let result = price_american_put_heston(
             100.0, 100.0, 0.04, 1.0, 0.05, 0.02,
-            2.0, 0.04, 1e-4, 0.0,
-            80, 5, 100,
+            2.0, 0.04, 0.3, -0.7,
+            100, 25, 50,
         );
         println!("American put price: {:.6}", result.price);
-        println!("Boundary at t=0, mid v-state: {:.4}", result.boundary_s[0][2]);
-        assert!(result.price > 6.0, "Price below European BS: {}", result.price);
-        assert!(result.price < 15.0, "Price unreasonably high: {}", result.price);
-        assert!(result.boundary_s[0][2] < 100.0, "Boundary should be below strike");
+        println!("Boundary at t=0, mid v-state: {:.4}", result.boundary_s[0][12]);
+        assert!(result.price > 5.0, "Price below European BS: {}", result.price);
+        assert!(result.price < 20.0, "Price unreasonably high: {}", result.price);
+        assert!(result.boundary_s[0][12] < 100.0, "Boundary should be below strike");
+    }
+
+    // Run with: cargo test -p numerical-methods --release -- --ignored ctmc_speed --nocapture
+    // Sweeps (n_x, m_v, n_time) combinations and prints wall-clock time.
+    // Target: find the largest configuration that runs in ~0.1-0.2 seconds.
+    #[test]
+    #[ignore]
+    fn ctmc_speed_sweep() {
+        use std::time::Instant;
+
+        // (n_x, m_v, n_time): NM = n_x*m_v is the matrix dimension driving cost
+        let configs: &[(usize, usize, usize)] = &[
+            (20,  5,  50),   // NM=100   — very fast baseline
+            (40,  5,  50),   // NM=200
+            (40, 10,  50),   // NM=400
+            (60, 10,  50),   // NM=600
+            (80, 10,  50),   // NM=800
+            (80, 15,  50),   // NM=1200
+            (80, 20,  50),   // NM=1600  — crosses Dense→Krylov threshold at 1500
+            (100, 15, 50),   // NM=1500  — threshold boundary
+            (100, 20, 50),   // NM=2000
+            (100, 25, 50),   // NM=2500  — "default" paper grid
+            (120, 25, 50),   // NM=3000
+            (150, 25, 50),   // NM=3750
+            (100, 20, 100),  // NM=2000, 2× time steps
+            (100, 25, 100),  // NM=2500, 2× time steps
+        ];
+
+        println!("\n{:<10} {:<6} {:<6} {:<8} {:<8} {:<12} {:<8}",
+            "NM", "n_x", "m_v", "n_time", "strategy", "elapsed(ms)", "price");
+        println!("{}", "-".repeat(62));
+
+        for &(n_x, m_v, n_time) in configs {
+            let nm = n_x * m_v;
+            let strategy = if nm <= 600 { "Dense" } else { "Krylov" };
+            let t0 = Instant::now();
+            let result = price_american_put_heston(
+                100.0, 100.0, 0.04, 1.0, 0.05, 0.02,
+                2.0, 0.04, 0.3, -0.7,
+                n_x, m_v, n_time,
+            );
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            println!("{:<10} {:<6} {:<6} {:<8} {:<8} {:<12.1} {:<8.4}",
+                nm, n_x, m_v, n_time, strategy, ms, result.price);
+        }
     }
 }
