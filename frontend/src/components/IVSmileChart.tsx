@@ -2,6 +2,7 @@ import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import type { IVSmileData } from "../types/index.ts";
 import { Spinner } from "./ui/Spinner.tsx";
 import { Select } from "./ui/Select.tsx";
+import { IVSurfaceChart } from "./IVSurfaceChart.tsx";
 
 interface IVSmileChartProps {
   data: IVSmileData | null;
@@ -32,6 +33,7 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
   const [zoom, setZoom] = useState<ZoomState>({ scale: 1, translateX: 0, translateY: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+  const [viewMode, setViewMode] = useState<"2d" | "3d">("2d");
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
@@ -314,19 +316,41 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
         <div className="flex items-center justify-between mb-4 z-10 relative">
           <div>
             <span className="text-lg font-semibold text-white">
-              Implied Volatility Smile
+              Implied Volatility {viewMode === "2d" ? "Smile" : "Surface"}
             </span>
             <span className="ml-3 text-sm text-slate-400">
               {data.symbol} @ ${spotPrice.toFixed(2)}
             </span>
-            {zoom.scale > 1 && (
+            {zoom.scale > 1 && viewMode === "2d" && (
               <span className="ml-3 text-xs text-purple-400">
                 {zoom.scale.toFixed(1)}x zoom
               </span>
             )}
           </div>
           <div className="flex items-center gap-3">
-            {zoom.scale > 1 && (
+            <div className="flex bg-slate-800 rounded-md p-1">
+              <button
+                onClick={() => setViewMode("2d")}
+                className={`px-3 py-1 text-xs rounded-sm transition-colors ${
+                  viewMode === "2d"
+                    ? "bg-purple-600 text-white"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                2D Smile
+              </button>
+              <button
+                onClick={() => setViewMode("3d")}
+                className={`px-3 py-1 text-xs rounded-sm transition-colors ${
+                  viewMode === "3d"
+                    ? "bg-purple-600 text-white"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                3D Surface
+              </button>
+            </div>
+            {zoom.scale > 1 && viewMode === "2d" && (
               <button
                 onClick={() => setZoom({ scale: 1, translateX: 0, translateY: 0 })}
                 className="px-3 py-1 text-xs text-purple-400 hover:text-purple-300 border border-purple-500/30 hover:border-purple-500/50 rounded transition-colors"
@@ -334,24 +358,32 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
                 Reset Zoom
               </button>
             )}
-            <div className="w-48">
-              <Select
-                label="Expiration"
-                value={currentExpiration}
-                onChange={setSelectedExpiration}
-                options={expirations.map((exp) => ({ value: exp, label: exp }))}
-              />
-            </div>
+            {viewMode === "2d" && (
+              <div className="w-48">
+                <Select
+                  label="Expiration"
+                  value={currentExpiration}
+                  onChange={setSelectedExpiration}
+                  options={expirations.map((exp) => ({ value: exp, label: exp }))}
+                />
+              </div>
+            )}
           </div>
         </div>
 
-        <div
-          ref={chartContainerRef}
-          className="relative flex-1 min-h-[240px]"
-        >
-          <svg
-            ref={svgRef}
-            width={chartWidth}
+        {viewMode === "3d" ? (
+          <div className="flex-1 min-h-[240px]">
+            <IVSurfaceChart data={data} loading={loading} />
+          </div>
+        ) : (
+          <>
+            <div
+              ref={chartContainerRef}
+              className="relative flex-1 min-h-[240px]"
+            >
+              <svg
+                ref={svgRef}
+                width={chartWidth}
             height={chartHeight}
             viewBox={`0 0 ${chartWidth} ${chartHeight}`}
             className="w-full h-full absolute inset-0 cursor-crosshair"
@@ -589,13 +621,15 @@ export function IVSmileChart({ data, loading, underlyingPrice }: IVSmileChartPro
             </span>
           </div>
         </div>
+        </>
+        )}
       </div>
     );
   };
 
   return (
     <div
-      className="relative w-full h-full min-h-[400px] rounded-lg border border-slate-800 bg-slate-900 p-4"
+      className="relative w-full h-full min-h-[400px] rounded-lg border border-slate-800 bg-slate-900 p-4 overflow-hidden"
     >
       {renderContent()}
     </div>

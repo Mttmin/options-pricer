@@ -1,5 +1,6 @@
 use crate::{BlackScholesPrice, Options, Payoff};
 
+#[derive(Clone)]
 pub struct Position {
     pub option: Options,
     pub weight: f32,
@@ -49,6 +50,7 @@ pub enum Direction {
     SHORT,
     LONG,
 }
+#[derive(Clone)]
 pub struct OptionSpreads {
     components: Vec<Position>,
 }

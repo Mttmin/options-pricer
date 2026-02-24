@@ -1,3 +1,4 @@
+import Plot from "react-plotly.js";
 import type { PriceRequest, PriceResponse } from "../types/index.ts";
 import { calculatePayoffGrid } from "../utils/payoff.ts";
 import { Spinner } from "./ui/Spinner.tsx";
@@ -15,7 +16,7 @@ export function PayoffDiagram({
 }: PayoffDiagramProps) {
   if (!request || !priceResult) {
     return (
-      <div className="relative h-48 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
+      <div className="relative h-64 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
         <div className="absolute inset-0 flex items-center justify-center">
           <svg
             className="h-full w-full text-slate-800 opacity-30"
@@ -48,7 +49,7 @@ export function PayoffDiagram({
 
   if (loading) {
     return (
-      <div className="h-48 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
+      <div className="h-64 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
         <Spinner />
         <span className="ml-2 text-slate-400">Calculating payoff...</span>
       </div>
@@ -59,7 +60,7 @@ export function PayoffDiagram({
 
   if (!payoffData) {
     return (
-      <div className="h-48 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
+      <div className="h-64 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center">
         <p className="text-slate-500 text-sm text-center px-4">
           Payoff diagram not available for exotic options.
           <br />
@@ -72,84 +73,119 @@ export function PayoffDiagram({
   const { spotPrices, payoffs, breakEvenPoints, maxProfit, maxLoss } =
     payoffData;
 
-  const minPayoff = Math.min(...payoffs);
-  const maxPayoff = Math.max(...payoffs);
-  const payoffRange = maxPayoff - minPayoff || 1;
-  const padding = payoffRange * 0.15;
-
-  const chartHeight = 150;
-  const chartWidth = 400;
-
-  const zeroY =
-    chartHeight -
-    ((0 - minPayoff + padding) / (payoffRange + 2 * padding)) * chartHeight;
-
-  const points = spotPrices
-    .map((_, i) => {
-      const x = (i / (spotPrices.length - 1)) * chartWidth;
-      const y =
-        chartHeight -
-        ((payoffs[i] - minPayoff + padding) / (payoffRange + 2 * padding)) *
-        chartHeight;
-      return `${x},${y}`;
-    })
-    .join(" ");
-
-  const positiveArea: string[] = [];
-  const negativeArea: string[] = [];
-  let isFirstPositive = true;
-  let isFirstNegative = true;
-
-  for (let i = 0; i < spotPrices.length; i++) {
-    const x = (i / (spotPrices.length - 1)) * chartWidth;
-    const y =
-      chartHeight -
-      ((payoffs[i] - minPayoff + padding) / (payoffRange + 2 * padding)) *
-      chartHeight;
-
-    if (payoffs[i] >= 0) {
-      if (isFirstPositive) {
-        positiveArea.push(`M${x},${zeroY}`);
-        isFirstPositive = false;
-      }
-      positiveArea.push(`L${x},${y}`);
-    }
-
-    if (payoffs[i] <= 0) {
-      if (isFirstNegative) {
-        negativeArea.push(`M${x},${zeroY}`);
-        isFirstNegative = false;
-      }
-      negativeArea.push(`L${x},${y}`);
-    }
-  }
-
-  if (positiveArea.length > 0) {
-    const lastX = ((spotPrices.length - 1) / (spotPrices.length - 1)) * chartWidth;
-    positiveArea.push(`L${lastX},${zeroY} Z`);
-  }
-
-  if (negativeArea.length > 0) {
-    const lastX = ((spotPrices.length - 1) / (spotPrices.length - 1)) * chartWidth;
-    negativeArea.push(`L${lastX},${zeroY} Z`);
-  }
-
   const currentSpot =
     request.structure_type === "single"
       ? request.spot_price
       : request.structure_type === "spread"
         ? request.spot_price
         : 0;
-  const currentSpotX =
-    ((currentSpot - spotPrices[0]) / (spotPrices[spotPrices.length - 1] - spotPrices[0])) *
-    chartWidth;
+
+  const positivePayoffs = payoffs.map((p) => (p >= 0 ? p : 0));
+  const negativePayoffs = payoffs.map((p) => (p <= 0 ? p : 0));
+
+  const plotData: any[] = [
+    {
+      x: spotPrices,
+      y: positivePayoffs,
+      type: "scatter",
+      mode: "lines",
+      line: { width: 0 },
+      fill: "tozeroy",
+      fillcolor: "rgba(34, 197, 94, 0.2)",
+      hoverinfo: "skip",
+      showlegend: false,
+    },
+    {
+      x: spotPrices,
+      y: negativePayoffs,
+      type: "scatter",
+      mode: "lines",
+      line: { width: 0 },
+      fill: "tozeroy",
+      fillcolor: "rgba(239, 68, 68, 0.2)",
+      hoverinfo: "skip",
+      showlegend: false,
+    },
+    {
+      x: spotPrices,
+      y: payoffs,
+      type: "scatter",
+      mode: "lines",
+      line: { color: "#60a5fa", width: 2 },
+      name: "Payoff",
+      hovertemplate: "Spot: $%{x:.2f}<br>Payoff: $%{y:.2f}<extra></extra>",
+    },
+  ];
+
+  if (breakEvenPoints.length > 0) {
+    plotData.push({
+      x: breakEvenPoints,
+      y: breakEvenPoints.map(() => 0),
+      type: "scatter",
+      mode: "markers",
+      marker: { color: "#fbbf24", size: 8, line: { color: "#92400e", width: 1 } },
+      name: "Break-even",
+      hovertemplate: "Break-even: $%{x:.2f}<extra></extra>",
+    });
+  }
+
+  const layout: any = {
+    autosize: true,
+    margin: { l: 50, r: 20, t: 20, b: 40 },
+    paper_bgcolor: "transparent",
+    plot_bgcolor: "transparent",
+    xaxis: {
+      title: {
+        text:
+          request.structure_type === "spread" &&
+          request.spread_type === "calendar_spread"
+            ? "Underlying Asset Price at Short-Term Expiration"
+            : "Underlying Asset Price at Expiration",
+        font: { color: "#94a3b8", size: 12 },
+      },
+      tickfont: { color: "#94a3b8" },
+      gridcolor: "#334155",
+      zerolinecolor: "#475569",
+    },
+    yaxis: {
+      title: {
+        text: "Payoff ($)",
+        font: { color: "#94a3b8", size: 12 },
+      },
+      tickfont: { color: "#94a3b8" },
+      gridcolor: "#334155",
+      zeroline: true,
+      zerolinecolor: "#64748b",
+      zerolinewidth: 1,
+    },
+    showlegend: false,
+    hovermode: "x unified",
+    shapes: [
+      {
+        type: "line",
+        x0: currentSpot,
+        x1: currentSpot,
+        y0: 0,
+        y1: 1,
+        yref: "paper",
+        line: {
+          color: "#8b5cf6",
+          width: 1,
+          dash: "dash",
+        },
+      },
+    ],
+  };
 
   return (
-    <div className="rounded-lg border border-slate-800 bg-slate-900 p-4 pb-8">
+    <div className="rounded-lg border border-slate-800 bg-slate-900 p-4 pb-4">
       <div className="flex items-center justify-between mb-3">
         <div>
           <span className="text-lg font-semibold text-white">
-            Payoff at Expiration
+            {request.structure_type === "spread" &&
+            request.spread_type === "calendar_spread"
+              ? "Payoff at Short-Term Expiration"
+              : "Payoff at Expiration"}
           </span>
           {maxProfit !== null && (
             <span className="ml-3 text-sm text-green-400">
@@ -171,94 +207,14 @@ export function PayoffDiagram({
         </div>
       </div>
 
-      <div className="relative">
-        <svg
-          viewBox={`0 0 ${chartWidth} ${chartHeight}`}
-          className="w-full h-40"
-          preserveAspectRatio="none"
-        >
-          <defs>
-            <linearGradient id="profitGradient" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#22c55e" stopOpacity="0.3" />
-              <stop offset="100%" stopColor="#22c55e" stopOpacity="0" />
-            </linearGradient>
-            <linearGradient id="lossGradient" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#ef4444" stopOpacity="0" />
-              <stop offset="100%" stopColor="#ef4444" stopOpacity="0.3" />
-            </linearGradient>
-          </defs>
-
-          {positiveArea.length > 0 && (
-            <path d={positiveArea.join(" ")} fill="url(#profitGradient)" />
-          )}
-          {negativeArea.length > 0 && (
-            <path d={negativeArea.join(" ")} fill="url(#lossGradient)" />
-          )}
-
-          <line
-            x1="0"
-            y1={zeroY}
-            x2={chartWidth}
-            y2={zeroY}
-            stroke="#64748b"
-            strokeWidth="1"
-            strokeDasharray="4 4"
-            vectorEffect="non-scaling-stroke"
-          />
-
-          <polyline
-            points={points}
-            fill="none"
-            stroke="#60a5fa"
-            strokeWidth="2"
-            vectorEffect="non-scaling-stroke"
-          />
-
-          <line
-            x1={currentSpotX}
-            y1="0"
-            x2={currentSpotX}
-            y2={chartHeight}
-            stroke="#8b5cf6"
-            strokeWidth="1"
-            strokeDasharray="2 2"
-            vectorEffect="non-scaling-stroke"
-          />
-
-          {breakEvenPoints.map((breakEven, idx) => {
-            const x =
-              ((breakEven - spotPrices[0]) /
-                (spotPrices[spotPrices.length - 1] - spotPrices[0])) *
-              chartWidth;
-            return (
-              <circle
-                key={idx}
-                cx={x}
-                cy={zeroY}
-                r="3"
-                fill="#fbbf24"
-                stroke="#92400e"
-                strokeWidth="1"
-              />
-            );
-          })}
-        </svg>
-
-        <div className="absolute left-0 top-0 text-xs text-slate-500 bg-slate-900/50 px-1 rounded">
-          ${maxPayoff.toFixed(2)}
-        </div>
-        <div className="absolute left-0 bottom-6 text-xs text-slate-500 bg-slate-900/50 px-1 rounded">
-          ${minPayoff.toFixed(2)}
-        </div>
-        <div className="absolute right-0 bottom-0 text-xs text-slate-500">
-          ${spotPrices[spotPrices.length - 1].toFixed(2)}
-        </div>
-        <div className="absolute left-1/2 -translate-x-1/2 bottom-0 text-xs text-slate-500">
-          ${spotPrices[Math.floor(spotPrices.length / 2)].toFixed(2)}
-        </div>
-        <div className="absolute left-0 bottom-0 text-xs text-slate-500">
-          ${spotPrices[0].toFixed(2)}
-        </div>
+      <div className="w-full h-64">
+        <Plot
+          data={plotData}
+          layout={layout}
+          useResizeHandler={true}
+          style={{ width: "100%", height: "100%" }}
+          config={{ displayModeBar: false, responsive: true }}
+        />
       </div>
     </div>
   );
