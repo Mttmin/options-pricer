@@ -9,11 +9,20 @@ interface PriceChartProps {
   loading: boolean;
 }
 
+interface ZoomState {
+  scale: number;
+  translateX: number;
+  translateY: number;
+}
+
 export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartProps) {
   const [hoverPoint, setHoverPoint] = useState<{ price: number; date: string; x: number; y: number } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const [zoom, setZoom] = useState<ZoomState>({ scale: 1, translateX: 0, translateY: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -29,13 +38,79 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
     return () => resizeObserver.disconnect();
   }, []);
 
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const preventScroll = (e: WheelEvent) => {
+      e.preventDefault();
+    };
+
+    container.addEventListener('wheel', preventScroll, { passive: false });
+    return () => container.removeEventListener('wheel', preventScroll);
+  }, []);
+
   const chartWidth = dimensions.width || 800;
   const chartHeight = dimensions.height || 400;
   const padding = { left: 50, right: 20, top: 20, bottom: 30 };
 
+  const handleWheel = useCallback(
+    (e: React.WheelEvent<SVGSVGElement>) => {
+      e.preventDefault();
+      if (!svgRef.current) return;
+
+      const rect = svgRef.current.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      const delta = e.deltaY > 0 ? 0.9 : 1.1;
+      const newScale = Math.max(1, Math.min(10, zoom.scale * delta));
+
+      if (newScale === 1) {
+        setZoom({ scale: 1, translateX: 0, translateY: 0 });
+      } else {
+        const factor = newScale / zoom.scale;
+        const newTranslateX = mouseX - factor * (mouseX - zoom.translateX);
+        const newTranslateY = mouseY - factor * (mouseY - zoom.translateY);
+        setZoom({ scale: newScale, translateX: newTranslateX, translateY: newTranslateY });
+      }
+    },
+    [zoom]
+  );
+
+  const handleMouseDown = useCallback((e: React.MouseEvent<SVGSVGElement>) => {
+    if (e.button === 0 && zoom.scale > 1) {
+      setIsDragging(true);
+      setDragStart({ x: e.clientX - zoom.translateX, y: e.clientY - zoom.translateY });
+      e.preventDefault();
+    }
+  }, [zoom]);
+
+  const handleMouseMoveForPan = useCallback(
+    (e: React.MouseEvent<SVGSVGElement>) => {
+      if (isDragging && dragStart && zoom.scale > 1) {
+        setZoom({
+          ...zoom,
+          translateX: e.clientX - dragStart.x,
+          translateY: e.clientY - dragStart.y,
+        });
+      }
+    },
+    [isDragging, dragStart, zoom]
+  );
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false);
+    setDragStart(null);
+  }, []);
+
+  const handleDoubleClick = useCallback(() => {
+    setZoom({ scale: 1, translateX: 0, translateY: 0 });
+  }, []);
+
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<SVGSVGElement>) => {
-      if (!svgRef.current || data.length === 0) return;
+      if (!svgRef.current || data.length === 0 || isDragging) return;
 
       const sortedData = [...data].reverse();
       const prices = sortedData.map((p) => p.price);
@@ -52,7 +127,9 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
       const rect = svgRef.current.getBoundingClientRect();
       const svgX = e.clientX - rect.left;
       const svgWidth = rect.width;
-      const normalizedX = (svgX / svgWidth) * chartWidth;
+      let normalizedX = (svgX / svgWidth) * chartWidth;
+
+      normalizedX = (normalizedX - zoom.translateX) / zoom.scale;
 
       if (normalizedX < padding.left || normalizedX > chartWidth - padding.right) {
         setHoverPoint(null);
@@ -73,12 +150,13 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
         });
       }
     },
-    [data, chartWidth, chartHeight, padding]
+    [data, chartWidth, chartHeight, padding, zoom, isDragging]
   );
 
   const handleMouseLeave = useCallback(() => {
     setHoverPoint(null);
-  }, []);
+    handleMouseUp();
+  }, [handleMouseUp]);
 
   const renderContent = () => {
     if (!ticker) {
@@ -147,7 +225,7 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
 
     return (
       <>
-        <div className="absolute top-4 left-4 z-10">
+        <div className="absolute top-4 left-4 z-10 flex items-center gap-4">
           <div className="flex items-center gap-3">
             <div>
               <span className="text-lg font-semibold text-white">{ticker}</span>
@@ -163,7 +241,20 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
               {priceChangePercent.toFixed(2)}%)
               <span className="text-slate-500 ml-1 text-xs">90d</span>
             </div>
+            {zoom.scale > 1 && (
+              <span className="text-xs text-purple-400">
+                {zoom.scale.toFixed(1)}x zoom
+              </span>
+            )}
           </div>
+          {zoom.scale > 1 && (
+            <button
+              onClick={() => setZoom({ scale: 1, translateX: 0, translateY: 0 })}
+              className="px-3 py-1 text-xs text-purple-400 hover:text-purple-300 border border-purple-500/30 hover:border-purple-500/50 rounded transition-colors"
+            >
+              Reset Zoom
+            </button>
+          )}
         </div>
 
         <svg
@@ -172,9 +263,17 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
           height={chartHeight}
           viewBox={`0 0 ${chartWidth} ${chartHeight}`}
           className="w-full h-full absolute inset-0"
+          style={{ cursor: isDragging ? "grabbing" : zoom.scale > 1 ? "grab" : "crosshair" }}
           preserveAspectRatio="none"
-          onMouseMove={handleMouseMove}
+          onMouseMove={(e) => {
+            handleMouseMoveForPan(e);
+            handleMouseMove(e);
+          }}
+          onMouseDown={handleMouseDown}
+          onMouseUp={handleMouseUp}
           onMouseLeave={handleMouseLeave}
+          onWheel={handleWheel}
+          onDoubleClick={handleDoubleClick}
         >
           <defs>
             <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
@@ -191,6 +290,7 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
             </linearGradient>
           </defs>
 
+          <g transform={`translate(${zoom.translateX}, ${zoom.translateY}) scale(${zoom.scale})`}>
           {yTicks.map((tick, i) => {
             const y = getY(tick);
             return (
@@ -270,6 +370,7 @@ export function PriceChart({ data, ticker, currentPrice, loading }: PriceChartPr
               />
             </>
           )}
+          </g>
 
           <text
             x={chartWidth / 2}

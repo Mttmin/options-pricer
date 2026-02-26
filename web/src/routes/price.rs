@@ -159,6 +159,17 @@ fn price_single(req: SingleOptionRequest, dividend_info: Option<(f64, f64)>) -> 
         rho: option.rho(vol, spot, rfr) * direction_sign,
     };
 
+    let mut spot_prices = Vec::with_capacity(100);
+    let mut payoffs = Vec::with_capacity(100);
+    let min_spot = spot * 0.5;
+    let max_spot = spot * 1.5;
+    let step = (max_spot - min_spot) / 99.0;
+    for i in 0..100 {
+        let s = min_spot + (i as f64) * step;
+        spot_prices.push(s);
+        payoffs.push((option.compute(s) - bs_price.abs()) * direction_sign);
+    }
+
     Ok(PriceResponse {
         structure_type: "single".to_string(),
         pricing: PricingResult {
@@ -184,6 +195,7 @@ fn price_single(req: SingleOptionRequest, dividend_info: Option<(f64, f64)>) -> 
             }),
         },
         greeks: Some(greeks),
+        payoff_curve: Some(PayoffCurve { spot_prices, payoffs }),
     })
 }
 
@@ -363,7 +375,7 @@ fn price_spread(req: SpreadRequest, dividend_info: Option<(f64, f64)>) -> Result
 
     let penalty_start = Instant::now();
     let penalty_result = if allow_pde {
-        compute_spread_penalty_solver(spread).ok()
+        compute_spread_penalty_solver(spread.clone()).ok()
     } else {
         None
     };
@@ -372,6 +384,47 @@ fn price_spread(req: SpreadRequest, dividend_info: Option<(f64, f64)>) -> Result
     } else {
         None
     };
+
+    let mut spot_prices = Vec::with_capacity(100);
+    let mut payoffs = Vec::with_capacity(100);
+    let min_spot = spot * 0.5;
+    let max_spot = spot * 1.5;
+    let step = (max_spot - min_spot) / 99.0;
+
+    let is_calendar = matches!(req.spread_type, SpreadTypeInput::CalendarSpread);
+    let short_term_maturity = req.short_term_maturity.unwrap_or(0.0);
+
+    for i in 0..100 {
+        let s = min_spot + (i as f64) * step;
+        spot_prices.push(s);
+        
+        let mut payoff = 0.0;
+        if is_calendar {
+            for pos in spread.components() {
+                let opt = pos.option;
+                if (opt.time_to_maturity() - short_term_maturity).abs() < 1e-6 {
+                    // Short-term leg expires, intrinsic value
+                    payoff += opt.compute(s) * pos.weight as f64;
+                } else {
+                    // Long-term leg, price with remaining time
+                    let remaining_ttm = opt.time_to_maturity() - short_term_maturity;
+                    let new_opt = match opt {
+                        Options::Call(_) => Options::new_call(
+                            opt.strike_price(), s, opt.volatility(), opt.risk_free_rate(), remaining_ttm, opt.dividend_yield()
+                        ),
+                        Options::Put(_) => Options::new_put(
+                            opt.strike_price(), s, opt.volatility(), opt.risk_free_rate(), remaining_ttm, opt.dividend_yield()
+                        ),
+                    };
+                    payoff += new_opt.bs_pricing() * pos.weight as f64;
+                }
+            }
+        } else {
+            payoff = spread.compute(s);
+        }
+        
+        payoffs.push(payoff - bs_price);
+    }
 
     Ok(PriceResponse {
         structure_type: "spread".to_string(),
@@ -398,6 +451,7 @@ fn price_spread(req: SpreadRequest, dividend_info: Option<(f64, f64)>) -> Result
             }),
         },
         greeks: Some(greeks),
+        payoff_curve: Some(PayoffCurve { spot_prices, payoffs }),
     })
 }
 
@@ -462,6 +516,19 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
             let bs_price = cb.bs_pricing();
             let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
 
+            let mut spot_prices = Vec::with_capacity(100);
+            let mut payoffs = Vec::with_capacity(100);
+            let min_spot = params.stock_price * 0.5;
+            let max_spot = params.stock_price * 1.5;
+            let step = (max_spot - min_spot) / 99.0;
+            for i in 0..100 {
+                let s = min_spot + (i as f64) * step;
+                spot_prices.push(s);
+                let conversion_value = (params.face_value / params.conversion_price) * s;
+                let payoff = params.face_value.max(conversion_value);
+                payoffs.push(payoff - bs_price);
+            }
+
             Ok(PriceResponse {
                 structure_type: "exotic".to_string(),
                 pricing: PricingResult {
@@ -482,6 +549,7 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                     }),
                 },
                 greeks: None,
+                payoff_curve: Some(PayoffCurve { spot_prices, payoffs }),
             })
         }
         ExoticTypeInput::ChooserOption => {
@@ -499,6 +567,28 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
             let bs_price = chooser.bs_pricing();
             let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
 
+            let mut spot_prices = Vec::with_capacity(100);
+            let mut payoffs = Vec::with_capacity(100);
+            let min_spot = params.spot_price * 0.5;
+            let max_spot = params.spot_price * 1.5;
+            let step = (max_spot - min_spot) / 99.0;
+            let remaining_ttm = params.time_to_maturity - params.choose_time;
+            
+            for i in 0..100 {
+                let s = min_spot + (i as f64) * step;
+                spot_prices.push(s);
+                
+                let call = Options::new_call(
+                    params.strike_price, s, params.volatility, params.risk_free_rate, remaining_ttm, params.dividend_yield
+                );
+                let put = Options::new_put(
+                    params.strike_price, s, params.volatility, params.risk_free_rate, remaining_ttm, params.dividend_yield
+                );
+                
+                let payoff = call.bs_pricing().max(put.bs_pricing());
+                payoffs.push(payoff - bs_price);
+            }
+
             Ok(PriceResponse {
                 structure_type: "exotic".to_string(),
                 pricing: PricingResult {
@@ -519,6 +609,7 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                     }),
                 },
                 greeks: None,
+                payoff_curve: Some(PayoffCurve { spot_prices, payoffs }),
             })
         }
     }

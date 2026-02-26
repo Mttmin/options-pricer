@@ -27,6 +27,14 @@ pub struct PriceResponse {
     pub pricing: PricingResult,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub greeks: Option<GreeksResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payoff_curve: Option<PayoffCurve>,
+}
+
+#[derive(Serialize)]
+pub struct PayoffCurve {
+    pub spot_prices: Vec<f64>,
+    pub payoffs: Vec<f64>,
 }
 
 #[derive(Serialize)]
