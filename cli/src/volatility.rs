@@ -1,5 +1,9 @@
 use crate::fetcher::DataFetcher;
 
+const EMA_WINDOW_DAYS: u16 = 30;
+const EMA_LAMBDA: f64 = 0.9;
+const MIN_CORRELATION: f64 = 0.2;
+
 fn calculate_pearson_correlation(x: &[f64], y: &[f64]) -> f64 {
     let n = x.len();
     if n != y.len() || n == 0 {
@@ -88,29 +92,26 @@ fn ema_volatility_all(data: &[(String, f64)],n_days_per: u16, lambda: f64) -> Re
     }
 }
 
-pub async fn vix_volatility(symbol: &str, data_fetcher: DataFetcher, num_days: u16) -> Result<f64, f64> {
-    let (stock_data, _) = match data_fetcher
-        .get_historical_data(symbol, num_days.into())
-        .await
-    {
-        Ok(result) => result,
-        Err(_) => return Err(0.0),
-    };
+fn blend_ema_with_vix_series(
+    stock_data: &[(String, f64)],
+    mut vix_data_desc_pct: Vec<f64>,
+    ema_window_days: u16,
+    lambda: f64,
+    min_correlation: f64,
+) -> Result<f64, f64> {
+    let fallback = ema_volatility(stock_data, ema_window_days, lambda)
+        .unwrap_or_else(|v| v);
 
-    let fallback = ema_volatility(&stock_data, 30, 0.9).unwrap_or_else(|v| v);
-
-    let mut vix_data = match data_fetcher.fetch_fred_vix(num_days).await {
-        Ok(data) => data,
-        Err(_) => return Err(fallback),
-    };
-
-    if vix_data.len() < 2 || stock_data.len() <= num_days as usize {
+    if vix_data_desc_pct.len() < 2 || stock_data.len() <= ema_window_days as usize {
         return Err(fallback);
     }
 
-    vix_data.iter_mut().for_each(|x| *x /= 100.0);
+    // FRED endpoint is requested in descending order (latest -> oldest).
+    // Reverse to oldest -> latest so it aligns with rolling EMA output.
+    vix_data_desc_pct.reverse();
+    vix_data_desc_pct.iter_mut().for_each(|x| *x /= 100.0);
 
-    let mut ema_vol = match ema_volatility_all(&stock_data, num_days, 0.9) {
+    let ema_vol = match ema_volatility_all(stock_data, ema_window_days, lambda) {
         Ok(data) => data,
         Err(_) => return Err(fallback),
     };
@@ -119,24 +120,47 @@ pub async fn vix_volatility(symbol: &str, data_fetcher: DataFetcher, num_days: u
         return Err(fallback);
     }
 
-    let last_vix = vix_data.pop().unwrap_or(0.0);
-    let latest_ema_vol = ema_vol[0];
-    ema_vol.remove(0);
+    let latest_ema_vol = *ema_vol.last().unwrap_or(&fallback);
+    let latest_vix = *vix_data_desc_pct.last().unwrap_or(&latest_ema_vol);
 
-    let min_len = ema_vol.len().min(vix_data.len());
-    if min_len == 0 {
+    let min_len = ema_vol.len().min(vix_data_desc_pct.len());
+    if min_len < 2 {
         return Err(fallback);
     }
 
     let ema_slice = &ema_vol[ema_vol.len() - min_len..];
-    let vix_slice = &vix_data[vix_data.len() - min_len..];
+    let vix_slice = &vix_data_desc_pct[vix_data_desc_pct.len() - min_len..];
     let correlation = calculate_pearson_correlation(ema_slice, vix_slice);
 
-    if correlation < 0.2 {
+    if correlation < min_correlation {
         return Err(latest_ema_vol);
     }
 
-    Ok(last_vix * correlation + (1.0 - correlation) * latest_ema_vol)
+    Ok(latest_vix * correlation + (1.0 - correlation) * latest_ema_vol)
+}
+
+pub async fn vix_volatility(symbol: &str, data_fetcher: DataFetcher, num_days: u16) -> Result<f64, f64> {
+    let lookback_days = num_days as usize + EMA_WINDOW_DAYS as usize;
+    let (stock_data, _) = match data_fetcher
+        .get_historical_data(symbol, lookback_days)
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => return Err(0.0),
+    };
+
+    let vix_data = match data_fetcher.fetch_fred_vix(num_days).await {
+        Ok(data) => data,
+        Err(_) => return Err(ema_volatility(&stock_data, EMA_WINDOW_DAYS, EMA_LAMBDA).unwrap_or_else(|v| v)),
+    };
+
+    blend_ema_with_vix_series(
+        &stock_data,
+        vix_data,
+        EMA_WINDOW_DAYS,
+        EMA_LAMBDA,
+        MIN_CORRELATION,
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -175,6 +199,50 @@ mod tests {
         println!("Standard: {:.2}%, EMA: {:.2}%", std_vol * 100.0, ema_vol * 100.0);
         assert!(std_vol > 0.0 && ema_vol > 0.0);
         assert!(ema_vol / std_vol > 0.3 && ema_vol / std_vol < 3.0);
+    }
+
+    #[test]
+    fn test_vix_blend_uses_correlation_when_series_aligned() {
+        let prices = gen_prices(160, 0.02);
+        let ema_series = ema_volatility_all(&prices, EMA_WINDOW_DAYS, EMA_LAMBDA).unwrap();
+
+        let num_days = 60usize;
+        let ema_tail = &ema_series[ema_series.len() - num_days..];
+        let mut vix_desc_pct: Vec<f64> = ema_tail.iter().map(|v| v * 100.0).collect();
+        vix_desc_pct.reverse();
+
+        let blended = blend_ema_with_vix_series(
+            &prices,
+            vix_desc_pct,
+            EMA_WINDOW_DAYS,
+            EMA_LAMBDA,
+            MIN_CORRELATION,
+        );
+
+        assert!(blended.is_ok());
+    }
+
+    #[test]
+    fn test_vix_blend_falls_back_on_low_correlation() {
+        let prices = gen_prices(160, 0.02);
+
+        // Intentionally shape a low-correlation VIX series vs EMA volatility.
+        let num_days = 60usize;
+        let mut vix_desc_pct = Vec::with_capacity(num_days);
+        for i in 0..num_days {
+            let value = if i % 2 == 0 { 10.0 } else { 40.0 };
+            vix_desc_pct.push(value);
+        }
+
+        let blended = blend_ema_with_vix_series(
+            &prices,
+            vix_desc_pct,
+            EMA_WINDOW_DAYS,
+            EMA_LAMBDA,
+            MIN_CORRELATION,
+        );
+
+        assert!(blended.is_err());
     }
 
     #[test]
