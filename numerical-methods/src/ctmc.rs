@@ -285,15 +285,15 @@ impl SLVModelVariant {
             other => other,
         }
     }
-    pub fn g_integral(&self, s: f64) -> f64 { dispatch!(self, g_integral, s) }
-    pub fn f_integral(&self, v: f64) -> f64 { dispatch!(self, f_integral, v) }
-    pub fn g_inverse(&self, x: f64) -> f64  { dispatch!(self, g_inverse, x) }
-    pub fn f_inverse(&self, y: f64) -> f64  { dispatch!(self, f_inverse, y) }
-    pub fn m_prime(&self, v: f64) -> f64    { dispatch!(self, m_prime, v) }
-    pub fn sigma_prime_v(&self, v: f64) -> f64 { dispatch!(self, sigma_prime_v, v) }
-    pub fn gamma_prime(&self, s: f64) -> f64   { dispatch!(self, gamma_prime, s) }
-    pub fn rho(&self) -> f64                { dispatch!(self, rho) }
-    pub fn omega(&self, s: f64, v: f64) -> f64 { dispatch!(self, omega, s, v) }
+    #[inline] pub fn g_integral(&self, s: f64) -> f64 { dispatch!(self, g_integral, s) }
+    #[inline] pub fn f_integral(&self, v: f64) -> f64 { dispatch!(self, f_integral, v) }
+    #[inline] pub fn g_inverse(&self, x: f64) -> f64  { dispatch!(self, g_inverse, x) }
+    #[inline] pub fn f_inverse(&self, y: f64) -> f64  { dispatch!(self, f_inverse, y) }
+    #[inline] pub fn m_prime(&self, v: f64) -> f64    { dispatch!(self, m_prime, v) }
+    #[inline] pub fn sigma_prime_v(&self, v: f64) -> f64 { dispatch!(self, sigma_prime_v, v) }
+    #[inline] pub fn gamma_prime(&self, s: f64) -> f64   { dispatch!(self, gamma_prime, s) }
+    #[inline] pub fn rho(&self) -> f64                { dispatch!(self, rho) }
+    #[inline] pub fn omega(&self, s: f64, v: f64) -> f64 { dispatch!(self, omega, s, v) }
 }
 
 impl SLVModel for SLVModelVariant {
@@ -532,22 +532,27 @@ pub fn assemble_generator(slv_model: &SLVModelVariant, x_grid: &[f64], x_spacing
 // Algorithm 3.1: CTMC Integral Equation method for American options (Ma, Yang & Cui 2021)
 
 pub struct CTMCPricerConfig {
-    pub strike: f64,
-    pub risk_free: f64,
-    pub dividend: f64,
-    pub maturity: f64,
+    pub option: options::Options,
     pub n_time_steps: usize,
 }
 
 impl CTMCPricerConfig {
-    pub fn dt(&self) -> f64 { self.maturity / self.n_time_steps as f64 }
+    #[inline] pub fn dt(&self) -> f64 { self.option.time_to_maturity() / self.n_time_steps as f64 }
 
-    // Terminal boundary in spot-space: min(K, rK/q). Limit is K when q=0.
+    // Terminal exercise boundary in spot-space at maturity.
+    // Put: min(K, rK/q) — exercised early only when spot is low.
+    // Call: max(K, rK/q) — exercised early only when dividend yield exceeds risk-free rate; q=0 → +∞.
     pub fn terminal_boundary_s(&self) -> f64 {
-        if self.dividend > 1e-15 {
-            self.strike.min(self.strike * self.risk_free / self.dividend)
-        } else {
-            self.strike
+        let k = self.option.strike_price();
+        let r = self.option.risk_free_rate();
+        let q = self.option.dividend_yield().unwrap_or(0.0);
+        match &self.option {
+            options::Options::Put(_) => {
+                if q > 1e-15 { k.min(k * r / q) } else { k }
+            }
+            options::Options::Call(_) => {
+                if q > 1e-15 { k.max(k * r / q) } else { f64::INFINITY }
+            }
         }
     }
 }
@@ -561,22 +566,26 @@ pub struct CTMCResult {
     pub boundary_s: Vec<Vec<f64>>,
 }
 
-// H^(1): European put payoff vector.
-// Element at φ(i,l) = l·N+i: max(K − S(x_i, v_l), 0).
-// excess[l*n+i] = K − S(x_i, v_l) (pre-computed, not clamped).
+// H^(1): European option payoff vector.
+// excess[l*n+i] = intrinsic value (K−S for put, S−K for call), pre-computed, unclamped.
+#[inline]
 fn build_h1(excess: &[f64]) -> Vec<f64> {
     excess.iter().map(|&e| e.max(0.0)).collect()
 }
 
-// H^(3)_k: early exercise integrand. For nodes in the exercise region (x_i ≤ b_k(v_l)):
-//   h3_coeff[l*n+i] = rK − (rS − ω(S, v_l)), pre-computed; zero outside exercise region.
-fn build_h3(h3_coeff: &[f64], x_grid: &[f64], boundary: &[f64], m: usize, n: usize) -> Vec<f64> {
+// H^(3)_k: early exercise integrand.
+//   Put  (is_call=false): exercise region x_i ≤ b_k(v_l); coeff = rK − (rS − ω).
+//   Call (is_call=true) : exercise region x_i ≥ b_k(v_l); coeff = (rS − ω) − rK.
+// is_call is pre-computed outside the time-step loop so the branch is hoisted.
+#[inline]
+fn build_h3(h3_coeff: &[f64], x_grid: &[f64], boundary: &[f64], m: usize, n: usize, is_call: bool) -> Vec<f64> {
     (0..m)
         .into_par_iter()
         .flat_map_iter(|l| {
             let b = boundary[l];
             (0..n).map(move |i| {
-                if x_grid[i] <= b { h3_coeff[l * n + i] } else { 0.0 }
+                let in_region = if is_call { x_grid[i] >= b } else { x_grid[i] <= b };
+                if in_region { h3_coeff[l * n + i] } else { 0.0 }
             })
         })
         .collect()
@@ -585,6 +594,7 @@ fn build_h3(h3_coeff: &[f64], x_grid: &[f64], boundary: &[f64], m: usize, n: usi
 // Find b_k(v_l): X-space boundary where intrinsic = continuation for variance state l.
 // f(i) = excess[base+i] − J_k[base+i]; monotone decreasing in i (deep ITM → OTM).
 // Binary-search for the rightmost i where f(i) ≥ 0, then refine with linear interpolation.
+#[inline]
 fn find_boundary_for_state(j_k: &[f64], excess: &[f64], x_grid: &[f64], l: usize, n: usize) -> f64 {
     let base = l * n;
     let f = |i: usize| excess[base + i] - j_k[base + i];
@@ -614,6 +624,35 @@ fn find_boundary_for_state(j_k: &[f64], excess: &[f64], x_grid: &[f64], l: usize
     x_grid[cross]
 }
 
+// Find b_k(v_l) for a call: X-space boundary where intrinsic = continuation for variance state l.
+// f(i) = excess_call[base+i] − J_k[base+i]; monotone increasing in i (OTM → deep ITM).
+// Binary-search for the leftmost i where f(i) ≥ 0, then refine with linear interpolation.
+// Returns +∞ when no exercise region exists (correct for q=0: INFINITY causes h3 to be zero everywhere).
+#[inline]
+fn find_boundary_for_state_call(j_k: &[f64], excess: &[f64], x_grid: &[f64], l: usize, n: usize) -> f64 {
+    let base = l * n;
+    let f = |i: usize| excess[base + i] - j_k[base + i];
+
+    if f(n - 1) < 0.0 { return f64::INFINITY; } // no exercise anywhere
+    if f(0) >= 0.0 { return x_grid[0]; }          // entire range is exercise region
+    // Invariant: f(lo) < 0, f(hi) >= 0. Converge to leftmost crossing.
+    let mut lo = 0;
+    let mut hi = n - 1;
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if f(mid) < 0.0 { lo = mid; } else { hi = mid; }
+    }
+    let cross = hi;
+    let f_lo = f(cross - 1);
+    let f_hi = f(cross);
+    if (f_hi - f_lo).abs() > 1e-30 {
+        let alpha = f_lo.abs() / (f_lo.abs() + f_hi.abs());
+        return x_grid[cross - 1] + alpha * (x_grid[cross] - x_grid[cross - 1]);
+    }
+    x_grid[cross]
+}
+
+#[inline]
 fn interpolate_value(j: &[f64], x_grid: &[f64], v_grid: &[f64], x: f64, v: f64, n: usize, m: usize) -> f64 {
     let ix = bracket_search(x_grid, x);
     let ix1 = (ix + 1).min(n - 1);
@@ -629,6 +668,7 @@ fn interpolate_value(j: &[f64], x_grid: &[f64], v_grid: &[f64], x: f64, v: f64, 
         + wx * wv * j[iv1 * n + ix1]
 }
 
+#[inline]
 fn bracket_search(grid: &[f64], target: f64) -> usize {
     let n = grid.len();
     if n == 0 || target <= grid[0] { return 0; }
@@ -666,18 +706,28 @@ pub fn run_algorithm_31(
             (0..n).map(move |i| model.g_inverse(ctmc.x_grid[i] + rho * f_vl))
         })
         .collect();
-    // excess[l*n+i] = K − S(x_i, v_l), unclamped, used for exercise boundary search.
-    let excess: Vec<f64> = s_grid.iter().map(|&s| config.strike - s).collect();
-    // h3_coeff[l*n+i] = rK − (rS − ω(S, v_l)), the early-exercise integrand value.
-    let r = config.risk_free;
-    let k_strike = config.strike;
-    let s_sl: &[f64] = &s_grid;   // &[f64] is Copy, safe to move into inner closure
+    let r = config.option.risk_free_rate();
+    let k_strike = config.option.strike_price();
+    // Hoist call/put dispatch out of all inner loops.
+    let is_call  = matches!(config.option, options::Options::Call(_));
+    let eep_sign = if is_call { -1.0_f64 } else { 1.0_f64 };
+
+    // excess[l*n+i]: intrinsic value (unsigned), used for exercise boundary search.
+    //   Put: K − S(x_i, v_l)   Call: S(x_i, v_l) − K
+    let excess: Vec<f64> = if is_call {
+        s_grid.iter().map(|&s| s - k_strike).collect()
+    } else {
+        s_grid.iter().map(|&s| k_strike - s).collect()
+    };
+    // h3_coeff[l*n+i]: early-exercise integrand, pre-computed.
+    //   Put:  rK − (rS − ω(S, v_l))   Call: (rS − ω(S, v_l)) − rK  (unified via eep_sign)
+    let s_sl: &[f64] = &s_grid;
     let h3_coeff: Vec<f64> = (0..m)
         .flat_map(|l| {
             let v_l = ctmc.v_grid[l];
             (0..n).map(move |i| {
                 let s = s_sl[l * n + i];
-                r * k_strike - (r * s - model.omega(s, v_l))
+                eep_sign * (r * k_strike - (r * s - model.omega(s, v_l)))
             })
         })
         .collect();
@@ -692,7 +742,7 @@ pub fn run_algorithm_31(
 
     let mut rhs = vec![0.0_f64; nm];
     for k in (0..n_steps).rev() {
-        let h3 = build_h3(&h3_coeff, &ctmc.x_grid, &boundary_x[k + 1], m, n);
+        let h3 = build_h3(&h3_coeff, &ctmc.x_grid, &boundary_x[k + 1], m, n, is_call);
         rhs.iter_mut()
             .zip(j.iter())
             .zip(h3.iter())
@@ -700,7 +750,11 @@ pub fn run_algorithm_31(
         j = operator.apply(&rhs);
         boundary_x[k] = (0..m)
             .into_par_iter()
-            .map(|l| find_boundary_for_state(&j, &excess, &ctmc.x_grid, l, n))
+            .map(|l| if is_call {
+                find_boundary_for_state_call(&j, &excess, &ctmc.x_grid, l, n)
+            } else {
+                find_boundary_for_state(&j, &excess, &ctmc.x_grid, l, n)
+            })
             .collect();
     }
 
@@ -714,42 +768,83 @@ pub fn run_algorithm_31(
     CTMCResult { price, j0: j, boundary_x, boundary_s }
 }
 
-/// Price an American put under the Heston stochastic volatility model.
+/// Price an American option under the Heston stochastic volatility model.
 ///
-/// Builds grids, assembles G, selects Dense Padé or Krylov based on problem size,
-/// then runs Algorithm 3.1. Grid range follows the paper: x ∈ [g(0.001S), g(4S)].
-pub fn price_american_put_heston(
-    strike: f64,
-    spot: f64,
+/// Accepts any `Options` variant (put or call). Builds grids, assembles G, selects Dense Padé
+/// or Krylov based on problem size, then runs Algorithm 3.1.
+/// Grid range follows the paper: x ∈ [g(0.001S), g(4S)].
+pub fn price_american_option_heston(
+    option: options::Options,
     v0: f64,
-    maturity: f64,
-    r: f64,
-    q: f64,
     kappa: f64,
     theta_lr: f64,
     sigma_v: f64,
-    rho: f64,
+    heston_rho: f64,
     n_x: usize,
     m_v: usize,
     n_time: usize,
 ) -> CTMCResult {
-    let model = SLVModelVariant::Heston(Heston::new(rho, sigma_v, r, Some(q), kappa, theta_lr));
+    let spot = option.spot_price();
+    let r    = option.risk_free_rate();
+    let q    = option.dividend_yield().unwrap_or(0.0);
+    let t    = option.time_to_maturity();
+    let model = SLVModelVariant::Heston(Heston::new(heston_rho, sigma_v, r, Some(q), kappa, theta_lr));
 
     let v_grid = uniform_variance_grid(v0, m_v as i32);
 
     let f_v0 = model.f_integral(v0);
-    let x_min = model.g_integral(1e-3 * spot) - rho * f_v0;
-    let x_max = model.g_integral(4.0 * spot) - rho * f_v0;
+    let x_min = model.g_integral(1e-3 * spot) - heston_rho * f_v0;
+    let x_max = model.g_integral(4.0 * spot) - heston_rho * f_v0;
     let x_grid: Vec<f64> = (0..n_x).map(|i| x_min + (x_max - x_min) * i as f64 / (n_x - 1) as f64).collect();
     let x_spacings: Vec<f64> = x_grid.windows(2).map(|w| w[1] - w[0]).collect();
 
     let ctmc = assemble_generator(&model, &x_grid, &x_spacings, &v_grid);
     let nm = ctmc.dim();
-    let dt = maturity / n_time as f64;
+    let dt = t / n_time as f64;
     let operator = MatExpOperator::new(&ctmc.generator, r, dt, MatExpOperator::suggest_strategy(nm));
-    let config = CTMCPricerConfig { strike, risk_free: r, dividend: q, maturity, n_time_steps: n_time };
+    let config = CTMCPricerConfig { option, n_time_steps: n_time };
 
     run_algorithm_31(&ctmc, &config, &model, &operator, spot, v0)
+}
+
+/// Price an American put under Heston — convenience wrapper around `price_american_option_heston`.
+pub fn price_american_put_heston(
+    strike: f64, spot: f64, v0: f64, maturity: f64,
+    r: f64, q: f64, kappa: f64, theta_lr: f64, sigma_v: f64, rho: f64,
+    n_x: usize, m_v: usize, n_time: usize,
+) -> CTMCResult {
+    price_american_option_heston(
+        options::Options::new_put(strike, spot, 0.0, r, maturity, Some(q)),
+        v0, kappa, theta_lr, sigma_v, rho, n_x, m_v, n_time,
+    )
+}
+
+/// Price an American call under Heston — convenience wrapper around `price_american_option_heston`.
+pub fn price_american_call_heston(
+    strike: f64, spot: f64, v0: f64, maturity: f64,
+    r: f64, q: f64, kappa: f64, theta_lr: f64, sigma_v: f64, rho: f64,
+    n_x: usize, m_v: usize, n_time: usize,
+) -> CTMCResult {
+    price_american_option_heston(
+        options::Options::new_call(strike, spot, 0.0, r, maturity, Some(q)),
+        v0, kappa, theta_lr, sigma_v, rho, n_x, m_v, n_time,
+    )
+}
+
+/// Price an American option spread under Heston.
+///
+/// Each leg is priced independently via `price_american_option_heston` and combined with its weight.
+pub fn price_american_spread_heston(
+    spread: &options::optionspreads::OptionSpreads,
+    v0: f64, kappa: f64, theta_lr: f64, sigma_v: f64, heston_rho: f64,
+    n_x: usize, m_v: usize, n_time: usize,
+) -> f64 {
+    spread.components().iter().map(|pos| {
+        let result = price_american_option_heston(
+            pos.option, v0, kappa, theta_lr, sigma_v, heston_rho, n_x, m_v, n_time,
+        );
+        result.price * pos.weight as f64
+    }).sum()
 }
 
 #[cfg(test)]
@@ -803,6 +898,92 @@ mod tests {
         assert!(result.price > 5.0, "Price below European BS: {}", result.price);
         assert!(result.price < 20.0, "Price unreasonably high: {}", result.price);
         assert!(result.boundary_s[0][12] < 100.0, "Boundary should be below strike");
+    }
+
+    #[test]
+    fn call_terminal_boundary_above_put() {
+        // q=3%, r=5%, K=100 → call boundary = max(100, 5/3*100) ≈ 166.7; put = min(100, 166.7) = 100
+        let put_config = CTMCPricerConfig {
+            option: options::Options::new_put(100.0, 100.0, 0.0, 0.05, 1.0, Some(0.03)),
+            n_time_steps: 10,
+        };
+        let call_config = CTMCPricerConfig {
+            option: options::Options::new_call(100.0, 100.0, 0.0, 0.05, 1.0, Some(0.03)),
+            n_time_steps: 10,
+        };
+        assert!(call_config.terminal_boundary_s() > put_config.terminal_boundary_s());
+        assert!((put_config.terminal_boundary_s() - 100.0).abs() < 1e-10);
+        assert!((call_config.terminal_boundary_s() - 500.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn call_no_dividend_boundary_is_infinite() {
+        let config = CTMCPricerConfig {
+            option: options::Options::new_call(100.0, 100.0, 0.0, 0.05, 1.0, None),
+            n_time_steps: 10,
+        };
+        assert_eq!(config.terminal_boundary_s(), f64::INFINITY);
+    }
+
+    #[test]
+    #[ignore]
+    fn american_call_heston_smoke() {
+        // ATM call S=K=100, T=1yr, r=5%, q=3%; Heston params mirror put smoke test
+        // With q>0 early exercise is possible; expected price roughly $8-14
+        let result = price_american_call_heston(
+            100.0, 100.0, 0.04, 1.0, 0.05, 0.03,
+            2.0, 0.04, 0.3, -0.7,
+            100, 25, 75,
+        );
+        println!("American call price: {:.6}", result.price);
+        println!("Boundary at t=0, mid v-state: {:.4}", result.boundary_s[0][12]);
+        assert!(result.price > 5.0, "Price too low: {}", result.price);
+        assert!(result.price < 25.0, "Price unreasonably high: {}", result.price);
+        assert!(result.boundary_s[0][12] > 100.0, "Call boundary should be above strike");
+    }
+
+    #[test]
+    #[ignore]
+    fn american_call_zero_dividend_no_eep() {
+        // q=0: American call = European call. Terminal boundary is +∞; no early exercise premium.
+        // Validate: (1) terminal boundary row is +∞, (2) price is in European call range.
+        let result = price_american_call_heston(
+            100.0, 100.0, 0.04, 1.0, 0.05, 0.0,
+            2.0, 0.04, 0.3, -0.7,
+            100, 25, 75,
+        );
+        println!("American call (q=0) price: {:.6}", result.price);
+        // Terminal boundary (last row of boundary_s) should be +∞ for all variance states.
+        let n_steps = result.boundary_s.len() - 1;
+        for &b in &result.boundary_s[n_steps] {
+            assert!(b.is_infinite(), "Terminal call boundary with q=0 should be infinite: {b}");
+        }
+        // Price should be consistent with European call (BS benchmark: ~$10-12 with vol≈0.2)
+        assert!(result.price > 8.0 && result.price < 18.0,
+            "q=0 call price should be near European: {}", result.price);
+    }
+
+    #[test]
+    #[ignore]
+    fn spread_straddle_price_reasonable() {
+        use options::optionspreads::{Direction, OptionSpreads};
+        // ATM straddle: long call + long put at same strike. Price > each individual leg.
+        let put_price = price_american_put_heston(
+            100.0, 100.0, 0.04, 1.0, 0.05, 0.02, 2.0, 0.04, 0.3, -0.7, 60, 15, 50,
+        ).price;
+        let call_price = price_american_call_heston(
+            100.0, 100.0, 0.04, 1.0, 0.05, 0.02, 2.0, 0.04, 0.3, -0.7, 60, 15, 50,
+        ).price;
+        let straddle = OptionSpreads::new_straddle(
+            Direction::LONG, 100.0, 100.0, 0.2, 0.05, 1.0, Some(0.02),
+        );
+        let spread_price = price_american_spread_heston(
+            &straddle, 0.04, 2.0, 0.04, 0.3, -0.7, 60, 15, 50,
+        );
+        println!("Put: {put_price:.4}, Call: {call_price:.4}, Straddle spread: {spread_price:.4}");
+        assert!(spread_price > put_price, "Straddle should exceed put alone");
+        assert!(spread_price > call_price, "Straddle should exceed call alone");
+        assert!(spread_price < put_price + call_price + 0.5, "Straddle close to sum of legs");
     }
 
     // Run with: cargo test -p numerical-methods --release -- --ignored ctmc_speed --nocapture
