@@ -1,5 +1,6 @@
 pub mod binomial;
 pub mod ctmc;
+pub mod deep_cal;
 pub mod expm;
 pub mod slv;
 

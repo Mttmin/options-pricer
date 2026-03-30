@@ -18,6 +18,10 @@ CLAUDE.md
 api_keys.json
 railway.toml
 
+# Model weights (symlinks resolve locally; actual files are not committed)
+weights/*.onnx
+weights/*.onnx.data
+
 # Logs
 logs
 *.log
