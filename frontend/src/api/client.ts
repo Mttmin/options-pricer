@@ -5,6 +5,8 @@ import type {
   PriceResponse,
   IVSmileData,
   SofrResponse,
+  CtmcPriceRequest,
+  CtmcPriceResponse,
 } from "../types/index.ts";
 
 const BASE_URL = "/api";
@@ -89,4 +91,15 @@ export async function fetchOptionChain(
 export async function fetchSofr(): Promise<SofrResponse> {
   const response = await fetch(`${BASE_URL}/sofr`);
   return handleResponse<SofrResponse>(response);
+}
+
+export async function submitCtmcPricing(
+  request: CtmcPriceRequest
+): Promise<CtmcPriceResponse> {
+  const response = await fetch(`${BASE_URL}/price/ctmc`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+  return handleResponse<CtmcPriceResponse>(response);
 }

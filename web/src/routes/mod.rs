@@ -1,3 +1,4 @@
+pub mod ctmc;
 pub mod history;
 pub mod market;
 pub mod options_chain;
@@ -21,6 +22,7 @@ pub fn api_router() -> Router<Arc<AppState>> {
         .route("/api/volatility/{symbol}", get(volatility::get_volatility))
         .route("/api/options-chain/{symbol}", get(options_chain::get_option_chain))
         .route("/api/price", post(price::calculate_price))
+        .route("/api/price/ctmc", post(ctmc::calculate_ctmc_price))
 }
 
 async fn health() -> axum::Json<serde_json::Value> {
