@@ -13,11 +13,13 @@ import type {
   VolatilityResponse,
   PriceResponse,
   IVSmileData,
+  CtmcPriceResponse,
 } from "./types/index.ts";
 import {
   fetchMarketData,
   fetchVolatility,
   submitPricing,
+  submitCtmcPricing,
   fetchPriceHistory,
   fetchOptionChain,
   fetchSofr,
@@ -29,8 +31,8 @@ import { MarketDataDisplay } from "./components/MarketDataDisplay.tsx";
 import { PriceChart } from "./components/PriceChart.tsx";
 import { StructureSelector } from "./components/StructureSelector.tsx";
 import { DirectionToggle } from "./components/DirectionToggle.tsx";
-import { ManualOverrideToggle } from "./components/ManualOverrideToggle.tsx";
 import { ExerciseStyleToggle } from "./components/ExerciseStyleToggle.tsx";
+import { ManualOverrideToggle } from "./components/ManualOverrideToggle.tsx";
 import { SingleOptionForm } from "./components/inputs/SingleOptionForm.tsx";
 import { SpreadForm } from "./components/inputs/SpreadForm.tsx";
 import { ExoticForm } from "./components/inputs/ExoticForm.tsx";
@@ -92,8 +94,10 @@ export default function App() {
   const [priceLoading, setPriceLoading] = useState(false);
   const [priceError, setPriceError] = useState<string | null>(null);
 
-  // UI state
-  const [showMonteCarlo, setShowMonteCarlo] = useState(false);
+  // CTMC state
+  const [ctmcResult, setCtmcResult] = useState<CtmcPriceResponse | null>(null);
+  const [ctmcLoading, setCtmcLoading] = useState(false);
+  const [ctmcError, setCtmcError] = useState<string | null>(null);
 
   // Recalculate when volatility source changes (if we have a previous result)
   useEffect(() => {
@@ -258,6 +262,48 @@ export default function App() {
     direction, marketData, spreadType, strikes, shortTermMaturity, longTermMaturity,
   ]);
 
+  const handleCtmcCalculate = useCallback(async () => {
+    if (!selectedTicker || structureType !== "single") return;
+
+    const ttm = singleValues.expirationDate
+      ? calculateTTM(singleValues.expirationDate)
+      : 0.25;
+    const strike = parseFloat(singleValues.strike);
+    const rfr = parseFloat(singleValues.riskFreeRate) || 0.05;
+    const divStr = singleValues.dividendYield.trim();
+    const div = divStr ? parseFloat(divStr) / 100 : null;
+
+    if (!strike || isNaN(strike)) {
+      setCtmcError("Strike price is required.");
+      return;
+    }
+    if (ttm <= 0) {
+      setCtmcError("Expiration date must be in the future.");
+      return;
+    }
+
+    setCtmcLoading(true);
+    setCtmcError(null);
+    setCtmcResult(null);
+
+    try {
+      const result = await submitCtmcPricing({
+        symbol: selectedTicker,
+        option_type: singleValues.optionType,
+        direction,
+        strike_price: strike,
+        time_to_maturity: ttm,
+        risk_free_rate: rfr,
+        dividend_yield: div,
+      });
+      setCtmcResult(result);
+    } catch (err) {
+      setCtmcError(err instanceof Error ? err.message : "CTMC pricing failed");
+    } finally {
+      setCtmcLoading(false);
+    }
+  }, [selectedTicker, structureType, singleValues, direction]);
+
   const handleCalculate = useCallback(async () => {
     setPriceLoading(true);
     setPriceError(null);
@@ -386,10 +432,14 @@ export default function App() {
     } finally {
       setPriceLoading(false);
     }
+
+    if (selectedTicker && structureType === "single" && exerciseStyle === "american") {
+      handleCtmcCalculate();
+    }
   }, [
     structureType, direction, singleValues, manualOverride, getSelectedVol,
     marketData, spreadType, strikes, shortTermMaturity,
-    longTermMaturity, exoticType, exoticValues,
+    longTermMaturity, exoticType, exoticValues, selectedTicker, handleCtmcCalculate,
   ]);
 
   return (
@@ -501,7 +551,7 @@ export default function App() {
         </section>
 
         {/* Calculate Button */}
-        <section className="mb-8 text-center">
+        <section className="mb-8 text-center space-y-3">
           <Button onClick={handleCalculate} loading={priceLoading}>
             Calculate Prices
           </Button>
@@ -511,7 +561,7 @@ export default function App() {
         </section>
 
         {/* Pricing Results */}
-        {(priceResult || priceLoading) && (
+        {(priceResult || priceLoading || ctmcResult || ctmcLoading || ctmcError) && (
           <section className="mb-8">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-semibold">Pricing Results</h2>
@@ -525,6 +575,9 @@ export default function App() {
               result={priceResult}
               loading={priceLoading}
               exerciseStyle={structureType === "exotic" ? "european" : exerciseStyle}
+              ctmcResult={ctmcResult}
+              ctmcLoading={ctmcLoading}
+              ctmcError={ctmcError}
             />
           </section>
         )}

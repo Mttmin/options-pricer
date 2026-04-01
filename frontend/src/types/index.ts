@@ -196,6 +196,39 @@ export type IVSmileData = {
   smiles_by_expiry: Record<string, SmilePoint[]>;
 };
 
+export type CtmcPriceRequest = {
+  symbol: string;
+  option_type: OptionType;
+  direction: Direction;
+  strike_price: number;
+  time_to_maturity: number;
+  risk_free_rate: number;
+  dividend_yield?: number | null;
+  n_restarts?: number;
+  n_x?: number;
+  m_v?: number;
+  n_time?: number;
+};
+
+export type HestonResult = {
+  kappa: number;
+  theta: number;
+  sigma: number;
+  rho: number;
+  v0: number;
+};
+
+export type CtmcPriceResponse = {
+  symbol: string;
+  spot_price: number;
+  price: number;
+  heston: HestonResult;
+  ivrmse: number;
+  n_evals: number;
+  n_instruments: number;
+  timing_ms: number;
+};
+
 export const SPREAD_LABELS: Record<SpreadType, string> = {
   straddle: "Straddle",
   strangle: "Strangle",

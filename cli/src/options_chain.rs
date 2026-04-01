@@ -1,4 +1,5 @@
 use chrono::{NaiveDate, DateTime, Utc};
+use numerical_methods::slv::{CalibrationDataset, CalibrationInstrument, OptionSide};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -75,7 +76,123 @@ pub struct VolatilitySmile {
     pub smiles_by_expiry: HashMap<NaiveDate, Vec<SmilePoint>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CalibrationDataBuildConfig {
+    pub min_days_to_expiry: i64,
+    pub fallback_risk_free_rate: f64,
+    pub fallback_dividend_yield: f64,
+}
+
+impl Default for CalibrationDataBuildConfig {
+    fn default() -> Self {
+        Self {
+            min_days_to_expiry: 1,
+            fallback_risk_free_rate: 0.0,
+            fallback_dividend_yield: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DataCoverageReport {
+    pub missing_fields: Vec<String>,
+    pub dropped_expired_contracts: usize,
+    pub dropped_non_positive_price_contracts: usize,
+    pub used_fallback_risk_free: bool,
+    pub used_fallback_dividend: bool,
+}
+
 impl OptionChain {
+    pub fn to_heston_calibration_dataset(
+        &self,
+        config: &CalibrationDataBuildConfig,
+        risk_free_curve: Option<&dyn Fn(f64) -> Option<f64>>,
+        dividend_curve: Option<&dyn Fn(f64) -> Option<f64>>,
+    ) -> (CalibrationDataset, DataCoverageReport) {
+        let mut report = DataCoverageReport::default();
+        let mut instruments = Vec::with_capacity(self.contracts.len());
+
+        let as_of_date = self.fetch_timestamp.date_naive();
+
+        for contract in &self.contracts {
+            let days = (contract.expiration - as_of_date).num_days();
+            if days < config.min_days_to_expiry {
+                report.dropped_expired_contracts += 1;
+                continue;
+            }
+
+            let maturity = (days as f64 / 365.25).max(1.0 / 365.25);
+            let risk_free = risk_free_curve
+                .and_then(|f| f(maturity))
+                .unwrap_or_else(|| {
+                    report.used_fallback_risk_free = true;
+                    config.fallback_risk_free_rate
+                });
+            let dividend = dividend_curve
+                .and_then(|f| f(maturity))
+                .unwrap_or_else(|| {
+                    report.used_fallback_dividend = true;
+                    config.fallback_dividend_yield
+                });
+
+            let mid = if contract.bid > 0.0 && contract.ask > 0.0 {
+                0.5 * (contract.bid + contract.ask)
+            } else if contract.mark > 0.0 {
+                contract.mark
+            } else {
+                contract.last
+            };
+
+            if mid <= 0.0 {
+                report.dropped_non_positive_price_contracts += 1;
+                continue;
+            }
+
+            let side = match contract.option_type {
+                OptionType::Call => OptionSide::Call,
+                OptionType::Put => OptionSide::Put,
+            };
+
+            instruments.push(CalibrationInstrument {
+                symbol: contract.contract_id.clone(),
+                side,
+                strike: contract.strike,
+                maturity_years: maturity,
+                market_price: mid,
+                spot: self.underlying_price,
+                risk_free_rate: risk_free,
+                dividend_yield: dividend,
+                implied_vol: (contract.implied_volatility > 0.0).then_some(contract.implied_volatility),
+                bid: (contract.bid > 0.0).then_some(contract.bid),
+                ask: (contract.ask > 0.0).then_some(contract.ask),
+                open_interest: Some(contract.open_interest),
+                volume: Some(contract.volume),
+            });
+        }
+
+        if self.underlying_price <= 0.0 {
+            report.missing_fields.push("spot".to_string());
+        }
+        if risk_free_curve.is_none() {
+            report.missing_fields.push("risk_free_curve".to_string());
+        }
+        if dividend_curve.is_none() {
+            report.missing_fields.push("dividend_curve".to_string());
+        }
+        if self.contracts.iter().all(|c| c.bid <= 0.0 || c.ask <= 0.0) {
+            report.missing_fields.push("bid_ask".to_string());
+        }
+
+        (
+            CalibrationDataset {
+                valuation_symbol: self.symbol.clone(),
+                as_of_epoch_secs: self.fetch_timestamp.timestamp(),
+                instruments,
+            },
+            report,
+        )
+    }
+
     /// Computes a summary implied volatility from the chain.
     ///
     /// Strategy: Take the nearest expiration, find contracts within ±5%
@@ -367,5 +484,23 @@ mod tests {
         assert!((points[0].moneyness - 0.95).abs() < 0.001);
         assert!((points[1].moneyness - 1.00).abs() < 0.001);
         assert!((points[2].moneyness - 1.05).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_build_calibration_dataset() {
+        let chain = make_test_chain();
+        let cfg = CalibrationDataBuildConfig::default();
+        let r_curve = |_: f64| Some(0.03);
+        let q_curve = |_: f64| Some(0.01);
+
+        let (dataset, report) = chain.to_heston_calibration_dataset(
+            &cfg,
+            Some(&r_curve),
+            Some(&q_curve),
+        );
+
+        assert!(!dataset.instruments.is_empty());
+        assert!(report.missing_fields.is_empty());
+        assert!(dataset.instruments.iter().all(|q| q.market_price > 0.0));
     }
 }

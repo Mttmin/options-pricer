@@ -95,6 +95,27 @@ pub struct PenaltySolverResult {
 }
 
 #[derive(Serialize)]
+pub struct HestonResult {
+    pub kappa: f64,
+    pub theta: f64,
+    pub sigma: f64,
+    pub rho: f64,
+    pub v0: f64,
+}
+
+#[derive(Serialize)]
+pub struct CtmcPriceResponse {
+    pub symbol: String,
+    pub spot_price: f64,
+    pub price: f64,
+    pub heston: HestonResult,
+    pub ivrmse: f32,
+    pub n_evals: usize,
+    pub n_instruments: usize,
+    pub timing_ms: f64,
+}
+
+#[derive(Serialize)]
 pub struct PenaltySolverDiagnostics {
     pub total_iterations: usize,
     pub avg_iterations_per_step: f64,

@@ -135,6 +135,26 @@ pub struct MarketQuery {
     pub lookback_days: usize,
 }
 
+#[derive(Deserialize)]
+pub struct CtmcPriceRequest {
+    pub symbol: String,
+    pub option_type: OptionTypeInput,
+    pub direction: DirectionInput,
+    pub strike_price: f64,
+    pub time_to_maturity: f64,
+    pub risk_free_rate: f64,
+    #[serde(default)]
+    pub dividend_yield: Option<f64>,
+    #[serde(default)]
+    pub n_restarts: Option<usize>,
+    #[serde(default)]
+    pub n_x: Option<usize>,
+    #[serde(default)]
+    pub m_v: Option<usize>,
+    #[serde(default)]
+    pub n_time: Option<usize>,
+}
+
 fn default_mc_simulations() -> u32 {
     100_000
 }

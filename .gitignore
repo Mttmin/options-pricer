@@ -7,6 +7,7 @@ run-docker.sh
 /.claude/
 /.pycache/
 CLAUDE.md
+
 # Ignore python tests
 *.py
 
@@ -17,6 +18,10 @@ CLAUDE.md
 api_keys.json
 railway.toml
 run-docker.sh
+
+# Model weights (symlinks resolve locally; actual files are not committed)
+weights/*.onnx
+weights/*.onnx.data
 
 # Logs
 logs

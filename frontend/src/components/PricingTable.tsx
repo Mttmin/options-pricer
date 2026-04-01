@@ -1,10 +1,14 @@
-import type { PriceResponse, ExerciseStyle } from "../types/index.ts";
+import { useState } from "react";
+import type { PriceResponse, ExerciseStyle, CtmcPriceResponse } from "../types/index.ts";
 import { Spinner } from "./ui/Spinner.tsx";
 
 interface PricingTableProps {
   result: PriceResponse | null;
   loading: boolean;
   exerciseStyle: ExerciseStyle;
+  ctmcResult?: CtmcPriceResponse | null;
+  ctmcLoading?: boolean;
+  ctmcError?: string | null;
 }
 
 function formatPrice(val: number | undefined | null): string {
@@ -28,7 +32,6 @@ function greekStrengthClass(key: GreekKey, val: number | undefined | null): stri
   if (val == null) return "text-slate-400";
   const abs = Math.abs(val);
 
-  // Rough thresholds per greek to keep the visual scale meaningful.
   const high = {
     delta: 0.6,
     gamma: 0.05,
@@ -50,7 +53,16 @@ function greekStrengthClass(key: GreekKey, val: number | undefined | null): stri
   return "text-slate-300";
 }
 
-export function PricingTable({ result, loading, exerciseStyle }: PricingTableProps) {
+export function PricingTable({
+  result,
+  loading,
+  exerciseStyle,
+  ctmcResult,
+  ctmcLoading,
+  ctmcError,
+}: PricingTableProps) {
+  const [hestonOpen, setHestonOpen] = useState(false);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center rounded-lg border border-slate-800 bg-slate-900 p-8">
@@ -64,6 +76,7 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
 
   const { pricing, greeks } = result;
   const timings = pricing.timings;
+  const showCtmc = ctmcLoading || ctmcResult != null || ctmcError != null;
 
   return (
     <div className="overflow-hidden rounded-lg border border-slate-800">
@@ -198,7 +211,8 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                     </span>
                     <br />
                     <span>
-                      Avg iters/step: {pricing.penalty_solver.diagnostics.avg_iterations_per_step.toFixed(1)}
+                      Avg iters/step:{" "}
+                      {pricing.penalty_solver.diagnostics.avg_iterations_per_step.toFixed(1)}
                     </span>
                     {timings && (
                       <>
@@ -225,6 +239,102 @@ export function PricingTable({ result, loading, exerciseStyle }: PricingTablePro
                         Time: {formatMs(timings.binomial_european_ms)}
                       </div>
                     )}
+                  </td>
+                </tr>
+              )}
+            </>
+          )}
+          {/* CTMC row — always shown when available, regardless of exercise style */}
+          {showCtmc && (
+            <>
+              <tr className="bg-slate-950 hover:bg-slate-900">
+                <td className="px-4 py-3 font-medium text-white">
+                  CTMC (Deep Cal)
+                </td>
+                <td className="px-4 py-3 text-right font-mono text-green-400">
+                  {ctmcLoading ? (
+                    <span className="inline-flex items-center justify-end gap-2 text-slate-400">
+                      <Spinner size="sm" />
+                      <span className="text-xs">calibrating…</span>
+                    </span>
+                  ) : ctmcError ? (
+                    <span className="text-red-400 text-xs">{ctmcError}</span>
+                  ) : (
+                    formatPrice(ctmcResult?.price)
+                  )}
+                </td>
+                <td className="px-4 py-3 text-right text-xs text-slate-500">
+                  {ctmcResult && !ctmcLoading && (
+                    <>
+                      <span>Heston SV · American</span>
+                      <br />
+                      <span>
+                        Time:{" "}
+                        {ctmcResult.timing_ms >= 1000
+                          ? `${(ctmcResult.timing_ms / 1000).toFixed(1)}s`
+                          : `${ctmcResult.timing_ms.toFixed(0)}ms`}
+                      </span>
+                      <br />
+                      <button
+                        onClick={() => setHestonOpen((o) => !o)}
+                        className="mt-1 text-slate-400 hover:text-slate-200 underline underline-offset-2"
+                      >
+                        {hestonOpen ? "Hide params ▲" : "Show params ▼"}
+                      </button>
+                    </>
+                  )}
+                </td>
+              </tr>
+
+              {hestonOpen && ctmcResult && (
+                <tr className="bg-slate-900">
+                  <td colSpan={3} className="px-4 py-3">
+                    <div className="rounded border border-slate-700 bg-slate-950 px-4 py-3">
+                      <p className="text-xs font-medium uppercase tracking-wider text-slate-500 mb-3">
+                        Calibrated Heston Parameters
+                      </p>
+                      <div className="grid grid-cols-5 gap-2 text-center mb-3">
+                        {(
+                          [
+                            ["κ (kappa)", ctmcResult.heston.kappa],
+                            ["θ (theta)", ctmcResult.heston.theta],
+                            ["σ (sigma)", ctmcResult.heston.sigma],
+                            ["ρ (rho)", ctmcResult.heston.rho],
+                            ["v₀", ctmcResult.heston.v0],
+                          ] as [string, number][]
+                        ).map(([label, val]) => (
+                          <div
+                            key={label}
+                            className="rounded border border-slate-700 bg-slate-900 px-2 py-2"
+                          >
+                            <div className="text-xs text-slate-500 mb-1">{label}</div>
+                            <div className="font-mono text-xs text-slate-300">
+                              {val.toFixed(4)}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex flex-wrap gap-4 text-xs text-slate-500">
+                        <span>
+                          IV RMSE:{" "}
+                          <span className="text-slate-400">
+                            {(ctmcResult.ivrmse * 100).toFixed(2)} vol pts
+                          </span>
+                        </span>
+                        <span>
+                          Instruments:{" "}
+                          <span className="text-slate-400">{ctmcResult.n_instruments}</span>
+                        </span>
+                        <span>
+                          Surrogate evals:{" "}
+                          <span className="text-slate-400">{ctmcResult.n_evals}</span>
+                        </span>
+                        <span>
+                          Spot:{" "}
+                          <span className="text-slate-400">{ctmcResult.spot_price.toFixed(2)}</span>
+                        </span>
+                      </div>
+                    </div>
                   </td>
                 </tr>
               )}
