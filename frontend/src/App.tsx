@@ -43,6 +43,7 @@ import { IVSmileChart } from "./components/IVSmileChart.tsx";
 import { OptionChainDisplay } from "./components/OptionChainDisplay.tsx";
 import { MonteCarloPathsChart } from "./components/MonteCarloPathsChart.tsx";
 import { Button } from "./components/ui/Button.tsx";
+import { Toggle } from "./components/ui/Toggle.tsx";
 
 export default function App() {
   // Ticker state
@@ -592,18 +593,28 @@ export default function App() {
           </section>
         )}
 
-        {/* Monte Carlo Paths Visualization */}
-        {priceResult?.pricing.monte_carlo && structureType === "single" && (
+        {/* Monte Carlo Paths Visualization - Temporarily hidden as it's WIP */}
+        {false && priceResult?.pricing.monte_carlo && structureType === "single" && (
           <section className="mb-8">
-            <MonteCarloPathsChart
-              mcResult={priceResult.pricing.monte_carlo}
-              spotPrice={parseFloat(singleValues.spotPrice) || marketData?.spot_price || 100}
-              timeToMaturity={
-                singleValues.expirationDate
-                  ? calculateTTM(singleValues.expirationDate)
-                  : 0.25
-              }
-            />
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold">Monte Carlo Simulation</h2>
+              <Toggle
+                label="Show Paths"
+                checked={showMonteCarlo}
+                onChange={setShowMonteCarlo}
+              />
+            </div>
+            {showMonteCarlo && (
+              <MonteCarloPathsChart
+                mcResult={priceResult!.pricing.monte_carlo ?? null}
+                spotPrice={parseFloat(singleValues.spotPrice) || marketData?.spot_price || 100}
+                timeToMaturity={
+                  singleValues.expirationDate
+                    ? calculateTTM(singleValues.expirationDate)
+                    : 0.25
+                }
+              />
+            )}
           </section>
         )}
 

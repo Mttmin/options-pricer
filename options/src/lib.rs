@@ -158,6 +158,9 @@ impl Call {
     pub fn time_to_maturity(&self) -> f64 {
         self.time_to_maturity
     }
+    pub fn dividend_yield(&self) -> Option<f64> {
+        self.dividend_yield
+    }
     pub fn new(
         strike_price: f64,
         spot_price: f64,
@@ -320,6 +323,9 @@ impl Put {
     }
     pub fn time_to_maturity(&self) -> f64 {
         self.time_to_maturity
+    }
+    pub fn dividend_yield(&self) -> Option<f64> {
+        self.dividend_yield
     }
 
     pub fn new(

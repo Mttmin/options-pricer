@@ -12,6 +12,19 @@ export function calculatePayoffGrid(
   request: PriceRequest,
   priceResult: PriceResponse
 ): PayoffData | null {
+  if (priceResult.payoff_curve) {
+    const { spot_prices, payoffs } = priceResult.payoff_curve;
+    const breakEvenPoints = findBreakEvenPoints(spot_prices, payoffs);
+    const { maxProfit, maxLoss } = calculateMaxProfitLoss(payoffs);
+    return {
+      spotPrices: spot_prices,
+      payoffs,
+      breakEvenPoints,
+      maxProfit,
+      maxLoss,
+    };
+  }
+
   if (request.structure_type === "exotic") {
     return null;
   }

@@ -17,6 +17,7 @@ CLAUDE.md
 # Ignore api keys and secrets
 api_keys.json
 railway.toml
+run-docker.sh
 
 # Model weights (symlinks resolve locally; actual files are not committed)
 weights/*.onnx

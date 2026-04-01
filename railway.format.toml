@@ -1,0 +1,11 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "/app/web"
+
+[env]
+FINNHUB_API_KEY = "YOUR_FINNHUB_API_KEY"
+ALPHA_VANTAGE_API_KEY = "YOUR_ALPHA_VANTAGE_API_KEY"
+FRED_API_KEY = "YOUR_FRED_API_KEY"

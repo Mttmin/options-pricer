@@ -143,10 +143,16 @@ export type GreeksResult = {
   rho: number;
 };
 
+export type PayoffCurve = {
+  spot_prices: number[];
+  payoffs: number[];
+};
+
 export type PriceResponse = {
   structure_type: StructureType;
   pricing: PricingResult;
   greeks?: GreeksResult;
+  payoff_curve?: PayoffCurve;
 };
 
 export type MarketDataResponse = {
