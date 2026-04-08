@@ -372,7 +372,7 @@ fn psi_k(omega: f64, c: f64, d: f64, a: f64) -> f64 {
 
 /// Price a European call or put under the Heston model using the COS method
 /// (Fang & Oosterlee 2008). Accuracy is ~10⁻⁸ for n_terms = 128.
-fn cos_european(
+pub(crate) fn cos_european(
 	side: OptionSide,
 	s0: f64,
 	strike: f64,
