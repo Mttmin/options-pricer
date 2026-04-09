@@ -11,7 +11,10 @@
 //!   - N_FLAT = 686  (row-major: strike-first, then maturity)
 //!
 //! # Parameter order (normalised [0,1])
-//! kappa, theta, sigma_v, rho, v0  (pure Heston)
+//! kappa, theta, sigma_v, rho, v0, carry  (pure Heston + market carry r−q)
+//!
+//! The first 5 are optimised by LM; carry is a fixed market observable passed
+//! as the 6th input to the ONNX model.
 //!
 //! # Mapping to HestonParameters
 //! kappa→kappa, theta→v_bar, sigma_v→sigma, rho→rho, v0→v0.
@@ -54,7 +57,8 @@ pub fn default_onnx_path() -> Option<String> {
 pub const NK: usize = 49;
 pub const NT: usize = 14;
 pub const N_FLAT: usize = NK * NT; // 686
-pub const N_PARAMS: usize = 5;     // Pure Heston: kappa, theta, sigma, rho, v0
+pub const N_PARAMS: usize = 5;     // Calibrated params: kappa, theta, sigma, rho, v0
+const N_MODEL_INPUTS: usize = N_PARAMS + 1; // +1 for carry (r-q), fixed market observable
 
 /// Maturity grid in years (14 points).
 pub const MATURITIES: [f32; NT] = [
@@ -100,6 +104,25 @@ pub fn log_moneyness_grid() -> [f32; NK] {
 const PARAM_LO: [f32; N_PARAMS] = [0.30, 0.02, 0.05, -0.98, 0.02];
 /// Physical upper bounds: [kappa, theta, sigma_v, rho, v0]
 const PARAM_HI: [f32; N_PARAMS] = [8.00, 0.12, 1.20,  0.10, 0.12];
+
+/// Carry (r−q) bounds — derived from R_BOUNDS/Q_BOUNDS in heston_datagen.py.
+const CARRY_LO: f32 = -0.04; // min(r) - max(q) = 0.00 - 0.04
+const CARRY_HI: f32 =  0.06; // max(r) - min(q) = 0.06 - 0.00
+
+/// Normalise carry (r−q) to [0,1] for ONNX input.
+fn normalise_carry(carry: f32) -> f32 {
+    (carry - CARRY_LO) / (CARRY_HI - CARRY_LO)
+}
+
+/// Extract carry = r−q from a `CalibrationDataset`.
+/// r and q are market-level observables, identical across instruments.
+fn dataset_carry(dataset: &CalibrationDataset) -> f32 {
+    dataset
+        .instruments
+        .first()
+        .map(|i| (i.risk_free_rate - i.dividend_yield) as f32)
+        .unwrap_or(0.0)
+}
 
 fn normalise(phys: &[f32; N_PARAMS]) -> [f32; N_PARAMS] {
     let mut out = [0f32; N_PARAMS];
@@ -213,10 +236,9 @@ impl BatesCalibrator {
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_file(onnx_path)?;
 
-        // Shape sanity: run a 1×N_PARAMS forward pass. If the ONNX model was
-        // exported with a different n_params, ORT will return a shape-mismatch
-        // error here rather than silently producing wrong outputs mid-calibration.
-        let dummy = Tensor::from_array(([1usize, N_PARAMS], vec![0.5f32; N_PARAMS]))?;
+        // Shape sanity: run a 1×N_MODEL_INPUTS forward pass.  Catches model/code
+        // mismatches (e.g. model retrained with different n_params) at startup.
+        let dummy = Tensor::from_array(([1usize, N_MODEL_INPUTS], vec![0.5f32; N_MODEL_INPUTS]))?;
         session.run(ort::inputs!["parameters" => dummy])?;
 
         Ok(Self { session })
@@ -232,13 +254,15 @@ impl BatesCalibrator {
     /// and confidence (from IDW interpolation). Zero-weight cells are excluded
     /// from the loss.
     ///
-    /// * `iv_market` – `[f32; 686]` flat IV surface (NK×NT, strike-major).
-    /// * `weights`   – `[f32; 686]` per-cell weights; 0.0 = excluded.
+    /// * `iv_market`  – `[f32; 686]` flat IV surface (NK×NT, strike-major).
+    /// * `weights`    – `[f32; 686]` per-cell weights; 0.0 = excluded.
+    /// * `carry_norm` – normalised carry (r−q) ∈ [0,1]; use `normalise_carry(r-q)`.
     /// * `n_restarts` – number of independent LM restarts (≥1).
     pub fn calibrate_with_weights(
         &mut self,
         iv_market: &[f32; N_FLAT],
         weights: &[f32; N_FLAT],
+        carry_norm: f32,
         n_restarts: usize,
         config: &CalibrationConfig,
     ) -> ort::Result<DeepCalibrationResult> {
@@ -249,7 +273,7 @@ impl BatesCalibrator {
 
         for seed in &seeds {
             let (theta, iv_loss, evals) =
-                self.levenberg_marquardt(seed, iv_market, weights, config)?;
+                self.levenberg_marquardt(seed, carry_norm, iv_market, weights, config)?;
             total_evals += evals;
             let rmse = iv_loss.sqrt();
             if best.as_ref().map_or(true, |b| rmse < b.0) {
@@ -280,15 +304,18 @@ impl BatesCalibrator {
     ) -> ort::Result<DeepCalibrationResult> {
         let confidence = [1.0f32; N_FLAT];
         let weights = build_weights(iv_market, mask, &confidence, config.moneyness_weight_sigma);
-        self.calibrate_with_weights(iv_market, &weights, n_restarts, config)
+        self.calibrate_with_weights(iv_market, &weights, 0.0, n_restarts, config)
     }
 
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
 
-    fn forward(&mut self, theta_norm: &[f32; N_PARAMS]) -> ort::Result<[f32; N_FLAT]> {
-        let tensor = Tensor::from_array(([1usize, N_PARAMS], theta_norm.to_vec()))?;
+    fn forward(&mut self, theta_norm: &[f32; N_PARAMS], carry_norm: f32) -> ort::Result<[f32; N_FLAT]> {
+        let mut inputs = [0f32; N_MODEL_INPUTS];
+        inputs[..N_PARAMS].copy_from_slice(theta_norm);
+        inputs[N_PARAMS] = carry_norm;
+        let tensor = Tensor::from_array(([1usize, N_MODEL_INPUTS], inputs.to_vec()))?;
         let outputs = self.session.run(ort::inputs!["parameters" => tensor])?;
         let (_shape, slice) = outputs["iv_surface"].try_extract_tensor::<f32>()?;
         let mut out = [0f32; N_FLAT];
@@ -308,6 +335,7 @@ impl BatesCalibrator {
     fn levenberg_marquardt(
         &mut self,
         init: &[f32; N_PARAMS],
+        carry_norm: f32,
         iv_market: &[f32; N_FLAT],
         weights: &[f32; N_FLAT],
         config: &CalibrationConfig,
@@ -331,7 +359,7 @@ impl BatesCalibrator {
         };
 
         let mut theta = clamp(*init);
-        let mut iv_pred = self.forward(&theta)?;
+        let mut iv_pred = self.forward(&theta, carry_norm)?;
         let mut cost = lm_cost(&iv_pred, iv_market, weights, &theta, &prior, reg_w);
         let mut damping = DAMP_INIT;
         let mut n_evals = 1usize;
@@ -357,7 +385,7 @@ impl BatesCalibrator {
                 if eps_actual.abs() < 1e-10 {
                     continue;
                 }
-                let iv_b = self.forward(&th_b)?;
+                let iv_b = self.forward(&th_b, carry_norm)?;
                 n_evals += 1;
                 for (k, &i) in valid.iter().enumerate() {
                     jac[j * n_valid + k] = (iv_b[i] - iv_pred[i]) / eps_actual;
@@ -408,7 +436,7 @@ impl BatesCalibrator {
                 c
             });
 
-            let iv_cand = self.forward(&candidate)?;
+            let iv_cand = self.forward(&candidate, carry_norm)?;
             n_evals += 1;
             let cost_cand = lm_cost(&iv_cand, iv_market, weights, &candidate, &prior, reg_w);
 
@@ -743,7 +771,8 @@ pub fn calibrate_heston_from_dataset(
     } else {
         build_weights(&surface, &mask, &confidence, config.moneyness_weight_sigma)
     };
-    calibrator.calibrate_with_weights(&surface, &weights, n_restarts, config)
+    let carry_norm = normalise_carry(dataset_carry(dataset));
+    calibrator.calibrate_with_weights(&surface, &weights, carry_norm, n_restarts, config)
 }
 
 /// End-to-end pipeline: load the ONNX surrogate, calibrate Heston parameters
@@ -938,8 +967,9 @@ mod tests {
         }
 
         let weights = build_weights(&iv_market, &mask, &confidence, Some(0.30));
+        let carry_norm = normalise_carry((r - q) as f32);
         let result = calibrator
-            .calibrate_with_weights(&iv_market, &weights, 5, &CalibrationConfig::default())
+            .calibrate_with_weights(&iv_market, &weights, carry_norm, 5, &CalibrationConfig::default())
             .expect("calibration failed");
 
         let h = result.heston;
