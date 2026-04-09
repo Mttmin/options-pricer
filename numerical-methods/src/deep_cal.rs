@@ -1,9 +1,8 @@
 //! Deep calibration via the BatesSurrogate ONNX model.
 //!
 //! Loads the exported `bates_surrogate.onnx` (+ companion `.onnx.data`) and
-//! calibrates Heston parameters from a market IV surface using Nelder-Mead
-//! through the frozen surrogate (Option A: jump params stripped, pure Heston
-//! output).
+//! calibrates Heston parameters from a market IV surface using Levenberg-Marquardt
+//! through the frozen surrogate (pure Heston, 5 parameters).
 //!
 //! # Grid
 //! The surrogate was trained on the `high41x14` preset:
@@ -12,13 +11,13 @@
 //!   - N_FLAT = 686  (row-major: strike-first, then maturity)
 //!
 //! # Parameter order (normalised [0,1])
-//! kappa, theta, sigma_v, rho, v0  (pure Heston)
+//! kappa, theta, sigma_v, rho, v0, carry  (pure Heston + market carry r−q)
+//!
+//! The first 5 are optimised by LM; carry is a fixed market observable passed
+//! as the 6th input to the ONNX model.
 //!
 //! # Mapping to HestonParameters
 //! kappa→kappa, theta→v_bar, sigma_v→sigma, rho→rho, v0→v0.
-//!
-//! Market rates r (risk-free) and q (dividend yield) are applied separately,
-//! not part of the calibration search. They should be known from market data.
 
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
@@ -40,12 +39,10 @@ use crate::slv::{CalibrationDataset, HestonParameters};
 ///
 /// Returns `None` if neither path exists.
 pub fn default_onnx_path() -> Option<String> {
-    // Path 1: workspace weights/ directory (sibling of this crate)
     let workspace = concat!(env!("CARGO_MANIFEST_DIR"), "/../weights/bates_surrogate.onnx");
     if std::path::Path::new(workspace).exists() {
         return Some(workspace.to_string());
     }
-    // Path 2: training project on the dev machine
     let dev = "/home/mttmin/coding/deep-calibration/model/bates_surrogate.onnx";
     if std::path::Path::new(dev).exists() {
         return Some(dev.to_string());
@@ -56,17 +53,12 @@ pub fn default_onnx_path() -> Option<String> {
 // ---------------------------------------------------------------------------
 // Grid constants  (must match heston_datagen.py high41x14 preset)
 // ---------------------------------------------------------------------------
-//
-// Systematic IV upward bias note:
-//   The surrogate is a Bates model where μ_j ≤ 0 (downward jumps only).
-//   Unconstrained calibration inflates Heston params (especially v0) and uses
-//   negative jumps as an offset, so extracting Heston-only always overshoots.
-//   Fix: pin λ_j = 0 so the surrogate degenerates to pure Heston during search.
 
 pub const NK: usize = 49;
 pub const NT: usize = 14;
 pub const N_FLAT: usize = NK * NT; // 686
-pub const N_PARAMS: usize = 5;     // Pure Heston: kappa, theta, sigma, rho, v0
+pub const N_PARAMS: usize = 5;     // Calibrated params: kappa, theta, sigma, rho, v0
+const N_MODEL_INPUTS: usize = N_PARAMS + 1; // +1 for carry (r-q), fixed market observable
 
 /// Maturity grid in years (14 points).
 pub const MATURITIES: [f32; NT] = [
@@ -98,14 +90,47 @@ pub fn log_moneyness_grid() -> [f32; NK] {
 }
 
 // ---------------------------------------------------------------------------
-// Parameter bounds  (physical units, matches calibrate.py PARAM_BOUNDS_PHYSICAL)
+// Parameter bounds  (must match PARAM_BOUNDS in heston_datagen.py exactly)
 // ---------------------------------------------------------------------------
+//
+// The ONNX surrogate's [0,1] normalised space is defined by these bounds.
+// Training data was normalised: theta_norm = (theta - LO) / (HI - LO).
+// Inference must use the same bounds; any mismatch maps every calibrated
+// parameter to the wrong physical value.
+//
+// Source of truth: PARAM_BOUNDS in training data creation/heston_datagen.py.
 
 /// Physical lower bounds: [kappa, theta, sigma_v, rho, v0]
-/// Tightened to prevent degenerate solutions where sigma maxes out.
-const PARAM_LO: [f32; N_PARAMS] = [0.10, 0.02, 0.10, -0.85, 0.02];
+const PARAM_LO: [f32; N_PARAMS] = [0.30, 0.02, 0.05, -0.98, 0.02];
 /// Physical upper bounds: [kappa, theta, sigma_v, rho, v0]
-const PARAM_HI: [f32; N_PARAMS] = [5.00, 0.15, 1.00, 0.05, 0.15];
+const PARAM_HI: [f32; N_PARAMS] = [8.00, 0.12, 1.20,  0.10, 0.12];
+
+/// Carry (r−q) bounds — derived from R_BOUNDS/Q_BOUNDS in heston_datagen.py.
+const CARRY_LO: f32 = -0.04; // min(r) - max(q) = 0.00 - 0.04
+const CARRY_HI: f32 =  0.06; // max(r) - min(q) = 0.06 - 0.00
+
+/// Normalise carry (r−q) to [0,1] for ONNX input.
+fn normalise_carry(carry: f32) -> f32 {
+    (carry - CARRY_LO) / (CARRY_HI - CARRY_LO)
+}
+
+/// Extract carry = r−q from a `CalibrationDataset`.
+/// r and q are market-level observables, identical across instruments.
+fn dataset_carry(dataset: &CalibrationDataset) -> f32 {
+    dataset
+        .instruments
+        .first()
+        .map(|i| (i.risk_free_rate - i.dividend_yield) as f32)
+        .unwrap_or(0.0)
+}
+
+fn normalise(phys: &[f32; N_PARAMS]) -> [f32; N_PARAMS] {
+    let mut out = [0f32; N_PARAMS];
+    for i in 0..N_PARAMS {
+        out[i] = (phys[i] - PARAM_LO[i]) / (PARAM_HI[i] - PARAM_LO[i]);
+    }
+    out
+}
 
 fn denormalise(norm: &[f32; N_PARAMS]) -> [f32; N_PARAMS] {
     let mut out = [0f32; N_PARAMS];
@@ -115,20 +140,43 @@ fn denormalise(norm: &[f32; N_PARAMS]) -> [f32; N_PARAMS] {
     out
 }
 
+/// Market-realistic Heston prior in normalised [0,1] space.
+/// Physical centre: κ=3.0, θ=0.04, σ_v=0.40, ρ=−0.70, v₀=0.04.
+/// This is a gentle attractor during calibration; the IV loss dominates
+/// when enough market quotes are present.
+fn market_prior_norm() -> [f32; N_PARAMS] {
+    let phys = [3.0_f32, 0.04, 0.40, -0.70, 0.04];
+    normalise(&phys)
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 /// Controls the calibration search over pure Heston parameters.
-///
-/// All 5 Heston parameters (kappa, theta, sigma, rho, v0) are freely optimized.
-/// Market rates (r, q) are applied separately during pricing, not calibrated.
 #[derive(Debug, Clone)]
 pub struct CalibrationConfig {
     /// Gaussian ATM weighting: each strike gets weight = exp(−lm² / (2σ²)).
     /// Near-ATM options have tighter bid-ask spreads and better price discovery.
     /// `None` = uniform weights. Typical value: 0.30.
     pub moneyness_weight_sigma: Option<f32>,
+
+    /// L2 regularisation weight toward the market-realistic prior.
+    /// The prior is κ=3.0, θ=0.04, σ_v=0.40, ρ=−0.70, v₀=0.04 in physical space.
+    /// Prevents degenerate solutions when the surface has few/sparse quotes.
+    /// Set to 0.0 to disable. Default: 0.001.
+    pub reg_weight: f32,
+
+    /// Weight residuals by Black-Scholes vega × confidence.
+    ///
+    /// Vega ∝ N′(d₁) · √T, where d₁ uses the observed IV at each cell.
+    /// This correctly down-weights deep OTM and very short-dated contracts
+    /// (large bid-ask spread relative to vega), and up-weights long-dated
+    /// near-ATM contracts that carry the most calibration signal.
+    ///
+    /// When `false`, falls back to the Gaussian ATM weighting controlled by
+    /// `moneyness_weight_sigma`. Default: `true`.
+    pub use_vega_weights: bool,
 
     // Deprecated fields kept for backward compatibility (no-op)
     #[deprecated(note = "pure Heston model, pin_jumps not used")]
@@ -143,6 +191,8 @@ impl Default for CalibrationConfig {
     fn default() -> Self {
         Self {
             moneyness_weight_sigma: Some(0.30),
+            reg_weight: 0.001,
+            use_vega_weights: true,
             #[allow(deprecated)]
             pin_jumps: false,
             #[allow(deprecated)]
@@ -158,7 +208,7 @@ impl Default for CalibrationConfig {
 pub struct DeepCalibrationResult {
     /// Calibrated Heston parameters extracted from the surrogate output.
     pub heston: HestonParameters,
-    /// Full normalised parameter vector [0,1]^7 at the optimum.
+    /// Full normalised parameter vector [0,1]^5 at the optimum.
     pub bates_norm: [f32; N_PARAMS],
     /// IV RMSE over valid (masked) market cells, in IV units (not bps).
     pub ivrmse: f32,
@@ -176,45 +226,62 @@ impl BatesCalibrator {
     ///
     /// The `bates_surrogate.onnx.data` external-weights file must live in the
     /// same directory as `onnx_path`.
+    ///
+    /// # Panics
+    /// Panics if the ONNX model's input is not `[batch, N_PARAMS]`.
+    /// This catches model/code mismatches (e.g. model retrained with different
+    /// n_params) at startup rather than mid-calibration.
     pub fn new(onnx_path: &str) -> ort::Result<Self> {
-        let session = Session::builder()?
+        let mut session = Session::builder()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_file(onnx_path)?;
+
+        // Shape sanity: run a 1×N_MODEL_INPUTS forward pass.  Catches model/code
+        // mismatches (e.g. model retrained with different n_params) at startup.
+        let dummy = Tensor::from_array(([1usize, N_MODEL_INPUTS], vec![0.5f32; N_MODEL_INPUTS]))?;
+        session.run(ort::inputs!["parameters" => dummy])?;
+
         Ok(Self { session })
     }
 
-    /// Calibrate Heston parameters to a market IV surface.
+    // -----------------------------------------------------------------------
+    // Public calibration API
+    // -----------------------------------------------------------------------
+
+    /// Calibrate Heston parameters given pre-computed weights.
+    ///
+    /// Weights already incorporate mask, moneyness Gaussian down-weighting,
+    /// and confidence (from IDW interpolation). Zero-weight cells are excluded
+    /// from the loss.
     ///
     /// * `iv_market`  – `[f32; 686]` flat IV surface (NK×NT, strike-major).
-    ///   Unobserved cells should be `0.0` and masked out via `mask`.
-    /// * `mask`       – `[bool; 686]` validity; `true` = genuine market quote.
-    /// * `n_restarts` – number of independent Nelder-Mead restarts (≥1).
-    pub fn calibrate(
+    /// * `weights`    – `[f32; 686]` per-cell weights; 0.0 = excluded.
+    /// * `carry_norm` – normalised carry (r−q) ∈ [0,1]; use `normalise_carry(r-q)`.
+    /// * `n_restarts` – number of independent LM restarts (≥1).
+    pub fn calibrate_with_weights(
         &mut self,
         iv_market: &[f32; N_FLAT],
-        mask: &[bool; N_FLAT],
+        weights: &[f32; N_FLAT],
+        carry_norm: f32,
         n_restarts: usize,
         config: &CalibrationConfig,
     ) -> ort::Result<DeepCalibrationResult> {
-        let weights = build_weights(iv_market, mask, config.moneyness_weight_sigma);
-        let seeds = make_seeds(n_restarts.max(1), config);
+        let seeds = make_seeds(n_restarts.max(1));
 
         let mut best: Option<(f32, [f32; N_PARAMS], usize)> = None;
         let mut total_evals = 0usize;
 
         for seed in &seeds {
-            let (theta, loss, evals) = self.nelder_mead(seed, iv_market, &weights, config)?;
+            let (theta, iv_loss, evals) =
+                self.levenberg_marquardt(seed, carry_norm, iv_market, weights, config)?;
             total_evals += evals;
-            let rmse = loss.sqrt();
+            let rmse = iv_loss.sqrt();
             if best.as_ref().map_or(true, |b| rmse < b.0) {
                 best = Some((rmse, theta, total_evals));
             }
         }
 
-        let (rmse, mut bates_norm, n_evals) = best.unwrap();
-        // Enforce pins in the stored result so bates_norm is consistent
-        // with what was actually passed to the surrogate.
-        pin_params(&mut bates_norm, config);
+        let (rmse, bates_norm, n_evals) = best.unwrap();
         let phys = denormalise(&bates_norm);
         Ok(DeepCalibrationResult {
             heston: bates_to_heston(&phys),
@@ -224,14 +291,31 @@ impl BatesCalibrator {
         })
     }
 
+    /// Backward-compatible wrapper: builds weights from mask (uniform confidence = 1.0).
+    ///
+    /// Prefer `calibrate_with_weights` when confidence information is available
+    /// (e.g. from `build_iv_surface`).
+    pub fn calibrate(
+        &mut self,
+        iv_market: &[f32; N_FLAT],
+        mask: &[bool; N_FLAT],
+        n_restarts: usize,
+        config: &CalibrationConfig,
+    ) -> ort::Result<DeepCalibrationResult> {
+        let confidence = [1.0f32; N_FLAT];
+        let weights = build_weights(iv_market, mask, &confidence, config.moneyness_weight_sigma);
+        self.calibrate_with_weights(iv_market, &weights, 0.0, n_restarts, config)
+    }
+
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
 
-    fn forward(&mut self, theta_norm: &[f32; N_PARAMS], config: &CalibrationConfig) -> ort::Result<[f32; N_FLAT]> {
-        let mut input = *theta_norm;
-        pin_params(&mut input, config);
-        let tensor = Tensor::from_array(([1usize, N_PARAMS], input.to_vec()))?;
+    fn forward(&mut self, theta_norm: &[f32; N_PARAMS], carry_norm: f32) -> ort::Result<[f32; N_FLAT]> {
+        let mut inputs = [0f32; N_MODEL_INPUTS];
+        inputs[..N_PARAMS].copy_from_slice(theta_norm);
+        inputs[N_PARAMS] = carry_norm;
+        let tensor = Tensor::from_array(([1usize, N_MODEL_INPUTS], inputs.to_vec()))?;
         let outputs = self.session.run(ort::inputs!["parameters" => tensor])?;
         let (_shape, slice) = outputs["iv_surface"].try_extract_tensor::<f32>()?;
         let mut out = [0f32; N_FLAT];
@@ -239,142 +323,136 @@ impl BatesCalibrator {
         Ok(out)
     }
 
-    fn objective(
-        &mut self,
-        theta: &[f32; N_PARAMS],
-        iv_market: &[f32; N_FLAT],
-        weights: &[f32; N_FLAT],
-        config: &CalibrationConfig,
-    ) -> ort::Result<f32> {
-        let iv_pred = self.forward(theta, config)?;
-        let mut num = 0f32;
-        let mut den = 0f32;
-        for i in 0..N_FLAT {
-            let w = weights[i];
-            if w > 0.0 {
-                let e = iv_pred[i] - iv_market[i];
-                num += w * e * e;
-                den += w;
-            }
-        }
-        let iv_loss = if den > 0.0 { num / den } else { f32::MAX };
-
-        // L2 regularization: penalise Heston params (0-4) far from center [0.5].
-        // This disambiguates parameters when IV surface alone is underdetermined.
-        // Rate/dividend (5-6) are not regularised as they have clear market meaning.
-        const REG_WEIGHT: f32 = 0.005; // Weak regularization; weight by tuning this
-        let mut reg = 0.0_f32;
-        for i in 0..5 {
-            let d = theta[i] - 0.5;
-            reg += d * d;
-        }
-        let total_loss = iv_loss + REG_WEIGHT * reg;
-        Ok(total_loss)
-    }
-
-    /// Nelder-Mead minimiser in [0,1]^7.
+    /// Levenberg-Marquardt calibration in normalised [0,1]^5 space.
     ///
-    /// Box constraints are enforced by clamping every vertex to [0,1] after
-    /// each geometric operation.
-    fn nelder_mead(
+    /// Uses finite-difference Jacobians (N_PARAMS forward passes per iteration).
+    /// Regularises toward the market-realistic prior with weight `config.reg_weight`.
+    ///
+    /// Damping schedule (matches slv.rs):
+    ///   initial = 1e-2, up_factor = 10.0, down_factor = 0.33.
+    ///
+    /// Returns `(theta_norm, weighted_iv_mse_no_reg, n_evals)`.
+    fn levenberg_marquardt(
         &mut self,
         init: &[f32; N_PARAMS],
+        carry_norm: f32,
         iv_market: &[f32; N_FLAT],
         weights: &[f32; N_FLAT],
         config: &CalibrationConfig,
     ) -> ort::Result<([f32; N_PARAMS], f32, usize)> {
-        const MAX_ITERS: usize = 600;
-        const TOL: f32 = 1e-7;
-        // Standard NM coefficients
-        const ALPHA: f32 = 1.0; // reflection
-        const GAMMA: f32 = 2.0; // expansion
-        const RHO: f32 = 0.5; // contraction
-        const SIGMA: f32 = 0.5; // shrink
+        const MAX_ITERS: usize = 50;
+        const EPS: f32 = 1e-4;      // finite-difference step in normalised space
+        const DAMP_INIT: f32 = 1e-2;
+        const DAMP_UP: f32 = 10.0;
+        const DAMP_DOWN: f32 = 0.33;
+        const STEP_TOL: f32 = 1e-6;
 
-        let n = N_PARAMS;
+        let prior = market_prior_norm();
+        let reg_w = config.reg_weight;
 
-        // Build initial simplex: init + n vertices perturbed by ±0.05.
-        // Pins are applied to every vertex so the search stays in the
-        // Heston (or configured) subspace from the first iteration.
-        let mut simplex: Vec<[f32; N_PARAMS]> = Vec::with_capacity(n + 1);
-        let mut init_pinned = *init;
-        pin_params(&mut init_pinned, config);
-        simplex.push(init_pinned);
-        for i in 0..n {
-            let mut v = init_pinned;
-            v[i] = if v[i] < 0.5 {
-                (v[i] + 0.05).min(1.0)
-            } else {
-                (v[i] - 0.05).max(0.0)
-            };
-            pin_params(&mut v, config);
-            simplex.push(v);
-        }
+        let clamp = |v: [f32; N_PARAMS]| -> [f32; N_PARAMS] {
+            let mut c = v;
+            for x in &mut c {
+                *x = x.clamp(0.0, 1.0);
+            }
+            c
+        };
 
-        let mut fvals: Vec<f32> = simplex
-            .iter()
-            .map(|v| self.objective(v, iv_market, weights, config))
-            .collect::<ort::Result<_>>()?;
-        let mut n_evals = n + 1;
+        let mut theta = clamp(*init);
+        let mut iv_pred = self.forward(&theta, carry_norm)?;
+        let mut cost = lm_cost(&iv_pred, iv_market, weights, &theta, &prior, reg_w);
+        let mut damping = DAMP_INIT;
+        let mut n_evals = 1usize;
+
+        // Collect indices of valid (non-zero weight) cells for fast inner loops.
+        let valid: Vec<usize> = (0..N_FLAT).filter(|&i| weights[i] > 0.0).collect();
 
         for _ in 0..MAX_ITERS {
-            // Sort ascending by function value
-            let mut order: Vec<usize> = (0..=n).collect();
-            order.sort_unstable_by(|&a, &b| fvals[a].partial_cmp(&fvals[b]).unwrap());
-            let sorted_simplex: Vec<_> = order.iter().map(|&i| simplex[i]).collect();
-            let sorted_fvals: Vec<_> = order.iter().map(|&i| fvals[i]).collect();
-            simplex = sorted_simplex;
-            fvals = sorted_fvals;
-
-            // Convergence check
-            if fvals[n] - fvals[0] < TOL {
+            if valid.is_empty() {
                 break;
             }
 
-            // Centroid of all but the worst
-            let c = centroid(&simplex[..n]);
+            // Build Jacobian columns via forward differences.
+            // jac[j][k] = d(iv_pred[valid[k]]) / d(theta[j])
+            let n_valid = valid.len();
+            let mut jac = vec![0f32; N_PARAMS * n_valid];
 
-            // Reflection: x_r = c + α*(c − x_worst)
-            let x_r = lerp_clamp(&c, &simplex[n], -ALPHA);
-            let f_r = self.objective(&x_r, iv_market, weights, config)?;
-            n_evals += 1;
-
-            if f_r < fvals[0] {
-                // Better than best: try expansion
-                let x_e = lerp_clamp(&c, &simplex[n], -GAMMA);
-                let f_e = self.objective(&x_e, iv_market, weights, config)?;
-                n_evals += 1;
-                if f_e < f_r {
-                    simplex[n] = x_e;
-                    fvals[n] = f_e;
-                } else {
-                    simplex[n] = x_r;
-                    fvals[n] = f_r;
+            for j in 0..N_PARAMS {
+                let mut th_b = theta;
+                let step = if theta[j] + EPS <= 1.0 { EPS } else { -EPS };
+                th_b[j] = (theta[j] + step).clamp(0.0, 1.0);
+                let eps_actual = th_b[j] - theta[j];
+                if eps_actual.abs() < 1e-10 {
+                    continue;
                 }
-            } else if f_r < fvals[n - 1] {
-                // Better than second-worst: accept reflection
-                simplex[n] = x_r;
-                fvals[n] = f_r;
-            } else {
-                // Contraction
-                let x_c = lerp_clamp(&c, &simplex[n], RHO);
-                let f_c = self.objective(&x_c, iv_market, weights, config)?;
+                let iv_b = self.forward(&th_b, carry_norm)?;
                 n_evals += 1;
-                if f_c < fvals[n] {
-                    simplex[n] = x_c;
-                    fvals[n] = f_c;
-                } else {
-                    // Shrink all toward best
-                    for i in 1..=n {
-                        simplex[i] = lerp_clamp(&simplex[0], &simplex[i], SIGMA);
-                        fvals[i] = self.objective(&simplex[i], iv_market, weights, config)?;
-                        n_evals += 1;
+                for (k, &i) in valid.iter().enumerate() {
+                    jac[j * n_valid + k] = (iv_b[i] - iv_pred[i]) / eps_actual;
+                }
+            }
+
+            // Build H = J^T W J + reg_w*I + damping*I
+            // and g = J^T W r + reg_w*(theta - prior)
+            // where W[i] = weights[i] and r[i] = iv_pred[i] - iv_market[i].
+            let mut h = [[0f32; N_PARAMS]; N_PARAMS];
+            let mut g = [0f32; N_PARAMS];
+
+            for a in 0..N_PARAMS {
+                for b in a..N_PARAMS {
+                    let mut s = 0f32;
+                    for (k, &i) in valid.iter().enumerate() {
+                        s += weights[i] * jac[a * n_valid + k] * jac[b * n_valid + k];
                     }
+                    h[a][b] = s;
+                    h[b][a] = s;
                 }
+                let mut rhs = 0f32;
+                for (k, &i) in valid.iter().enumerate() {
+                    rhs += weights[i] * jac[a * n_valid + k] * (iv_pred[i] - iv_market[i]);
+                }
+                // Prior regularisation: pulls toward market_prior_norm().
+                rhs += reg_w * (theta[a] - prior[a]);
+                g[a] = rhs;
+                h[a][a] += reg_w + damping;
+            }
+
+            // Solve H * delta = -g  (5×5 linear system).
+            let delta = match solve_5x5(&h, &g.map(|x| -x)) {
+                Some(d) => d,
+                None => break,
+            };
+
+            let step_norm: f32 = delta.iter().map(|d| d * d).sum::<f32>().sqrt();
+            if step_norm < STEP_TOL {
+                break;
+            }
+
+            let candidate = clamp({
+                let mut c = theta;
+                for i in 0..N_PARAMS {
+                    c[i] += delta[i];
+                }
+                c
+            });
+
+            let iv_cand = self.forward(&candidate, carry_norm)?;
+            n_evals += 1;
+            let cost_cand = lm_cost(&iv_cand, iv_market, weights, &candidate, &prior, reg_w);
+
+            if cost_cand < cost {
+                theta = candidate;
+                iv_pred = iv_cand;
+                cost = cost_cand;
+                damping = (damping * DAMP_DOWN).max(1e-10);
+            } else {
+                damping = (damping * DAMP_UP).min(1e8);
             }
         }
 
-        Ok((simplex[0], fvals[0], n_evals))
+        // Return unregularised weighted IV MSE for cross-restart RMSE comparison.
+        let iv_loss = weighted_iv_mse(&iv_pred, iv_market, weights);
+        Ok((theta, iv_loss, n_evals))
     }
 }
 
@@ -382,8 +460,7 @@ impl BatesCalibrator {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Extract `HestonParameters` from the 7-dim physical parameter vector.
-/// Indices: kappa=0, theta=1, sigma_v=2, rho=3, v0=4.
+/// Extract `HestonParameters` from the 5-dim physical parameter vector.
 fn bates_to_heston(phys: &[f32; N_PARAMS]) -> HestonParameters {
     HestonParameters {
         kappa: phys[0] as f64,
@@ -394,13 +471,127 @@ fn bates_to_heston(phys: &[f32; N_PARAMS]) -> HestonParameters {
     }
 }
 
-/// Build per-cell weights: valid mask × optional Gaussian ATM down-weighting.
+/// LM total cost: weighted IV MSE + prior regularisation.
+fn lm_cost(
+    iv_pred: &[f32; N_FLAT],
+    iv_market: &[f32; N_FLAT],
+    weights: &[f32; N_FLAT],
+    theta: &[f32; N_PARAMS],
+    prior: &[f32; N_PARAMS],
+    reg_weight: f32,
+) -> f32 {
+    let iv_loss = weighted_iv_mse(iv_pred, iv_market, weights);
+    let mut reg = 0f32;
+    for i in 0..N_PARAMS {
+        let d = theta[i] - prior[i];
+        reg += d * d;
+    }
+    iv_loss + reg_weight * reg
+}
+
+/// Weighted mean-squared IV error (excluding zero-weight cells).
+fn weighted_iv_mse(
+    iv_pred: &[f32; N_FLAT],
+    iv_market: &[f32; N_FLAT],
+    weights: &[f32; N_FLAT],
+) -> f32 {
+    let mut num = 0f32;
+    let mut den = 0f32;
+    for i in 0..N_FLAT {
+        if weights[i] > 0.0 {
+            let e = iv_pred[i] - iv_market[i];
+            num += weights[i] * e * e;
+            den += weights[i];
+        }
+    }
+    if den > 0.0 { num / den } else { f32::MAX }
+}
+
+/// Gaussian elimination with partial pivoting: Ax = b for A ∈ R^{5×5}.
+/// Returns `None` if the system is numerically singular.
+fn solve_5x5(a: &[[f32; N_PARAMS]; N_PARAMS], b: &[f32; N_PARAMS]) -> Option<[f32; N_PARAMS]> {
+    // Augmented matrix [A | b], shape (5, 6)
+    let mut m = [[0f32; N_PARAMS + 1]; N_PARAMS];
+    for i in 0..N_PARAMS {
+        m[i][..N_PARAMS].copy_from_slice(&a[i]);
+        m[i][N_PARAMS] = b[i];
+    }
+    for col in 0..N_PARAMS {
+        // Partial pivot
+        let mut max_row = col;
+        for row in (col + 1)..N_PARAMS {
+            if m[row][col].abs() > m[max_row][col].abs() {
+                max_row = row;
+            }
+        }
+        m.swap(col, max_row);
+        let pivot = m[col][col];
+        if pivot.abs() < 1e-10 {
+            return None;
+        }
+        for j in col..=N_PARAMS {
+            m[col][j] /= pivot;
+        }
+        for row in 0..N_PARAMS {
+            if row != col {
+                let factor = m[row][col];
+                for j in col..=N_PARAMS {
+                    m[row][j] -= factor * m[col][j];
+                }
+            }
+        }
+    }
+    let mut x = [0f32; N_PARAMS];
+    for i in 0..N_PARAMS {
+        x[i] = m[i][N_PARAMS];
+    }
+    Some(x)
+}
+
+/// Build per-cell weights using Black-Scholes vega × confidence.
 ///
-/// When `moneyness_sigma` is `Some(s)`, weight = exp(−lm² / (2s²)) so that
-/// near-ATM cells (tighter bid-ask, better price discovery) dominate the loss.
-fn build_weights(
+/// Vega proxy: N′(d₁) · √T, where d₁ = (−lm + ½σ²T) / (σ√T) uses the
+/// observed IV at each grid cell as σ.  This correctly down-weights deep
+/// OTM short-dated contracts (tiny vega, large relative bid-ask) and
+/// up-weights long-dated near-ATM contracts that anchor the smile shape.
+///
+/// `confidence[i]` ∈ (0, 1] further scales each cell by its IDW reliability.
+pub fn build_vega_weights(
+    iv_surface: &[f32; N_FLAT],
+    mask: &[bool; N_FLAT],
+    confidence: &[f32; N_FLAT],
+) -> [f32; N_FLAT] {
+    const INV_SQRT_2PI: f32 = 0.398_942_28; // 1 / sqrt(2π)
+    let lm_grid = log_moneyness_grid();
+    let mut w = [0f32; N_FLAT];
+    for ik in 0..NK {
+        let lm = lm_grid[ik];
+        for it in 0..NT {
+            let i = ik * NT + it;
+            if !mask[i] || iv_surface[i] <= 0.0 {
+                continue;
+            }
+            let sigma = iv_surface[i];
+            let t = MATURITIES[it];
+            let sigma_sqrt_t = sigma * t.sqrt();
+            // BS d₁ (r = q = 0 approximation — only the relative weighting matters)
+            let d1 = (-lm + 0.5 * sigma * sigma * t) / (sigma_sqrt_t + 1e-8);
+            // N′(d₁) · √T: large for near-ATM, near-zero for deep OTM
+            let vega_proxy = INV_SQRT_2PI * (-0.5 * d1 * d1).exp() * t.sqrt();
+            w[i] = vega_proxy * confidence[i].max(0.0);
+        }
+    }
+    w
+}
+
+/// Build per-cell weights: mask × confidence × Gaussian ATM down-weighting.
+///
+/// Fallback when `use_vega_weights = false`. Applies exp(−lm² / (2σ²)) when
+/// `moneyness_sigma` is `Some(s)`, otherwise uniform within the mask.
+pub fn build_weights(
     iv_market: &[f32; N_FLAT],
     mask: &[bool; N_FLAT],
+    confidence: &[f32; N_FLAT],
     moneyness_sigma: Option<f32>,
 ) -> [f32; N_FLAT] {
     let lm_grid = log_moneyness_grid();
@@ -414,162 +605,178 @@ fn build_weights(
         for it in 0..NT {
             let i = ik * NT + it;
             if mask[i] && iv_market[i] > 0.0 {
-                w[i] = atm_w;
+                w[i] = atm_w * confidence[i].max(0.0);
             }
         }
     }
     w
 }
 
-/// Apply `CalibrationConfig` constraints to a normalised [0,1] parameter vector.
-///
-/// With pure Heston (5 parameters), there are no pins — all Heston parameters
-/// are free to vary during calibration. Market rates (r, q) are applied
-/// separately during pricing, not optimised.
-fn pin_params(_theta: &mut [f32; N_PARAMS], _config: &CalibrationConfig) {
-    // No-op for pure Heston. Kept for API compatibility.
-    // If needed in future, can constrain specific Heston parameters here.
-}
-
-/// Initial starting points for multi-start, respecting config pins.
-fn make_seeds(n: usize, config: &CalibrationConfig) -> Vec<[f32; N_PARAMS]> {
+/// Multi-start seeds in normalised [0,1]^5.
+fn make_seeds(n: usize) -> Vec<[f32; N_PARAMS]> {
     let mut seeds: Vec<[f32; N_PARAMS]> = Vec::with_capacity(n);
-    // Centroid of the Heston subspace
-    let mut s0 = [0.5; N_PARAMS];
-    pin_params(&mut s0, config);
-    seeds.push(s0);
-    // Equity-like: fast mean-reversion, moderate vol-of-vol, steep skew
+    // Centroid of parameter space
+    seeds.push([0.5; N_PARAMS]);
+    // Near-market prior in normalised space (κ=3, θ=0.04, σ_v=0.4, ρ=−0.7, v₀=0.04)
     if n >= 2 {
-        let mut s = [0.7, 0.3, 0.3, 0.1, 0.3];
-        pin_params(&mut s, config);
-        seeds.push(s);
+        seeds.push(market_prior_norm());
+    }
+    // Equity-like: fast mean-reversion, moderate vol-of-vol, steep skew
+    // (normalised kappa≈0.7 → physical ≈5.7, rho≈0.1 → physical ≈−0.87)
+    if n >= 3 {
+        seeds.push([0.7, 0.3, 0.3, 0.1, 0.3]);
     }
     // High vol-of-vol regime
-    if n >= 3 {
-        let mut s = [0.3, 0.5, 0.7, 0.2, 0.5];
-        pin_params(&mut s, config);
-        seeds.push(s);
+    if n >= 4 {
+        seeds.push([0.3, 0.5, 0.7, 0.2, 0.5]);
     }
     // Fill remaining with evenly-spaced scalar values
     for k in seeds.len()..n {
         let t = (k as f32 + 1.0) / (n as f32 + 1.0);
-        let mut s = [t; N_PARAMS];
-        pin_params(&mut s, config);
-        seeds.push(s);
+        seeds.push([t; N_PARAMS]);
     }
     seeds
-}
-
-/// Centroid of a slice of vertices.
-fn centroid(verts: &[[f32; N_PARAMS]]) -> [f32; N_PARAMS] {
-    let mut c = [0f32; N_PARAMS];
-    let n = verts.len() as f32;
-    for v in verts {
-        for i in 0..N_PARAMS {
-            c[i] += v[i];
-        }
-    }
-    for i in 0..N_PARAMS {
-        c[i] /= n;
-    }
-    c
-}
-
-/// `a + t * (b − a)`, clamped element-wise to [0, 1].
-///
-/// This covers all Nelder-Mead moves:
-///   reflection  t = −α  →  a + α*(a − b)
-///   expansion   t = −γ
-///   contraction t = +ρ  →  a + ρ*(b − a)
-///   shrink      t = +σ  (call with a=best, b=vertex)
-fn lerp_clamp(a: &[f32; N_PARAMS], b: &[f32; N_PARAMS], t: f32) -> [f32; N_PARAMS] {
-    let mut out = [0f32; N_PARAMS];
-    for i in 0..N_PARAMS {
-        out[i] = (a[i] + t * (b[i] - a[i])).clamp(0.0, 1.0);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
 // Market surface builder
 // ---------------------------------------------------------------------------
 
-/// Map a `CalibrationDataset` onto the fixed 49×14 ONNX grid.
+/// Map a `CalibrationDataset` onto the fixed 49×14 ONNX grid using
+/// inverse-distance-weighted (IDW) interpolation.
 ///
-/// Each instrument with a known `implied_vol` is assigned to its nearest
-/// (strike, maturity) grid cell via log-moneyness = ln(K/S).  Multiple
-/// instruments that fall on the same cell have their IVs averaged.  Cells
-/// with no market quotes are left as 0.0 with `mask = false`.
+/// For each grid cell, the K=4 nearest observed quotes in (log-moneyness, T)
+/// space are combined via inverse-distance weighting. Cells near real quotes
+/// receive `confidence ≈ 1.0`; extrapolated cells receive as low as `0.1`.
 ///
-/// Returns `(surface, mask)` where the flat index is `ik * NT + it`
-/// (strike-major, matching the Python training layout).
-pub fn build_iv_surface(dataset: &CalibrationDataset) -> ([f32; N_FLAT], [bool; N_FLAT]) {
+/// Returns `(surface, mask, confidence)` where:
+///   - `surface[ik * NT + it]` is the interpolated IV (always finite for a
+///     non-empty dataset),
+///   - `mask[i]` is `true` for every filled cell (the entire grid when at
+///     least one quote is present),
+///   - `confidence[i]` ∈ [0.1, 1.0] encodes proximity to real market quotes.
+///
+/// Flat index is `ik * NT + it` (strike-major, matching Python training layout).
+pub fn build_iv_surface(
+    dataset: &CalibrationDataset,
+) -> ([f32; N_FLAT], [bool; N_FLAT], [f32; N_FLAT]) {
     let lm_grid = log_moneyness_grid();
-    let mut sum   = [0f32; N_FLAT];
-    let mut count = [0u32; N_FLAT];
 
-    for inst in &dataset.instruments {
-        let iv = match inst.implied_vol {
-            Some(v) if v > 0.0 => v as f32,
-            _ => continue,
-        };
-        if inst.spot <= 0.0 || inst.strike <= 0.0 {
-            continue;
-        }
-        let lm = (inst.strike / inst.spot).ln() as f32;
-        let t  = inst.maturity_years as f32;
+    // Collect valid observed quotes: (log_moneyness, maturity, iv)
+    let quotes: Vec<(f32, f32, f32)> = dataset
+        .instruments
+        .iter()
+        .filter_map(|inst| {
+            let iv = inst.implied_vol?;
+            if iv <= 0.0 || inst.spot <= 0.0 || inst.strike <= 0.0 {
+                return None;
+            }
+            let lm = (inst.strike / inst.spot).ln() as f32;
+            let t = inst.maturity_years as f32;
+            Some((lm, t, iv as f32))
+        })
+        .collect();
 
-        let ik = lm_grid
-            .iter()
-            .enumerate()
-            .min_by(|a, b| (a.1 - lm).abs().partial_cmp(&(b.1 - lm).abs()).unwrap())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        let it = MATURITIES
-            .iter()
-            .enumerate()
-            .min_by(|a, b| (a.1 - t).abs().partial_cmp(&(b.1 - t).abs()).unwrap())
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-
-        let idx = ik * NT + it;
-        sum[idx]   += iv;
-        count[idx] += 1;
+    if quotes.is_empty() {
+        return ([0f32; N_FLAT], [false; N_FLAT], [0f32; N_FLAT]);
     }
+
+    // Normalisation scales for the distance metric (grid extent in each axis)
+    const LM_SCALE: f32 = 1.20; // range of log-moneyness grid
+    const T_SCALE: f32 = 3.00;  // approximate range of maturity grid
+    const K_NEAREST: usize = 4;
+
+    // Confidence thresholds:
+    //   distance < NEAR → confidence = 1.0 (cell has a real nearby quote)
+    //   distance > FAR  → confidence = MIN_CONF (fully extrapolated)
+    //   in between      → linear decay
+    const NEAR_THRESH: f32 = 0.15;
+    const FAR_THRESH: f32 = 0.50;
+    const MIN_CONF: f32 = 0.10;
 
     let mut surface = [0f32; N_FLAT];
-    let mut mask    = [false; N_FLAT];
-    for i in 0..N_FLAT {
-        if count[i] > 0 {
-            surface[i] = sum[i] / count[i] as f32;
-            mask[i]    = true;
+    let mut mask = [false; N_FLAT];
+    let mut confidence = [0f32; N_FLAT];
+
+    for ik in 0..NK {
+        let lm = lm_grid[ik];
+        for it in 0..NT {
+            let t = MATURITIES[it];
+
+            // Normalised distance to each observed quote
+            let mut dists: Vec<(f32, f32)> = quotes
+                .iter()
+                .map(|&(qlm, qt, qiv)| {
+                    let dlm = (qlm - lm) / LM_SCALE;
+                    let dt = (qt - t) / T_SCALE;
+                    let d = (dlm * dlm + dt * dt).sqrt();
+                    (d, qiv)
+                })
+                .collect();
+            dists.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+            let min_dist = dists[0].0;
+
+            let iv = if min_dist < 1e-6 {
+                // Exact hit(s): average all zero-distance quotes.
+                // This handles duplicate instruments at the same (lm, T).
+                let n_exact = dists.iter().take_while(|&&(d, _)| d < 1e-6).count();
+                dists[..n_exact].iter().map(|&(_, iv)| iv).sum::<f32>() / n_exact as f32
+            } else {
+                // Inverse-distance weighted average of K nearest quotes.
+                let k = K_NEAREST.min(dists.len());
+                let mut num = 0f32;
+                let mut den = 0f32;
+                for &(d, qiv) in &dists[..k] {
+                    let w = 1.0 / d;
+                    num += w * qiv;
+                    den += w;
+                }
+                num / den
+            };
+
+            // Confidence based on normalised distance to the nearest real quote.
+            let conf = if min_dist < NEAR_THRESH {
+                1.0
+            } else if min_dist > FAR_THRESH {
+                MIN_CONF
+            } else {
+                let t_c = (min_dist - NEAR_THRESH) / (FAR_THRESH - NEAR_THRESH);
+                1.0 - (1.0 - MIN_CONF) * t_c
+            };
+
+            let idx = ik * NT + it;
+            surface[idx] = iv;
+            mask[idx] = true;
+            confidence[idx] = conf;
         }
     }
-    (surface, mask)
+
+    (surface, mask, confidence)
 }
 
 /// Calibrate Heston parameters to a `CalibrationDataset` using the deep surrogate.
 ///
-/// Builds the IV surface from `dataset`, then runs `BatesCalibrator::calibrate`.
+/// Builds the IV surface from `dataset` using IDW interpolation with confidence
+/// weighting, then runs multi-start LM calibration.
 pub fn calibrate_heston_from_dataset(
     calibrator: &mut BatesCalibrator,
     dataset: &CalibrationDataset,
     n_restarts: usize,
     config: &CalibrationConfig,
 ) -> ort::Result<DeepCalibrationResult> {
-    let (surface, mask) = build_iv_surface(dataset);
-    calibrator.calibrate(&surface, &mask, n_restarts, config)
+    let (surface, mask, confidence) = build_iv_surface(dataset);
+    let weights = if config.use_vega_weights {
+        build_vega_weights(&surface, &mask, &confidence)
+    } else {
+        build_weights(&surface, &mask, &confidence, config.moneyness_weight_sigma)
+    };
+    let carry_norm = normalise_carry(dataset_carry(dataset));
+    calibrator.calibrate_with_weights(&surface, &weights, carry_norm, n_restarts, config)
 }
 
 /// End-to-end pipeline: load the ONNX surrogate, calibrate Heston parameters
 /// from market data, and price an American option with the CTMC algorithm.
-///
-///   1. Load `bates_surrogate.onnx` from `onnx_path`.
-///   2. Build IV surface from `dataset` and run Nelder-Mead calibration.
-///   3. Price `option` with `price_american_option_heston`.
-///
-/// `n_x`, `m_v`, `n_time` control CTMC grid resolution (typical: 80, 20, 50).
 pub fn price_american_option_deep(
     onnx_path: &str,
     dataset: &CalibrationDataset,
@@ -630,21 +837,25 @@ mod tests {
             instruments,
         };
 
-        let (surface, mask) = build_iv_surface(&dataset);
+        let (surface, mask, confidence) = build_iv_surface(&dataset);
 
+        // IDW fills all 686 cells (one non-empty quote set → entire grid interpolated)
         let n_valid = mask.iter().filter(|&&m| m).count();
-        assert!(n_valid >= 3, "expected >=3 valid cells, got {n_valid}");
+        assert_eq!(n_valid, N_FLAT, "IDW should fill all cells; got {n_valid}");
+
         for i in 0..N_FLAT {
-            if mask[i] {
-                assert!(surface[i] > 0.0, "masked cell {i} has non-positive IV");
-            } else {
-                assert_eq!(surface[i], 0.0, "unmasked cell {i} should be 0.0");
-            }
+            assert!(surface[i] > 0.0, "IDW cell {i} has non-positive IV");
+            assert!(
+                confidence[i] >= 0.1 && confidence[i] <= 1.0,
+                "confidence out of [0.1, 1.0] at cell {i}: {}",
+                confidence[i]
+            );
         }
     }
 
     #[test]
     fn build_iv_surface_averages_duplicate_cells() {
+        // Two instruments at the same (K, T) → IDW exact-hit averages them.
         let spot = 100.0_f64;
         let instruments = vec![
             make_instrument(100.0, 0.5, 0.20, spot),
@@ -656,27 +867,232 @@ mod tests {
             instruments,
         };
 
-        let (surface, mask) = build_iv_surface(&dataset);
+        let (surface, mask, _confidence) = build_iv_surface(&dataset);
 
+        // All cells filled via IDW with only one unique location
         let n_valid = mask.iter().filter(|&&m| m).count();
-        assert_eq!(n_valid, 1, "two instruments on same cell should produce 1 masked cell");
+        assert_eq!(n_valid, N_FLAT, "IDW fills all cells; got {n_valid}");
 
-        let iv = surface.iter().zip(mask.iter()).find(|(_, m)| **m).map(|(v, _)| *v).unwrap();
-        assert!((iv - 0.25).abs() < 1e-5, "expected averaged IV ~0.25, got {iv}");
+        // The cell closest to (lm=0, T=0.5) should have IV ≈ 0.25 (average)
+        let lm_grid = log_moneyness_grid();
+        let ik = lm_grid
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        let it = MATURITIES
+            .iter()
+            .enumerate()
+            .min_by(|a, b| (a.1 - 0.5_f32).abs().partial_cmp(&(b.1 - 0.5_f32).abs()).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        let cell_iv = surface[ik * NT + it];
+        assert!(
+            (cell_iv - 0.25).abs() < 1e-4,
+            "expected IV ≈ 0.25 at ATM 6M cell, got {cell_iv}"
+        );
+    }
+
+    /// Synthetic round-trip test: calibrate known Heston parameters from a
+    /// COS-generated IV surface and verify recovery within 15% relative error.
+    ///
+    /// This test loads the ONNX model — run with:
+    ///   cargo test --release -- --ignored synthetic_round_trip_recovers_known_params
+    ///
+    /// If this test fails after all other fixes, the surrogate itself is the
+    /// bottleneck and retraining is required.
+    #[test]
+    #[ignore]
+    fn synthetic_round_trip_recovers_known_params() {
+        use crate::slv::{cos_european, HestonParameters, OptionSide};
+        use options::black_scholes::calculate_iv;
+
+        let onnx_path =
+            default_onnx_path().expect("ONNX model not found — run from workspace root");
+        let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
+
+        // True Heston parameters — comfortably inside training bounds.
+        let true_phys = [2.0_f64, 0.04, 0.35, -0.65, 0.04];
+        let true_heston = HestonParameters {
+            kappa: true_phys[0],
+            v_bar: true_phys[1],
+            sigma: true_phys[2],
+            rho:   true_phys[3],
+            v0:    true_phys[4],
+        };
+
+        // Scenario: S=100, r=3%, q=1%
+        let spot = 100.0_f64;
+        let r = 0.03_f64;
+        let q = 0.01_f64;
+        let n_cos = 256;
+
+        // Generate IV surface using Heston COS pricer for each grid cell.
+        let lm_grid = log_moneyness_grid();
+        let mut iv_market = [0f32; N_FLAT];
+        let confidence = [1.0f32; N_FLAT]; // All cells are "real" quotes
+        let mut mask = [true; N_FLAT];
+
+        for ik in 0..NK {
+            let lm = lm_grid[ik] as f64;
+            let strike = spot * lm.exp();
+            for it in 0..NT {
+                let tau = MATURITIES[it] as f64;
+                let idx = ik * NT + it;
+
+                // Price a put option (OTM for negative lm, ITM otherwise)
+                let price = cos_european(
+                    OptionSide::Put,
+                    spot,
+                    strike,
+                    r,
+                    q,
+                    tau,
+                    &true_heston,
+                    n_cos,
+                );
+
+                // Extract implied vol via Newton-Raphson bisection
+                let iv = calculate_iv(price, spot, strike, tau, r, q, false);
+
+                if iv > 0.005 && iv < 5.0 {
+                    iv_market[idx] = iv as f32;
+                } else {
+                    // Fallback: ATM vol approximation for problematic cells
+                    iv_market[idx] = (true_heston.v_bar as f32).sqrt();
+                    mask[idx] = false; // Don't use as calibration target
+                }
+            }
+        }
+
+        let weights = build_weights(&iv_market, &mask, &confidence, Some(0.30));
+        let carry_norm = normalise_carry((r - q) as f32);
+        let result = calibrator
+            .calibrate_with_weights(&iv_market, &weights, carry_norm, 5, &CalibrationConfig::default())
+            .expect("calibration failed");
+
+        let h = result.heston;
+        println!("\n=== Synthetic Round-Trip Test ===");
+        println!(
+            "True:      κ={:.4}  θ={:.4}  σ_v={:.4}  ρ={:.4}  v₀={:.4}",
+            true_phys[0], true_phys[1], true_phys[2], true_phys[3], true_phys[4]
+        );
+        println!(
+            "Recovered: κ={:.4}  θ={:.4}  σ_v={:.4}  ρ={:.4}  v₀={:.4}",
+            h.kappa, h.v_bar, h.sigma, h.rho, h.v0
+        );
+        println!("IVRMSE: {:.4} ({:.1} bps)", result.ivrmse, result.ivrmse * 10000.0);
+
+        assert!(
+            (h.kappa - true_phys[0]).abs() / true_phys[0] < 0.15,
+            "kappa: true={:.4} got={:.4}",
+            true_phys[0], h.kappa
+        );
+        assert!(
+            (h.v_bar - true_phys[1]).abs() / true_phys[1] < 0.15,
+            "theta: true={:.4} got={:.4}",
+            true_phys[1], h.v_bar
+        );
+        assert!(
+            (h.sigma - true_phys[2]).abs() / true_phys[2] < 0.15,
+            "sigma_v: true={:.4} got={:.4}",
+            true_phys[2], h.sigma
+        );
+        assert!(
+            (h.rho - true_phys[3]).abs() / true_phys[3].abs() < 0.15,
+            "rho: true={:.4} got={:.4}",
+            true_phys[3], h.rho
+        );
+        assert!(
+            (h.v0 - true_phys[4]).abs() / true_phys[4] < 0.15,
+            "v0: true={:.4} got={:.4}",
+            true_phys[4], h.v0
+        );
+    }
+
+    /// Real-data smoke test: calibrate a synthetic option chain and verify
+    /// the recovered parameters fall in market-realistic ranges.
+    ///
+    /// Exercises the full pipeline: build_iv_surface → IDW interpolation →
+    /// LM calibration. Does NOT require a specific real dataset.
+    ///
+    /// Run with:
+    ///   cargo test --release -- --ignored real_data_parameters_in_market_range
+    #[test]
+    #[ignore]
+    fn real_data_parameters_in_market_range() {
+        let onnx_path =
+            default_onnx_path().expect("ONNX model not found — run from workspace root");
+        let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
+
+        // Synthetic SPY-like option chain: ~30 instruments across 4 expiries
+        let spot = 450.0_f64;
+        let atm_iv = 0.18_f64;
+        let skew = 0.15_f64; // ≈ −∂IV/∂log-moneyness
+
+        let moneyness = [0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15_f64];
+        let expiries = [1.0 / 12.0, 3.0 / 12.0, 6.0 / 12.0, 1.0_f64];
+
+        let instruments: Vec<CalibrationInstrument> = moneyness
+            .iter()
+            .flat_map(|&m| {
+                expiries.iter().map(move |&t| {
+                    let lm = m.ln();
+                    let iv = (atm_iv - skew * lm).clamp(0.05, 1.0);
+                    CalibrationInstrument {
+                        symbol: "SPY".to_string(),
+                        side: if m < 1.0 { OptionSide::Put } else { OptionSide::Call },
+                        strike: m * spot,
+                        maturity_years: t,
+                        market_price: 0.0,
+                        spot,
+                        risk_free_rate: 0.05,
+                        dividend_yield: 0.015,
+                        implied_vol: Some(iv),
+                        bid: None,
+                        ask: None,
+                        open_interest: None,
+                        volume: None,
+                    }
+                })
+            })
+            .collect();
+
+        let dataset = CalibrationDataset {
+            valuation_symbol: "SPY".to_string(),
+            as_of_epoch_secs: 0,
+            instruments,
+        };
+
+        let result = calibrate_heston_from_dataset(&mut calibrator, &dataset, 5, &CalibrationConfig::default())
+            .expect("calibration failed");
+
+        let p = result.heston;
+        println!("\n=== Real-Data Smoke Test (SPY-like) ===");
+        println!(
+            "κ={:.4}  θ={:.4}  σ_v={:.4}  ρ={:.4}  v₀={:.4}",
+            p.kappa, p.v_bar, p.sigma, p.rho, p.v0
+        );
+        println!("IVRMSE: {:.4} ({:.1} bps)", result.ivrmse, result.ivrmse * 10000.0);
+
+        // Assert market-realistic parameter ranges
+        assert!(p.kappa > 0.5 && p.kappa < 10.0, "kappa={:.4} out of [0.5, 10]", p.kappa);
+        assert!(p.v_bar > 0.01 && p.v_bar < 0.10, "theta={:.4} out of [0.01, 0.10]", p.v_bar);
+        assert!(p.sigma > 0.10 && p.sigma < 1.20, "sigma_v={:.4} out of [0.10, 1.20]", p.sigma);
+        assert!(p.rho < -0.30 && p.rho > -0.98, "rho={:.4} out of (-0.98, -0.30)", p.rho);
+        assert!(p.v0 > 0.01 && p.v0 < 0.10, "v0={:.4} out of [0.01, 0.10]", p.v0);
+
+        // Loose IVRMSE threshold — if fit is good it will be much lower
+        let ivrmse_bps = result.ivrmse * 10000.0;
+        assert!(
+            ivrmse_bps < 200.0,
+            "IVRMSE={:.1} bps exceeds 200 bps threshold",
+            ivrmse_bps
+        );
     }
 
     /// Comparison test: deep-calibration pipeline vs direct CTMC with true params.
-    ///
-    /// Scenario: S=K=100, T=1yr, r=5%, q=2%.
-    /// True Heston params: kappa=2.0, theta=0.04, sigma=0.35, rho=-0.65, v0=0.04.
-    /// Synthetic IV surface is built by approximating the Heston skew via the ATM
-    /// level (sqrt(theta)) and a linear skew slope from rho/sigma.
-    ///
-    /// Prints a table comparing:
-    ///   1. CTMC (true params)     — ground truth
-    ///   2. CTMC (Fourier LM cal)  — from full_pipeline_calibrate_then_ctmc_american_put
-    ///   3. CTMC (deep cal)        — this pipeline
-    ///   4. Black-Scholes European — lower bound reference
     #[test]
     #[ignore]
     fn price_american_option_deep_smoke() {
@@ -684,61 +1100,72 @@ mod tests {
 
         let onnx_path = default_onnx_path().expect("ONNX model not found — run from workspace root");
 
-        // Shared scenario
         let (spot, strike, r, q, tau) = (100.0_f64, 100.0_f64, 0.05_f64, 0.02_f64, 1.0_f64);
-        // True Heston parameters (same as full_pipeline_calibrate_then_ctmc_american_put)
         let (kappa, theta, sigma_v, rho_h, v0) = (2.0_f64, 0.04_f64, 0.35_f64, -0.65_f64, 0.04_f64);
         let (n_x, m_v, n_time) = (100, 25, 75);
 
-        // 1. Ground truth: CTMC with true Heston params
+        // Ground truth: CTMC with true Heston params
         let true_result = price_american_put_heston(
             strike, spot, v0, tau, r, q, kappa, theta, sigma_v, rho_h, n_x, m_v, n_time,
         );
 
-        // 2. Deep calibration
-        //    Build a synthetic surface using ATM IV ≈ sqrt(theta) and a
-        //    first-order skew approximation: IV(m) ≈ atm_iv - skew * log_moneyness
-        //    where skew ≈ -rho * sigma_v / (2 * sqrt(theta)) (Heston skew expansion).
+        // Build a synthetic IV surface via ATM + linear skew approximation
         let atm_iv = theta.sqrt();
-        let skew   = -rho_h * sigma_v / (2.0 * atm_iv);
+        let skew = -rho_h * sigma_v / (2.0 * atm_iv);
         let moneyness_grid = [0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10, 1.15, 1.20_f64];
-        let maturity_grid  = [0.25, 0.5, 1.0, 2.0_f64];
-        let instruments: Vec<_> = moneyness_grid.iter().flat_map(|&m| {
-            maturity_grid.iter().map(move |&t| {
-                let lm = m.ln();
-                let iv = (atm_iv - skew * lm).max(0.05);
-                make_instrument(m * spot, t, iv, spot)
+        let maturity_grid = [0.25, 0.5, 1.0, 2.0_f64];
+        let instruments: Vec<_> = moneyness_grid
+            .iter()
+            .flat_map(|&m| {
+                maturity_grid.iter().map(move |&t| {
+                    let lm = m.ln();
+                    let iv = (atm_iv - skew * lm).max(0.05);
+                    CalibrationInstrument {
+                        symbol: "SYN".to_string(),
+                        side: OptionSide::Put,
+                        strike: m * spot,
+                        maturity_years: t,
+                        market_price: 0.0,
+                        spot,
+                        risk_free_rate: r,
+                        dividend_yield: q,
+                        implied_vol: Some(iv),
+                        bid: None,
+                        ask: None,
+                        open_interest: None,
+                        volume: None,
+                    }
+                })
             })
-        }).collect();
+            .collect();
         let dataset = CalibrationDataset {
             valuation_symbol: "SYN".to_string(),
             as_of_epoch_secs: 0,
             instruments,
         };
-        // Run deep calibration and also capture calibrated params
+
         let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
-        let cal_result = calibrate_heston_from_dataset(&mut calibrator, &dataset, 3, &CalibrationConfig::default())
-            .expect("deep calibration failed");
+        let cal_result =
+            calibrate_heston_from_dataset(&mut calibrator, &dataset, 3, &CalibrationConfig::default())
+                .expect("deep calibration failed");
         let h = cal_result.heston;
         let deep_result = crate::ctmc::price_american_put_heston(
             strike, spot, h.v0, tau, r, q, h.kappa, h.v_bar, h.sigma, h.rho,
             n_x, m_v, n_time,
         );
 
-        // 3. Black-Scholes European (lower bound, using ATM IV)
         let bs_put = options::Options::new_put(strike, spot, atm_iv, r, tau, Some(q));
         let bs_price = bs_put.bs_pricing();
 
         println!("\n=== American Put Pricing Comparison ===");
-        println!("Scenario: S={spot}, K={strike}, T={tau}yr, r={:.1}%, q={:.1}%", r*100.0, q*100.0);
-        println!();
+        println!("Scenario: S={spot}, K={strike}, T={tau}yr, r={:.1}%, q={:.1}%", r * 100.0, q * 100.0);
         println!("True Heston params:");
         println!("  kappa={kappa}  theta={theta}  sigma={sigma_v}  rho={rho_h}  v0={v0}");
-        println!();
         println!("Deep-calibrated Heston params (IVRMSE={:.4}):", cal_result.ivrmse);
-        println!("  kappa={:.4}  theta={:.4}  sigma={:.4}  rho={:.4}  v0={:.4}",
-            h.kappa, h.v_bar, h.sigma, h.rho, h.v0);
-        println!();
+        println!(
+            "  kappa={:.4}  theta={:.4}  sigma={:.4}  rho={:.4}  v0={:.4}",
+            h.kappa, h.v_bar, h.sigma, h.rho, h.v0
+        );
         println!("{:<32} {:>10}", "Method", "Price");
         println!("{}", "-".repeat(44));
         println!("{:<32} {:>10.4}", "CTMC (true params)",      true_result.price);
