@@ -101,9 +101,9 @@ pub fn log_moneyness_grid() -> [f32; NK] {
 // Source of truth: PARAM_BOUNDS in training data creation/heston_datagen.py.
 
 /// Physical lower bounds: [kappa, theta, sigma_v, rho, v0]
-const PARAM_LO: [f32; N_PARAMS] = [0.30, 0.02, 0.05, -0.98, 0.02];
+const PARAM_LO: [f32; N_PARAMS] = [0.50, 0.02, 0.10, -0.95, 0.02];
 /// Physical upper bounds: [kappa, theta, sigma_v, rho, v0]
-const PARAM_HI: [f32; N_PARAMS] = [8.00, 0.12, 1.20,  0.10, 0.12];
+const PARAM_HI: [f32; N_PARAMS] = [6.00, 0.10, 0.90, -0.20, 0.10];
 
 /// Carry (r−q) bounds — derived from R_BOUNDS/Q_BOUNDS in heston_datagen.py.
 const CARRY_LO: f32 = -0.04; // min(r) - max(q) = 0.00 - 0.04
@@ -236,10 +236,19 @@ impl BatesCalibrator {
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_file(onnx_path)?;
 
-        // Shape sanity: run a 1×N_MODEL_INPUTS forward pass.  Catches model/code
-        // mismatches (e.g. model retrained with different n_params) at startup.
+        // Shape sanity: run a 1×N_MODEL_INPUTS forward pass.
+        // If the ONNX was exported with a different n_params (e.g. 5 instead of 6),
+        // ORT will return an error here — fail loudly at construction rather than
+        // silently producing wrong calibrations mid-run.
         let dummy = Tensor::from_array(([1usize, N_MODEL_INPUTS], vec![0.5f32; N_MODEL_INPUTS]))?;
-        session.run(ort::inputs!["parameters" => dummy])?;
+        session.run(ort::inputs!["parameters" => dummy]).expect(
+            &format!(
+                "ONNX model rejected input shape [1, {}]. \
+                 The model was likely exported with a different n_params. \
+                 Re-export bates_surrogate.onnx after retraining.",
+                N_MODEL_INPUTS
+            )
+        );
 
         Ok(Self { session })
     }
@@ -291,20 +300,24 @@ impl BatesCalibrator {
         })
     }
 
-    /// Backward-compatible wrapper: builds weights from mask (uniform confidence = 1.0).
+    /// Convenience wrapper: builds weights from mask (uniform confidence = 1.0).
     ///
-    /// Prefer `calibrate_with_weights` when confidence information is available
-    /// (e.g. from `build_iv_surface`).
+    /// `carry` is the market-level r−q in physical units (e.g. 0.05 − 0.02 = 0.03).
+    /// It is normalised internally before being passed to the ONNX model.
+    ///
+    /// Prefer `calibrate_with_weights` when per-cell confidence information is
+    /// available (e.g. from `build_iv_surface`).
     pub fn calibrate(
         &mut self,
         iv_market: &[f32; N_FLAT],
         mask: &[bool; N_FLAT],
+        carry: f32,
         n_restarts: usize,
         config: &CalibrationConfig,
     ) -> ort::Result<DeepCalibrationResult> {
         let confidence = [1.0f32; N_FLAT];
         let weights = build_weights(iv_market, mask, &confidence, config.moneyness_weight_sigma);
-        self.calibrate_with_weights(iv_market, &weights, 0.0, n_restarts, config)
+        self.calibrate_with_weights(iv_market, &weights, normalise_carry(carry), n_restarts, config)
     }
 
     // -----------------------------------------------------------------------
@@ -1176,5 +1189,196 @@ mod tests {
 
         assert!(deep_result.price > 0.0);
         assert!(deep_result.price < spot);
+    }
+
+    /// Full cross-method benchmark for a JNJ-like ATM American put.
+    ///
+    /// Prices the same 6-month ATM American put under every available method
+    /// and prints a formatted comparison table.  A full COS IV surface is
+    /// synthesised from the true Heston parameters and fed to the deep
+    /// calibration pipeline so parameter recovery can also be assessed.
+    ///
+    /// Run (release required for CTMC speed):
+    ///   cargo test --release -p numerical-methods -- --ignored --nocapture \
+    ///     jnj_american_put_full_comparison
+    #[test]
+    #[ignore]
+    fn jnj_american_put_full_comparison() {
+        use crate::binomial::{BinomialParameters, ExerciseStyle, binomial_price};
+        use crate::ctmc::price_american_put_heston;
+        use crate::slv::{cos_european, HestonParameters, OptionSide};
+        use crate::{PenaltySolver, TimestepMode};
+        use options::black_scholes::{black_scholes_price, calculate_iv};
+        use options::Options;
+
+        // --- Reference scenario: NVDA-like 6-month ATM put (q≈0 ensures all
+        // GBM-based methods use the same drift, making the cross-method
+        // comparison self-consistent: Binomial and PDE do not accept a
+        // continuous dividend yield parameter) ---
+        let spot   = 900.0_f64;
+        let strike = 900.0_f64;
+        let r      = 0.053_f64;  // SOFR-ish
+        let q      = 0.000_f64;  // NVDA has negligible dividend
+        let tau    = 0.50_f64;   // 6 months
+
+        // True Heston params — comfortably inside training bounds
+        // kappa∈[0.30,8.00], theta∈[0.02,0.12], sigma_v∈[0.05,1.20],
+        // rho∈[−0.98,0.10], v0∈[0.02,0.12]
+        // NVDA character: higher vol (~50%), high vol-of-vol, steep skew
+        let true_kappa   = 1.8_f64;
+        let true_theta   = 0.070_f64;   // long-run var → ~26.5% ATM vol
+        let true_sigma_v = 0.55_f64;    // high vol-of-vol (NVDA-like)
+        let true_rho     = -0.65_f64;   // steep negative skew
+        let true_v0      = 0.080_f64;   // slightly elevated short-term var
+
+        let true_heston = HestonParameters {
+            kappa: true_kappa,
+            v_bar: true_theta,
+            sigma: true_sigma_v,
+            rho:   true_rho,
+            v0:    true_v0,
+        };
+        let n_cos = 256;
+
+        // --- ATM COS price → extract implied vol for GBM methods ---
+        let cos_atm_price = cos_european(
+            OptionSide::Put, spot, strike, r, q, tau, &true_heston, n_cos,
+        );
+        let atm_iv = calculate_iv(cos_atm_price, spot, strike, tau, r, q, false);
+
+        // --- Method 1: Black-Scholes European ---
+        // q=0 for NVDA, so dividend_yield=None keeps BS identical to Binomial/PDE
+        let bs_opt = Options::new_put(strike, spot, atm_iv, r, tau, None);
+        let bs_european = black_scholes_price(bs_opt);
+
+        // --- Method 2: Black's approximation for American put ---
+        // With no discrete dividend event, Black's method returns the European
+        // price (the implementation does not handle continuous-yield early
+        // exercise via Barone-Adesi-Whaley or similar).
+        let bs_approx = options::black_scholes::black_scholes_approx_american(bs_opt, None);
+
+        // --- Methods 3 & 4: Binomial CRR (European and American) ---
+        let put_obj = options::Put::new(strike, spot, atm_iv, r, tau, None);
+        let binom_params = BinomialParameters::new(spot, 500, tau, atm_iv, r);
+        let binom_european = binomial_price(&put_obj, &binom_params, ExerciseStyle::European);
+        let binom_american = binomial_price(&put_obj, &binom_params, ExerciseStyle::American);
+
+        // --- Method 5: Penalty PDE (BS dynamics, American exercise) ---
+        let mut solver = PenaltySolver::new(
+            put_obj,
+            300,
+            200,
+            1e-6,
+            TimestepMode::Constant,
+        );
+        solver.initialize();
+        solver.solve();
+        let pde_american = solver.option_value();
+
+        // --- Method 6: CTMC with true Heston params (stochastic-vol reference) ---
+        let (n_x, m_v, n_time) = (80, 20, 50);
+        let ctmc_true = price_american_put_heston(
+            strike, spot, true_v0, tau, r, q,
+            true_kappa, true_theta, true_sigma_v, true_rho,
+            n_x, m_v, n_time,
+        );
+
+        // --- Method 7: Deep calibration → CTMC ---
+        let onnx_path = default_onnx_path().expect("ONNX model not found");
+        let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
+
+        // Build dense COS IV surface for calibration input
+        let lm_grid = log_moneyness_grid();
+        let mut iv_market = [0f32; N_FLAT];
+        let confidence = [1.0f32; N_FLAT];
+        let mut mask = [true; N_FLAT];
+
+        for ik in 0..NK {
+            let lm = lm_grid[ik] as f64;
+            let k = spot * lm.exp();
+            for it in 0..NT {
+                let tau_i = MATURITIES[it] as f64;
+                let idx = ik * NT + it;
+                let p = cos_european(OptionSide::Put, spot, k, r, q, tau_i, &true_heston, n_cos);
+                let iv = calculate_iv(p, spot, k, tau_i, r, q, false);
+                if iv > 0.005 && iv < 5.0 {
+                    iv_market[idx] = iv as f32;
+                } else {
+                    iv_market[idx] = true_theta.sqrt() as f32;
+                    mask[idx] = false;
+                }
+            }
+        }
+
+        let weights = build_weights(&iv_market, &mask, &confidence, Some(0.30));
+        let carry_norm = normalise_carry((r - q) as f32);
+        let cal = calibrator
+            .calibrate_with_weights(&iv_market, &weights, carry_norm, 5, &CalibrationConfig::default())
+            .expect("calibration failed");
+
+        let h = cal.heston;
+        let ctmc_deep = price_american_put_heston(
+            strike, spot, h.v0, tau, r, q,
+            h.kappa, h.v_bar, h.sigma, h.rho,
+            n_x, m_v, n_time,
+        );
+
+        // ================================================================
+        // Output
+        // ================================================================
+
+        println!("\n╔══════════════════════════════════════════════════════════════════════╗");
+        println!("║          NVDA-like American Put — Cross-Method Comparison            ║");
+        println!("╠══════════════════════════════════════════════════════════════════════╣");
+        println!("║  Spot ${:.0}  Strike ${:.0}  r {:.1}%  q {:.1}%  T {:.0}M  ATM-IV {:.1}%    ║",
+            spot, strike, r * 100.0, q * 100.0, tau * 12.0, atm_iv * 100.0);
+        println!("╚══════════════════════════════════════════════════════════════════════╝\n");
+
+        let reference = ctmc_true.price;
+
+        println!("  {:<36} {:>9}  {:>10}  {:>10}",
+            "Method", "Price ($)", "vs BS-Euro", "vs CTMC-True");
+        println!("  {}", "─".repeat(70));
+
+        let row = |label: &str, price: f64| {
+            let d_bs   = price - bs_european;
+            let d_ctmc = price - reference;
+            println!("  {:<36} {:>9.4}  {:>+10.4}  {:>+10.4}", label, price, d_bs, d_ctmc);
+        };
+
+        row("BS European (GBM)",            bs_european);
+        row("BS American Approx (Black's)", bs_approx);
+        row("Binomial CRR European (N=500)", binom_european);
+        row("Binomial CRR American (N=500)", binom_american);
+        row("Penalty PDE American",          pde_american);
+        row("CTMC Heston — true params",     ctmc_true.price);
+        row("CTMC Heston — deep cal",        ctmc_deep.price);
+
+        println!("  {}", "─".repeat(70));
+        println!("  Early exercise premium (Binomial):  ${:.4}", binom_american - binom_european);
+        println!("  Early exercise premium (PDE):       ${:.4}", pde_american   - bs_european);
+        println!("  Heston SV premium over ATM-BS:      ${:.4}", ctmc_true.price - bs_european);
+
+        println!("\n  {:<14} {:>10}  {:>12}  {:>10}  {:>9}",
+            "Param", "True", "Deep Cal", "Abs Err", "Rel Err");
+        println!("  {}", "─".repeat(60));
+
+        let param_row = |name: &str, t: f64, c: f64| {
+            let abs_e = (c - t).abs();
+            let rel_e = abs_e / t.abs() * 100.0;
+            println!("  {:<14} {:>10.4}  {:>12.4}  {:>10.4}  {:>8.1}%", name, t, c, abs_e, rel_e);
+        };
+
+        param_row("kappa",   true_kappa,   h.kappa);
+        param_row("theta",   true_theta,   h.v_bar);
+        param_row("sigma_v", true_sigma_v, h.sigma);
+        param_row("rho",     true_rho,     h.rho);
+        param_row("v0",      true_v0,      h.v0);
+        println!("  {}", "─".repeat(60));
+        println!("  Calibration IV-RMSE: {:.1} bps  ({} model evaluations)",
+            cal.ivrmse * 10000.0, cal.n_evals);
+
+        assert!(ctmc_deep.price > 0.0);
+        assert!(ctmc_deep.price < spot);
     }
 }
