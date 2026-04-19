@@ -1,544 +1,446 @@
-import { useState, useCallback, useEffect } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
-  StructureType,
-  Direction,
-  OptionType,
-  SpreadType,
-  ExoticType,
-  VolSource,
-  ExerciseStyle,
-  SpreadStrikes,
-  PriceRequest,
-  MarketDataResponse,
-  VolatilityResponse,
-  PriceResponse,
-  IVSmileData,
   CtmcPriceResponse,
+  Direction,
+  ExerciseStyle,
+  ExoticType,
+  IVSmileData,
+  MarketDataResponse,
+  OptionType,
+  PriceRequest,
+  PriceResponse,
+  SpreadStrikes,
+  SpreadType,
+  StructureType,
+  VolatilityResponse,
+  VolSource,
 } from "./types/index.ts";
 import {
   fetchMarketData,
-  fetchVolatility,
-  submitPricing,
-  submitCtmcPricing,
-  fetchPriceHistory,
   fetchOptionChain,
+  fetchPriceHistory,
   fetchSofr,
+  fetchVolatility,
+  submitCtmcPricing,
+  submitPricing,
   type PricePoint,
 } from "./api/client.ts";
 import { calculateTTM } from "./utils/ttm.ts";
-import { TickerSearch } from "./components/TickerSearch.tsx";
-import { MarketDataDisplay } from "./components/MarketDataDisplay.tsx";
-import { PriceChart } from "./components/PriceChart.tsx";
-import { StructureSelector } from "./components/StructureSelector.tsx";
-import { DirectionToggle } from "./components/DirectionToggle.tsx";
-import { ExerciseStyleToggle } from "./components/ExerciseStyleToggle.tsx";
-import { ManualOverrideToggle } from "./components/ManualOverrideToggle.tsx";
-import { SingleOptionForm } from "./components/inputs/SingleOptionForm.tsx";
+import { Sidebar, type TickerInfo } from "./design/Sidebar.tsx";
+import {
+  buildRows,
+  GreeksStrip,
+  HeroPrice,
+  PayoffPanel,
+  PriceChartPanel,
+  PricingRows,
+} from "./design/Center.tsx";
+import { PayoffChart } from "./design/Charts.tsx";
+import { MarketModal, RightPanel, type ModalTab } from "./design/MarketContext.tsx";
+import { TweaksPanel, TWEAK_DEFAULTS, type Tweaks } from "./design/TweaksPanel.tsx";
 import { SpreadForm } from "./components/inputs/SpreadForm.tsx";
 import { ExoticForm } from "./components/inputs/ExoticForm.tsx";
-import { VolatilityToggle } from "./components/VolatilityToggle.tsx";
-import { PricingTable } from "./components/PricingTable.tsx";
-import { PayoffDiagram } from "./components/PayoffDiagram.tsx";
-import { IVSmileChart } from "./components/IVSmileChart.tsx";
-import { OptionChainDisplay } from "./components/OptionChainDisplay.tsx";
-import { MonteCarloPathsChart } from "./components/MonteCarloPathsChart.tsx";
-import { Button } from "./components/ui/Button.tsx";
-import { Toggle } from "./components/ui/Toggle.tsx";
+import { calculatePayoffGrid } from "./utils/payoff.ts";
+
+function todayPlus(days: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
 export default function App() {
-  // Ticker state
-  const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
+  const [tweaks, setTweaks] = useState<Tweaks>(() => {
+    try { return { ...TWEAK_DEFAULTS, ...JSON.parse(localStorage.getItem("op-tweaks") || "{}") }; }
+    catch { return TWEAK_DEFAULTS; }
+  });
+  useEffect(() => { localStorage.setItem("op-tweaks", JSON.stringify(tweaks)); }, [tweaks]);
+  useEffect(() => { document.documentElement.setAttribute("data-theme", tweaks.theme); }, [tweaks.theme]);
 
-  // Market data state
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [marketData, setMarketData] = useState<MarketDataResponse | null>(null);
   const [volData, setVolData] = useState<VolatilityResponse | null>(null);
   const [priceHistory, setPriceHistory] = useState<PricePoint[]>([]);
-  const [ivSmileData, setIVSmileData] = useState<IVSmileData | null>(null);
+  const [smile, setSmile] = useState<IVSmileData | null>(null);
   const [marketLoading, setMarketLoading] = useState(false);
   const [marketError, setMarketError] = useState<string | null>(null);
 
-  // Structure state
-  const [structureType, setStructureType] = useState<StructureType>("single");
+  const [structure, setStructure] = useState<StructureType>("single");
   const [direction, setDirection] = useState<Direction>("long");
-  const [manualOverride, setManualOverride] = useState(false);
   const [exerciseStyle, setExerciseStyle] = useState<ExerciseStyle>("european");
-
-  // Single option state
-  const [singleValues, setSingleValues] = useState({
-    optionType: "call" as OptionType,
-    strike: "",
-    expirationDate: "",
-    spotPrice: "",
-    volatility: "",
-    riskFreeRate: "0.05",
-    dividendYield: "",
-  });
-
-  // Spread state
+  const [optionType, setOptionType] = useState<OptionType>("call");
+  const [strike, setStrike] = useState("100");
+  const [expirationDate, setExpirationDate] = useState(todayPlus(60));
+  const [spot, setSpot] = useState("100");
+  const [volatility, setVolatility] = useState("0.24");
+  const [riskFreeRate, setRiskFreeRate] = useState("4.75");
+  const [dividendYield, setDividendYield] = useState("0");
+  const [volSource, setVolSource] = useState<VolSource>("implied");
+  const [manualOverride, setManualOverride] = useState(false);
   const [spreadType, setSpreadType] = useState<SpreadType>("straddle");
   const [strikes, setStrikes] = useState<SpreadStrikes>({});
-  const [shortTermMaturity, setShortTermMaturity] = useState("");
-  const [longTermMaturity, setLongTermMaturity] = useState("");
-
-  // Exotic state
   const [exoticType, setExoticType] = useState<ExoticType>("convertible_bond");
   const [exoticValues, setExoticValues] = useState<Record<string, string>>({
     risk_free_rate: "0.05",
   });
 
-  // Volatility source
-  const [volSource, setVolSource] = useState<VolSource>("ema");
+  const [range, setRange] = useState<"1M" | "3M" | "6M" | "1Y">("3M");
+  const [modalOpen, setModalOpen] = useState(false);
+  const [modalTab, setModalTab] = useState<ModalTab>("history");
+  const [pinned, setPinned] = useState<{ price: number; method: string } | null>(null);
+  const [selectedMethod, setSelectedMethod] = useState<string | null>(null);
 
-  // Pricing state
-  const [priceResult, setPriceResult] = useState<PriceResponse | null>(null);
-  const [priceLoading, setPriceLoading] = useState(false);
+  const [result, setResult] = useState<PriceResponse | null>(null);
   const [priceError, setPriceError] = useState<string | null>(null);
-
-  // CTMC state
   const [ctmcResult, setCtmcResult] = useState<CtmcPriceResponse | null>(null);
   const [ctmcLoading, setCtmcLoading] = useState(false);
-  const [ctmcError, setCtmcError] = useState<string | null>(null);
 
-  // Recalculate when volatility source changes (if we have a previous result)
   useEffect(() => {
-    if (priceResult && !manualOverride) {
-      handleCalculate();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [volSource]);
-
-  // Fetch SOFR rate on app load
-  useEffect(() => {
-    const loadSofr = async () => {
-      try {
-        const sofrData = await fetchSofr();
-        console.log("SOFR rate loaded:", sofrData.rate);
-        setSingleValues((prev) => ({
-          ...prev,
-          riskFreeRate: sofrData.rate.toFixed(4),
-        }));
-      } catch (err) {
-        console.warn("SOFR fetch failed, using default 0.05:", err);
-        setSingleValues((prev) => ({
-          ...prev,
-          riskFreeRate: "0.05",
-        }));
-      }
-    };
-    loadSofr();
+    fetchSofr()
+      .then(r => setRiskFreeRate((r.rate * 100).toFixed(3)))
+      .catch(() => {});
   }, []);
 
-  const handleSearch = useCallback(async (symbol: string) => {
-    console.log("Searching for symbol:", symbol);
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") setModalOpen(false); };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, []);
+
+  const loadSymbol = useCallback(async (sym: string) => {
     setMarketLoading(true);
     setMarketError(null);
-    setSelectedTicker(symbol);
+    setSelectedSymbol(sym);
     try {
-      const [data, history, ivSmile] = await Promise.all([
-        fetchMarketData(symbol),
-        fetchPriceHistory(symbol, 90),
-        fetchOptionChain(symbol).catch((err) => {
-          console.warn("Option chain fetch failed:", err);
-          return null;
-        }),
+      const [data, history, chain] = await Promise.all([
+        fetchMarketData(sym),
+        fetchPriceHistory(sym, 365).catch(() => [] as PricePoint[]),
+        fetchOptionChain(sym).catch(() => null),
       ]);
-      console.log("Market data:", data);
-      console.log("Price history:", history);
-      console.log("IV Smile data:", ivSmile);
-
       setMarketData(data);
       setPriceHistory(history);
-      setIVSmileData(ivSmile);
-      setSingleValues((prev) => ({
-        ...prev,
-        spotPrice: data.spot_price.toFixed(2),
-        volatility: (
-          data.implied_volatility ?? data.historical_volatility
-        ).toFixed(4),
-        dividendYield: data.dividend_yield
-          ? (data.dividend_yield * 100).toFixed(2)
-          : "",
-      }));
-      // Fetch vol data in background
-      fetchVolatility(symbol).then(setVolData).catch((err) => {
-        console.warn("Volatility fetch failed:", err);
-      });
+      setSmile(chain);
+      setSpot(data.spot_price.toFixed(2));
+      const volToUse = data.implied_volatility ?? data.historical_volatility;
+      setVolatility(volToUse.toFixed(4));
+      setDividendYield(data.dividend_yield ? (data.dividend_yield * 100).toFixed(2) : "0");
+      setStrike(String(Math.round(data.spot_price)));
+      setStrikes({ strike: Math.round(data.spot_price) });
+      fetchVolatility(sym).then(setVolData).catch(() => setVolData(null));
     } catch (err) {
-      console.error("Search error:", err);
-      setMarketError(err instanceof Error ? err.message : "Failed to fetch data");
+      setMarketError(err instanceof Error ? err.message : "Failed to fetch market data");
     } finally {
       setMarketLoading(false);
     }
   }, []);
 
-  const handleSingleChange = useCallback((field: string, value: string) => {
-    setSingleValues((prev) => ({ ...prev, [field]: value }));
-  }, []);
+  const ticker: TickerInfo | null = useMemo(() => {
+    if (!marketData) return null;
+    return {
+      sym: marketData.symbol,
+      name: marketData.symbol,
+      spot: marketData.spot_price,
+      iv: marketData.implied_volatility,
+      hv: marketData.historical_volatility,
+      div: marketData.dividend_yield ?? 0,
+    };
+  }, [marketData]);
 
-  const handleExoticChange = useCallback((field: string, value: string) => {
-    setExoticValues((prev) => ({ ...prev, [field]: value }));
-  }, []);
+  const volDataForSidebar = useMemo(() => {
+    if (!volData && !marketData) return null;
+    return {
+      implied: volData?.implied ?? marketData?.implied_volatility ?? null,
+      historical: volData?.historical ?? marketData?.historical_volatility ?? null,
+      ema: volData?.ema ?? null,
+      vix_correlated: volData?.vix_correlated ?? null,
+    };
+  }, [volData, marketData]);
 
-  const handleMaturityChange = useCallback((field: string, value: string) => {
-    if (field === "shortTermMaturity") setShortTermMaturity(value);
-    else setLongTermMaturity(value);
-  }, []);
+  const effectiveVol = useMemo((): number => {
+    if (manualOverride) return parseFloat(volatility) || 0.2;
+    if (!volDataForSidebar) return parseFloat(volatility) || 0.2;
+    const v = volDataForSidebar[volSource];
+    return v ?? volDataForSidebar.historical ?? 0.2;
+  }, [manualOverride, volatility, volDataForSidebar, volSource]);
 
-  const getSelectedVol = useCallback((): number => {
-    if (!volData && !marketData) return parseFloat(singleValues.volatility) || 0;
-    if (volSource === "implied")
-      return volData?.implied ?? marketData?.implied_volatility ?? marketData?.historical_volatility ?? 0;
-    if (volSource === "historical")
-      return volData?.historical ?? marketData?.historical_volatility ?? 0;
-    if (volSource === "ema") return volData?.ema ?? volData?.historical ?? 0;
-    if (volSource === "vix_correlated")
-      return volData?.vix_correlated ?? volData?.historical ?? 0;
-    return 0;
-  }, [volData, marketData, volSource, singleValues.volatility]);
+  const bsArgs = useMemo(() => {
+    const S = parseFloat(spot) || marketData?.spot_price || 100;
+    const K = parseFloat(strike) || S;
+    const r = (parseFloat(riskFreeRate) || 5) / 100;
+    const q = (parseFloat(dividendYield) || 0) / 100;
+    const T = calculateTTM(expirationDate) || 0.25;
+    return { S, K, r, q, sigma: effectiveVol, T, type: optionType };
+  }, [spot, strike, riskFreeRate, dividendYield, expirationDate, effectiveVol, optionType, marketData]);
 
-  const getCurrentRequest = useCallback((): PriceRequest | null => {
-    if (!priceResult) return null;
-
+  const buildRequest = useCallback((): PriceRequest | null => {
     try {
-      const vol = manualOverride
-        ? parseFloat(singleValues.volatility) || 0.2
-        : getSelectedVol() || 0.2;
+      const vol = effectiveVol;
+      const S = bsArgs.S;
+      const r = bsArgs.r;
+      const q = bsArgs.q;
+      const T = bsArgs.T;
 
-      if (structureType === "single") {
-        const ttm = singleValues.expirationDate
-          ? calculateTTM(singleValues.expirationDate)
-          : 0.25;
-        const spot = parseFloat(singleValues.spotPrice) || marketData?.spot_price || 100;
-        const strike = parseFloat(singleValues.strike) || spot;
-        const rfr = parseFloat(singleValues.riskFreeRate) || 0.05;
-        const divStr = singleValues.dividendYield.trim();
-        const div = divStr ? parseFloat(divStr) / 100 : null;
-
+      if (structure === "single") {
+        const K = parseFloat(strike);
+        if (!S || !K || T <= 0) return null;
         return {
           structure_type: "single",
-          option_type: singleValues.optionType,
+          option_type: optionType,
           direction,
-          strike_price: strike,
-          spot_price: spot,
+          strike_price: K,
+          spot_price: S,
           volatility: vol,
-          risk_free_rate: rfr,
-          time_to_maturity: ttm,
-          dividend_yield: div,
+          risk_free_rate: r,
+          time_to_maturity: T,
+          dividend_yield: q || null,
         };
-      } else if (structureType === "spread") {
-        const spot = parseFloat(singleValues.spotPrice) || marketData?.spot_price || 100;
-        const rfr = parseFloat(singleValues.riskFreeRate) || 0.05;
-        const ttm = singleValues.expirationDate
-          ? calculateTTM(singleValues.expirationDate)
-          : 0.25;
-        const divStr = singleValues.dividendYield.trim();
-        const div = divStr ? parseFloat(divStr) / 100 : null;
+      }
 
+      if (structure === "spread") {
         return {
           structure_type: "spread",
           spread_type: spreadType,
           direction,
-          spot_price: spot,
+          spot_price: S,
           volatility: vol,
-          risk_free_rate: rfr,
-          time_to_maturity: ttm,
-          dividend_yield: div,
+          risk_free_rate: r,
+          time_to_maturity: T,
+          dividend_yield: q || null,
           strikes,
-          short_term_maturity: shortTermMaturity
-            ? parseFloat(shortTermMaturity)
-            : undefined,
-          long_term_maturity: longTermMaturity
-            ? parseFloat(longTermMaturity)
-            : undefined,
         };
       }
+
+      if (exoticType === "convertible_bond") {
+        return {
+          structure_type: "exotic",
+          exotic_type: "convertible_bond",
+          face_value: 1000,
+          coupon_rate: 0.05,
+          maturity: 5,
+          payment_frequency: 2,
+          credit_spread: 0.02,
+          conversion_price: 50,
+          stock_price: S,
+          volatility: vol,
+          time_to_maturity: T || 5,
+          risk_free_rate: r,
+          dividend_yield: q || null,
+        };
+      }
+      return {
+        structure_type: "exotic",
+        exotic_type: "chooser_option",
+        spot_price: S,
+        strike_price: parseFloat(strike) || S,
+        volatility: vol,
+        risk_free_rate: r,
+        time_to_maturity: T || 1,
+        dividend_yield: q || null,
+        choose_time: T * 0.5,
+      };
     } catch {
       return null;
     }
+  }, [structure, optionType, direction, strike, bsArgs, effectiveVol, spreadType, strikes, exoticType]);
 
-    return null;
-  }, [
-    priceResult, manualOverride, singleValues, getSelectedVol, structureType,
-    direction, marketData, spreadType, strikes, shortTermMaturity, longTermMaturity,
-  ]);
+  useEffect(() => {
+    const req = buildRequest();
+    if (!req) { setResult(null); return; }
+    const id = setTimeout(() => {
+      submitPricing(req)
+        .then(r => { setResult(r); setPriceError(null); })
+        .catch(err => setPriceError(err instanceof Error ? err.message : "Pricing failed"));
+    }, 150);
+    return () => clearTimeout(id);
+  }, [buildRequest]);
 
-  const handleCtmcCalculate = useCallback(async () => {
-    if (!selectedTicker || structureType !== "single") return;
-
-    const ttm = singleValues.expirationDate
-      ? calculateTTM(singleValues.expirationDate)
-      : 0.25;
-    const strike = parseFloat(singleValues.strike);
-    const rfr = parseFloat(singleValues.riskFreeRate) || 0.05;
-    const divStr = singleValues.dividendYield.trim();
-    const div = divStr ? parseFloat(divStr) / 100 : null;
-
-    if (!strike || isNaN(strike)) {
-      setCtmcError("Strike price is required.");
+  useEffect(() => {
+    if (structure !== "single" || exerciseStyle !== "american" || !selectedSymbol) {
+      setCtmcResult(null);
       return;
     }
-    if (ttm <= 0) {
-      setCtmcError("Expiration date must be in the future.");
-      return;
-    }
+    const K = parseFloat(strike);
+    const T = bsArgs.T;
+    if (!K || T <= 0) { setCtmcResult(null); return; }
 
     setCtmcLoading(true);
-    setCtmcError(null);
-    setCtmcResult(null);
-
-    try {
-      const result = await submitCtmcPricing({
-        symbol: selectedTicker,
-        option_type: singleValues.optionType,
+    const id = setTimeout(() => {
+      submitCtmcPricing({
+        symbol: selectedSymbol,
+        option_type: optionType,
         direction,
-        strike_price: strike,
-        time_to_maturity: ttm,
-        risk_free_rate: rfr,
-        dividend_yield: div,
-      });
-      setCtmcResult(result);
-    } catch (err) {
-      setCtmcError(err instanceof Error ? err.message : "CTMC pricing failed");
-    } finally {
-      setCtmcLoading(false);
+        strike_price: K,
+        time_to_maturity: T,
+        risk_free_rate: bsArgs.r,
+        dividend_yield: bsArgs.q || null,
+      })
+        .then(setCtmcResult)
+        .catch(() => setCtmcResult(null))
+        .finally(() => setCtmcLoading(false));
+    }, 500);
+    return () => { clearTimeout(id); setCtmcLoading(false); };
+  }, [selectedSymbol, structure, exerciseStyle, optionType, direction, strike, bsArgs.T, bsArgs.r, bsArgs.q]);
+
+  const rows = useMemo(
+    () => buildRows(result, exerciseStyle, ctmcResult, ctmcLoading),
+    [result, exerciseStyle, ctmcResult, ctmcLoading]
+  );
+
+  const defaultId = useMemo(() => {
+    if (exerciseStyle === "american") return "bin_am";
+    return "bs";
+  }, [exerciseStyle]);
+
+  const activeId = useMemo(() => {
+    if (selectedMethod && rows.some(r => r.id === selectedMethod && !r.loading && r.price != null)) {
+      return selectedMethod;
     }
-  }, [selectedTicker, structureType, singleValues, direction]);
+    return defaultId;
+  }, [selectedMethod, rows, defaultId]);
 
-  const handleCalculate = useCallback(async () => {
-    setPriceLoading(true);
-    setPriceError(null);
+  const heroPrimary = useMemo(() => {
+    if (!rows.length) return null;
+    const r = rows.find(x => x.id === activeId) ?? rows[0];
+    return { method: `${r.method} · ${r.sub}`, price: r.price, ms: r.ms };
+  }, [rows, activeId]);
 
-    try {
-      let request: PriceRequest;
-      const vol = manualOverride
-        ? parseFloat(singleValues.volatility) || 0.2
-        : getSelectedVol() || 0.2;
+  const heroSecondary = useMemo(() => {
+    return rows
+      .filter(r => r.id !== activeId && !r.loading && r.price != null && !r.dim)
+      .slice(0, 3)
+      .map(r => ({ method: r.method, price: r.price }));
+  }, [rows, activeId]);
 
-      if (structureType === "single") {
-        const ttm = singleValues.expirationDate
-          ? calculateTTM(singleValues.expirationDate)
-          : 0.25;
-        const spot = parseFloat(singleValues.spotPrice) || marketData?.spot_price;
-        const strike = parseFloat(singleValues.strike);
-        const rfr = parseFloat(singleValues.riskFreeRate) || 0.05;
-        const divStr = singleValues.dividendYield.trim();
-        const div = divStr ? parseFloat(divStr) / 100 : null;
-
-        if (!spot || isNaN(spot)) {
-          throw new Error("Spot price is required. Search for a ticker or enter manually.");
-        }
-        if (!strike || isNaN(strike)) {
-          throw new Error("Strike price is required.");
-        }
-        if (ttm <= 0) {
-          throw new Error("Expiration date must be in the future.");
-        }
-
-        request = {
-          structure_type: "single",
-          option_type: singleValues.optionType,
-          direction,
-          strike_price: strike,
-          spot_price: spot,
-          volatility: vol,
-          risk_free_rate: rfr,
-          time_to_maturity: ttm,
-          dividend_yield: div,
-        };
-      } else if (structureType === "spread") {
-        const spot = parseFloat(singleValues.spotPrice) || marketData?.spot_price || 100;
-        const rfr = parseFloat(singleValues.riskFreeRate) || 0.05;
-        const ttm = singleValues.expirationDate
-          ? calculateTTM(singleValues.expirationDate)
-          : 0.25;
-        const divStr = singleValues.dividendYield.trim();
-        const div = divStr ? parseFloat(divStr) / 100 : null;
-
-        request = {
-          structure_type: "spread",
-          spread_type: spreadType,
-          direction,
-          spot_price: spot,
-          volatility: vol,
-          risk_free_rate: rfr,
-          time_to_maturity: ttm,
-          dividend_yield: div,
-          strikes,
-          short_term_maturity: shortTermMaturity
-            ? parseFloat(shortTermMaturity)
-            : undefined,
-          long_term_maturity: longTermMaturity
-            ? parseFloat(longTermMaturity)
-            : undefined,
-        };
-      } else {
-        if (exoticType === "convertible_bond") {
-          request = {
-            structure_type: "exotic",
-            exotic_type: "convertible_bond",
-            face_value: parseFloat(exoticValues.face_value || "1000"),
-            coupon_rate: parseFloat(exoticValues.coupon_rate || "0.05"),
-            maturity: parseFloat(exoticValues.maturity || "5"),
-            payment_frequency: parseInt(exoticValues.payment_frequency || "2"),
-            credit_spread: parseFloat(exoticValues.credit_spread || "0.02"),
-            conversion_price: parseFloat(exoticValues.conversion_price || "50"),
-            stock_price: parseFloat(
-              exoticValues.stock_price ||
-              singleValues.spotPrice ||
-              "100"
-            ),
-            volatility: vol,
-            time_to_maturity: parseFloat(
-              exoticValues.time_to_maturity || "5"
-            ),
-            risk_free_rate: parseFloat(
-              exoticValues.risk_free_rate || "0.05"
-            ),
-            dividend_yield: exoticValues.dividend_yield
-              ? parseFloat(exoticValues.dividend_yield)
-              : null,
-          };
-        } else {
-          request = {
-            structure_type: "exotic",
-            exotic_type: "chooser_option",
-            spot_price: parseFloat(
-              exoticValues.spot_price ||
-              singleValues.spotPrice ||
-              "100"
-            ),
-            strike_price: parseFloat(exoticValues.strike_price || "100"),
-            volatility: vol,
-            risk_free_rate: parseFloat(
-              exoticValues.risk_free_rate || "0.05"
-            ),
-            time_to_maturity: parseFloat(
-              exoticValues.time_to_maturity || "1"
-            ),
-            dividend_yield: exoticValues.dividend_yield
-              ? parseFloat(exoticValues.dividend_yield)
-              : null,
-            choose_time: parseFloat(exoticValues.choose_time || "0.5"),
-          };
-        }
-      }
-
-      const result = await submitPricing(request);
-      setPriceResult(result);
-    } catch (err) {
-      setPriceError(
-        err instanceof Error ? err.message : "Pricing failed"
-      );
-    } finally {
-      setPriceLoading(false);
+  const pinCurrent = () => {
+    if (heroPrimary?.price != null) {
+      setPinned({ price: heroPrimary.price, method: heroPrimary.method });
     }
+  };
 
-    if (selectedTicker && structureType === "single" && exerciseStyle === "american") {
-      handleCtmcCalculate();
-    }
-  }, [
-    structureType, direction, singleValues, manualOverride, getSelectedVol,
-    marketData, spreadType, strikes, shortTermMaturity,
-    longTermMaturity, exoticType, exoticValues, selectedTicker, handleCtmcCalculate,
-  ]);
+  const handleExoticChange = (field: string, value: string) => {
+    setExoticValues(prev => ({ ...prev, [field]: value }));
+  };
+
+  const payoffData = useMemo(() => {
+    if (!result) return null;
+    const req = buildRequest();
+    if (!req) return null;
+    return calculatePayoffGrid(req, result);
+  }, [result, buildRequest]);
+
+  const lastClose = priceHistory[priceHistory.length - 1]?.price;
+  const prevClose = priceHistory[priceHistory.length - 2]?.price;
+  const dayChg = lastClose && prevClose ? (lastClose - prevClose) / prevClose : 0;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-white">
-      <div className="max-w-5xl mx-auto px-4 py-8">
-        <h1 className="text-3xl font-bold text-center mb-2">Options Pricer</h1>
-        <p className="text-slate-400 text-center text-sm mb-8">
-          Multi-method pricing engine for options, spreads, and exotics
-        </p>
-
-        {/* Ticker Search */}
-        <section className="mb-6">
-          <TickerSearch
-            loading={marketLoading}
-            onSearch={handleSearch}
-          />
-          {marketError && (
-            <p className="text-red-400 text-sm mt-2">{marketError}</p>
-          )}
-        </section>
-
-        {/* Price Chart */}
-        <section className="mb-6">
-          <PriceChart
-            data={priceHistory}
-            ticker={selectedTicker}
-            currentPrice={marketData?.spot_price}
-            loading={marketLoading}
-          />
-        </section>
-
-
-
-        {/* Structure Selection */}
-        <section className="mb-6 space-y-4">
-          <div className="flex items-center gap-4 flex-wrap">
-            <StructureSelector
-              selected={structureType}
-              onChange={setStructureType}
-            />
-            {structureType !== "exotic" && (
-              <DirectionToggle direction={direction} onChange={setDirection} />
+    <div className="app">
+      <div className="topbar">
+        <div className="brand">
+          <div className="brand-mark">∫</div>
+          <span>Options Pricer</span>
+        </div>
+        <div className="topbar-sep"></div>
+        {ticker && (
+          <div className="topbar-meta">
+            <span><strong>{ticker.sym}</strong></span>
+            {lastClose != null && <span className="tnum">${lastClose.toFixed(2)}</span>}
+            {lastClose != null && prevClose != null && (
+              <span className="tnum" style={{ color: dayChg >= 0 ? "var(--accent)" : "var(--loss)" }}>
+                {dayChg >= 0 ? "+" : ""}{(dayChg * 100).toFixed(2)}%
+              </span>
             )}
-            {structureType !== "exotic" && (
-              <ExerciseStyleToggle
-                style={exerciseStyle}
-                onChange={setExerciseStyle}
-              />
-            )}
-            <ManualOverrideToggle
-              enabled={manualOverride}
-              onChange={setManualOverride}
-            />
+            <span>σ={(effectiveVol * 100).toFixed(1)}%</span>
+            <span>T={bsArgs.T.toFixed(3)}y</span>
+            <span>r={(bsArgs.r * 100).toFixed(2)}%</span>
           </div>
+        )}
+        <div className="topbar-right">
+          <button
+            className="icon-btn"
+            onClick={() => setTweaks({ ...tweaks, theme: tweaks.theme === "dark" ? "light" : "dark" })}
+          >
+            {tweaks.theme === "dark" ? "☾ Dark" : "☼ Light"}
+          </button>
+          <button
+            className="icon-btn"
+            onClick={() => { setModalTab("smile"); setModalOpen(true); }}
+            disabled={!ticker}
+          >
+            Market context ↗
+          </button>
+          <button
+            className="icon-btn primary"
+            onClick={pinCurrent}
+            disabled={heroPrimary?.price == null}
+          >
+            Pin snapshot
+          </button>
+        </div>
+      </div>
 
-          {/* Dynamic Form */}
-          <div className="bg-slate-900 rounded-lg p-6 border border-slate-800">
-            {structureType === "single" && (
-              <SingleOptionForm
-                values={singleValues}
-                onChange={handleSingleChange}
-                manualOverride={manualOverride}
+      <div className="main" data-density={tweaks.density} data-rightpanel={tweaks.rightPanel}>
+        <Sidebar
+          ticker={ticker}
+          onSelectTicker={loadSymbol}
+          loadingTicker={marketLoading}
+          structure={structure}
+          setStructure={setStructure}
+          direction={direction}
+          setDirection={setDirection}
+          exerciseStyle={exerciseStyle}
+          setExerciseStyle={setExerciseStyle}
+          optionType={optionType}
+          setOptionType={setOptionType}
+          strike={strike}
+          setStrike={setStrike}
+          expirationDate={expirationDate}
+          setExpirationDate={setExpirationDate}
+          spot={spot}
+          setSpot={setSpot}
+          volatility={volatility}
+          setVolatility={setVolatility}
+          riskFreeRate={riskFreeRate}
+          setRiskFreeRate={setRiskFreeRate}
+          dividendYield={dividendYield}
+          setDividendYield={setDividendYield}
+          volSource={volSource}
+          setVolSource={setVolSource}
+          volData={volDataForSidebar}
+          manualOverride={manualOverride}
+          setManualOverride={setManualOverride}
+          spreadType={spreadType}
+          setSpreadType={setSpreadType}
+          strikes={strikes}
+          setStrikes={setStrikes}
+          exoticType={exoticType}
+          setExoticType={setExoticType}
+        />
+
+        <div className="col center">
+          <PriceChartPanel
+            tickerSym={ticker?.sym ?? null}
+            history={priceHistory}
+            range={range}
+            setRange={setRange}
+          />
+
+          {marketError && (
+            <div className="empty" style={{ color: "var(--loss)" }}>{marketError}</div>
+          )}
+
+          {structure === "spread" && (
+            <div style={{ padding: "14px", borderBottom: "1px solid var(--border)" }}>
+              <SpreadForm
+                spreadType={spreadType}
+                onSpreadTypeChange={setSpreadType}
+                strikes={strikes}
+                onStrikesChange={setStrikes}
+                showTypeSelector={true}
               />
-            )}
-            {structureType === "spread" && (
-              <div className="grid grid-cols-1 md:grid-cols-[40%_60%] gap-4">
-                <div className="space-y-4">
-                  <SpreadForm
-                    spreadType={spreadType}
-                    onSpreadTypeChange={setSpreadType}
-                    strikes={strikes}
-                    onStrikesChange={setStrikes}
-                    shortTermMaturity={shortTermMaturity}
-                    longTermMaturity={longTermMaturity}
-                    onMaturityChange={handleMaturityChange}
-                    showTypeSelector={true}
-                  />
-                  <SingleOptionForm
-                    values={singleValues}
-                    onChange={handleSingleChange}
-                    manualOverride={manualOverride}
-                    isSpread={true}
-                  />
-                </div>
-                <div>
-                  <SpreadForm
-                    spreadType={spreadType}
-                    onSpreadTypeChange={setSpreadType}
-                    strikes={strikes}
-                    onStrikesChange={setStrikes}
-                    shortTermMaturity={shortTermMaturity}
-                    longTermMaturity={longTermMaturity}
-                    onMaturityChange={handleMaturityChange}
-                    showTypeSelector={false}
-                  />
-                </div>
-              </div>
-            )}
-            {structureType === "exotic" && (
+            </div>
+          )}
+
+          {structure === "exotic" && (
+            <div style={{ padding: "14px", borderBottom: "1px solid var(--border)" }}>
               <ExoticForm
                 exoticType={exoticType}
                 onExoticTypeChange={setExoticType}
@@ -546,106 +448,92 @@ export default function App() {
                 onChange={handleExoticChange}
                 manualOverride={manualOverride}
               />
-            )}
-          </div>
-        </section>
-
-        {/* Calculate Button */}
-        <section className="mb-8 text-center space-y-3">
-          <Button onClick={handleCalculate} loading={priceLoading}>
-            Calculate Prices
-          </Button>
-          {priceError && (
-            <p className="text-red-400 text-sm mt-2">{priceError}</p>
+            </div>
           )}
-        </section>
 
-        {/* Pricing Results */}
-        {(priceResult || priceLoading || ctmcResult || ctmcLoading || ctmcError) && (
-          <section className="mb-8">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-semibold">Pricing Results</h2>
-              <VolatilityToggle
-                source={volSource}
-                onChange={setVolSource}
-                volData={volData}
+          {structure === "single" && heroPrimary && tweaks.emphasis === "hero" && (
+            <HeroPrice
+              label={`${direction === "long" ? "Long" : "Short"} · ${optionType.toUpperCase()} · ${exerciseStyle}`}
+              primary={heroPrimary}
+              secondary={heroSecondary}
+              ctmc={ctmcResult}
+              pinned={pinned}
+              onPin={pinCurrent}
+              onClearPin={() => setPinned(null)}
+            />
+          )}
+
+          {result && rows.length > 0 && (
+            <div className="results">
+              <div className="results-head">
+                <div>
+                  <div className="results-title">Pricing methods</div>
+                  <div className="results-meta mono">
+                    <span>σ {(effectiveVol * 100).toFixed(2)}% ({manualOverride ? "manual" : volSource})</span>
+                    <span>S ${bsArgs.S.toFixed(2)}</span>
+                    <span>K ${bsArgs.K.toFixed(2)}</span>
+                    <span>T {bsArgs.T.toFixed(3)}y</span>
+                  </div>
+                </div>
+              </div>
+              <PricingRows
+                rows={rows}
+                selectedId={activeId}
+                onSelect={setSelectedMethod}
+                emphasis={tweaks.emphasis}
               />
             </div>
-            <PricingTable
-              result={priceResult}
-              loading={priceLoading}
-              exerciseStyle={structureType === "exotic" ? "european" : exerciseStyle}
-              ctmcResult={ctmcResult}
-              ctmcLoading={ctmcLoading}
-              ctmcError={ctmcError}
-            />
-          </section>
-        )}
+          )}
 
-        {/* Payoff Diagram */}
-        {(priceResult || priceLoading) && (
-          <section className="mb-8">
-            <PayoffDiagram
-              request={getCurrentRequest()}
-              priceResult={priceResult}
-              loading={priceLoading}
-            />
-          </section>
-        )}
+          {priceError && !result && (
+            <div className="empty" style={{ color: "var(--loss)" }}>{priceError}</div>
+          )}
 
-        {/* Monte Carlo Paths Visualization - Temporarily hidden as it's WIP */}
-        {false && priceResult?.pricing.monte_carlo && structureType === "single" && (
-          <section className="mb-8">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-semibold">Monte Carlo Simulation</h2>
-              <Toggle
-                label="Show Paths"
-                checked={showMonteCarlo}
-                onChange={setShowMonteCarlo}
-              />
+          {(structure === "single" || structure === "spread") && result?.greeks && (
+            <GreeksStrip greeks={result.greeks} bsArgs={bsArgs} />
+          )}
+
+          {structure === "single" && result && heroPrimary?.price != null && (
+            <PayoffPanel
+              bsArgs={bsArgs}
+              direction={direction}
+              premium={heroPrimary.price}
+            />
+          )}
+
+          {(structure === "spread" || structure === "exotic") && payoffData && payoffData.length > 0 && (
+            <div className="payoff">
+              <div className="payoff-head">
+                <span style={{ fontSize: 11, color: "var(--fg-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
+                  Payoff at expiry
+                </span>
+              </div>
+              <PayoffChart data={payoffData} height={160} strike={bsArgs.K} spot={bsArgs.S} />
             </div>
-            {showMonteCarlo && (
-              <MonteCarloPathsChart
-                mcResult={priceResult!.pricing.monte_carlo ?? null}
-                spotPrice={parseFloat(singleValues.spotPrice) || marketData?.spot_price || 100}
-                timeToMaturity={
-                  singleValues.expirationDate
-                    ? calculateTTM(singleValues.expirationDate)
-                    : 0.25
-                }
-              />
-            )}
-          </section>
-        )}
+          )}
+        </div>
 
-        {/* Market Data Display */}
-        {marketData && (
-          <section className="mb-6">
-            <MarketDataDisplay data={marketData} />
-          </section>
-        )}
-
-        {/* IV Smile Chart */}
-        {ivSmileData && (
-          <section className="mb-6">
-            <IVSmileChart
-              data={ivSmileData}
-              loading={marketLoading}
-              underlyingPrice={marketData?.spot_price ?? null}
-            />
-          </section>
-        )}
-
-        {/* Option Chain Display */}
-        {ivSmileData && (
-          <section className="mb-6">
-            <OptionChainDisplay
-              data={ivSmileData}
-              underlyingPrice={marketData?.spot_price ?? null}
-            />
-          </section>
+        {tweaks.rightPanel === "visible" && (
+          <RightPanel
+            ticker={ticker}
+            history={priceHistory}
+            smile={smile}
+            onOpenModal={(tab) => { setModalTab(tab); setModalOpen(true); }}
+          />
         )}
       </div>
+
+      <MarketModal
+        open={modalOpen}
+        tab={modalTab}
+        setTab={setModalTab}
+        onClose={() => setModalOpen(false)}
+        ticker={ticker}
+        history={priceHistory}
+        smile={smile}
+      />
+
+      <TweaksPanel tweaks={tweaks} setTweaks={setTweaks} />
     </div>
   );
 }

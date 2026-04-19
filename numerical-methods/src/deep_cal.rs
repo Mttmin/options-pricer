@@ -58,7 +58,10 @@ pub const NK: usize = 49;
 pub const NT: usize = 14;
 pub const N_FLAT: usize = NK * NT; // 686
 pub const N_PARAMS: usize = 5;     // Calibrated params: kappa, theta, sigma, rho, v0
-const N_MODEL_INPUTS: usize = N_PARAMS + 1; // +1 for carry (r-q), fixed market observable
+// Layout: [kappa, theta, sigma_v, rho, v0, r_norm, q_norm]
+// r and q are independently normalised market inputs (not combined carry).
+// Matches BatesDataset 7-dim output and train.py n_params=7.
+const N_MODEL_INPUTS: usize = N_PARAMS + 2; // +2 for r and q (independent market inputs)
 
 /// Maturity grid in years (14 points).
 pub const MATURITIES: [f32; NT] = [
@@ -105,23 +108,47 @@ const PARAM_LO: [f32; N_PARAMS] = [0.50, 0.02, 0.10, -0.95, 0.02];
 /// Physical upper bounds: [kappa, theta, sigma_v, rho, v0]
 const PARAM_HI: [f32; N_PARAMS] = [6.00, 0.10, 0.90, -0.20, 0.10];
 
-/// Carry (r−q) bounds — derived from R_BOUNDS/Q_BOUNDS in heston_datagen.py.
-const CARRY_LO: f32 = -0.04; // min(r) - max(q) = 0.00 - 0.04
-const CARRY_HI: f32 =  0.06; // max(r) - min(q) = 0.06 - 0.00
+/// Risk-free rate bounds — from R_BOUNDS in heston_datagen.py.
+const R_LO: f32 = 0.00;
+const R_HI: f32 = 0.06;
+/// Dividend yield bounds — from Q_BOUNDS in heston_datagen.py.
+const Q_LO: f32 = 0.00;
+const Q_HI: f32 = 0.04;
 
-/// Normalise carry (r−q) to [0,1] for ONNX input.
-fn normalise_carry(carry: f32) -> f32 {
-    (carry - CARRY_LO) / (CARRY_HI - CARRY_LO)
+/// Normalise risk-free rate to [0,1] for ONNX input slot 5.
+fn normalise_r(r: f32) -> f32 {
+    (r - R_LO) / (R_HI - R_LO)
 }
 
-/// Extract carry = r−q from a `CalibrationDataset`.
-/// r and q are market-level observables, identical across instruments.
-fn dataset_carry(dataset: &CalibrationDataset) -> f32 {
-    dataset
-        .instruments
-        .first()
-        .map(|i| (i.risk_free_rate - i.dividend_yield) as f32)
-        .unwrap_or(0.0)
+/// Normalise dividend yield to [0,1] for ONNX input slot 6.
+fn normalise_q(q: f32) -> f32 {
+    (q - Q_LO) / (Q_HI - Q_LO)
+}
+
+/// Extract (r, q) from a `CalibrationDataset`.
+/// All instruments must share the same risk-free rate and dividend yield;
+/// mismatched rates indicate a dataset construction error.
+fn dataset_rq(dataset: &CalibrationDataset) -> (f32, f32) {
+    let first = match dataset.instruments.first() {
+        Some(i) => i,
+        None => return (0.0, 0.0),
+    };
+    let (r0, q0) = (first.risk_free_rate, first.dividend_yield);
+    for ins in &dataset.instruments {
+        debug_assert!(
+            (ins.risk_free_rate - r0).abs() < 1e-4,
+            "inconsistent risk_free_rate across instruments: {} vs {}",
+            ins.risk_free_rate,
+            r0
+        );
+        debug_assert!(
+            (ins.dividend_yield - q0).abs() < 1e-4,
+            "inconsistent dividend_yield across instruments: {} vs {}",
+            ins.dividend_yield,
+            q0
+        );
+    }
+    (r0 as f32, q0 as f32)
 }
 
 fn normalise(phys: &[f32; N_PARAMS]) -> [f32; N_PARAMS] {
@@ -263,15 +290,17 @@ impl BatesCalibrator {
     /// and confidence (from IDW interpolation). Zero-weight cells are excluded
     /// from the loss.
     ///
-    /// * `iv_market`  – `[f32; 686]` flat IV surface (NK×NT, strike-major).
-    /// * `weights`    – `[f32; 686]` per-cell weights; 0.0 = excluded.
-    /// * `carry_norm` – normalised carry (r−q) ∈ [0,1]; use `normalise_carry(r-q)`.
+    /// * `iv_market` – `[f32; 686]` flat IV surface (NK×NT, strike-major).
+    /// * `weights`   – `[f32; 686]` per-cell weights; 0.0 = excluded.
+    /// * `r_norm`    – risk-free rate normalised to [0,1] via `normalise_r(r)`.
+    /// * `q_norm`    – dividend yield normalised to [0,1] via `normalise_q(q)`.
     /// * `n_restarts` – number of independent LM restarts (≥1).
     pub fn calibrate_with_weights(
         &mut self,
         iv_market: &[f32; N_FLAT],
         weights: &[f32; N_FLAT],
-        carry_norm: f32,
+        r_norm: f32,
+        q_norm: f32,
         n_restarts: usize,
         config: &CalibrationConfig,
     ) -> ort::Result<DeepCalibrationResult> {
@@ -282,7 +311,7 @@ impl BatesCalibrator {
 
         for seed in &seeds {
             let (theta, iv_loss, evals) =
-                self.levenberg_marquardt(seed, carry_norm, iv_market, weights, config)?;
+                self.levenberg_marquardt(seed, r_norm, q_norm, iv_market, weights, config)?;
             total_evals += evals;
             let rmse = iv_loss.sqrt();
             if best.as_ref().map_or(true, |b| rmse < b.0) {
@@ -302,8 +331,8 @@ impl BatesCalibrator {
 
     /// Convenience wrapper: builds weights from mask (uniform confidence = 1.0).
     ///
-    /// `carry` is the market-level r−q in physical units (e.g. 0.05 − 0.02 = 0.03).
-    /// It is normalised internally before being passed to the ONNX model.
+    /// `r` and `q` are the market-level rates in physical units (e.g. r=0.05, q=0.02).
+    /// They are normalised internally before being passed to the ONNX model.
     ///
     /// Prefer `calibrate_with_weights` when per-cell confidence information is
     /// available (e.g. from `build_iv_surface`).
@@ -311,23 +340,25 @@ impl BatesCalibrator {
         &mut self,
         iv_market: &[f32; N_FLAT],
         mask: &[bool; N_FLAT],
-        carry: f32,
+        r: f32,
+        q: f32,
         n_restarts: usize,
         config: &CalibrationConfig,
     ) -> ort::Result<DeepCalibrationResult> {
         let confidence = [1.0f32; N_FLAT];
         let weights = build_weights(iv_market, mask, &confidence, config.moneyness_weight_sigma);
-        self.calibrate_with_weights(iv_market, &weights, normalise_carry(carry), n_restarts, config)
+        self.calibrate_with_weights(iv_market, &weights, normalise_r(r), normalise_q(q), n_restarts, config)
     }
 
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
 
-    fn forward(&mut self, theta_norm: &[f32; N_PARAMS], carry_norm: f32) -> ort::Result<[f32; N_FLAT]> {
+    fn forward(&mut self, theta_norm: &[f32; N_PARAMS], r_norm: f32, q_norm: f32) -> ort::Result<[f32; N_FLAT]> {
         let mut inputs = [0f32; N_MODEL_INPUTS];
         inputs[..N_PARAMS].copy_from_slice(theta_norm);
-        inputs[N_PARAMS] = carry_norm;
+        inputs[N_PARAMS]     = r_norm;
+        inputs[N_PARAMS + 1] = q_norm;
         let tensor = Tensor::from_array(([1usize, N_MODEL_INPUTS], inputs.to_vec()))?;
         let outputs = self.session.run(ort::inputs!["parameters" => tensor])?;
         let (_shape, slice) = outputs["iv_surface"].try_extract_tensor::<f32>()?;
@@ -348,13 +379,21 @@ impl BatesCalibrator {
     fn levenberg_marquardt(
         &mut self,
         init: &[f32; N_PARAMS],
-        carry_norm: f32,
+        r_norm: f32,
+        q_norm: f32,
         iv_market: &[f32; N_FLAT],
         weights: &[f32; N_FLAT],
         config: &CalibrationConfig,
     ) -> ort::Result<([f32; N_PARAMS], f32, usize)> {
-        const MAX_ITERS: usize = 50;
-        const EPS: f32 = 1e-4;      // finite-difference step in normalised space
+        const MAX_ITERS: usize = 80;
+        // Per-parameter FD step in normalised [0,1] space.
+        // κ has a much flatter IV landscape than other params (diagnostics: only
+        // 84 bps sensitivity range across the full training interval), so it needs
+        // a larger step to estimate a meaningful Jacobian column.  Other params
+        // have 200–1000 bps range and do fine with the default 1e-4.
+        const EPS_DEFAULT: f32 = 1e-4;
+        const EPS_KAPPA:   f32 = 8e-4;  // index 0; larger step for flat κ landscape
+        let eps_per_param: [f32; N_PARAMS] = [EPS_KAPPA, EPS_DEFAULT, EPS_DEFAULT, EPS_DEFAULT, EPS_DEFAULT];
         const DAMP_INIT: f32 = 1e-2;
         const DAMP_UP: f32 = 10.0;
         const DAMP_DOWN: f32 = 0.33;
@@ -372,7 +411,7 @@ impl BatesCalibrator {
         };
 
         let mut theta = clamp(*init);
-        let mut iv_pred = self.forward(&theta, carry_norm)?;
+        let mut iv_pred = self.forward(&theta, r_norm, q_norm)?;
         let mut cost = lm_cost(&iv_pred, iv_market, weights, &theta, &prior, reg_w);
         let mut damping = DAMP_INIT;
         let mut n_evals = 1usize;
@@ -392,13 +431,14 @@ impl BatesCalibrator {
 
             for j in 0..N_PARAMS {
                 let mut th_b = theta;
-                let step = if theta[j] + EPS <= 1.0 { EPS } else { -EPS };
+                let eps_j = eps_per_param[j];
+                let step = if theta[j] + eps_j <= 1.0 { eps_j } else { -eps_j };
                 th_b[j] = (theta[j] + step).clamp(0.0, 1.0);
                 let eps_actual = th_b[j] - theta[j];
                 if eps_actual.abs() < 1e-10 {
                     continue;
                 }
-                let iv_b = self.forward(&th_b, carry_norm)?;
+                let iv_b = self.forward(&th_b, r_norm, q_norm)?;
                 n_evals += 1;
                 for (k, &i) in valid.iter().enumerate() {
                     jac[j * n_valid + k] = (iv_b[i] - iv_pred[i]) / eps_actual;
@@ -449,7 +489,7 @@ impl BatesCalibrator {
                 c
             });
 
-            let iv_cand = self.forward(&candidate, carry_norm)?;
+            let iv_cand = self.forward(&candidate, r_norm, q_norm)?;
             n_evals += 1;
             let cost_cand = lm_cost(&iv_cand, iv_market, weights, &candidate, &prior, reg_w);
 
@@ -626,21 +666,46 @@ pub fn build_weights(
 }
 
 /// Multi-start seeds in normalised [0,1]^5.
+///
+/// Seed layout:
+///   0: centroid [0.5]^5
+///   1: market prior   (κ=3.0, θ=0.04, σ_v=0.40, ρ=−0.70, v₀=0.04)
+///   2: low-κ  regime  (κ≈0.8, θ=0.04, σ_v=0.40, ρ=−0.70, v₀=0.04)
+///   3: high-κ regime  (κ≈5.5, θ=0.04, σ_v=0.40, ρ=−0.70, v₀=0.04)
+///   4: steep skew     (κ≈5.7, σ_v moderate, ρ extreme)
+///   5: high vol-of-vol
+///   6+: evenly spaced scalars
+///
+/// The low-κ and high-κ seeds are essential because κ has a flat objective
+/// landscape (84 bps sensitivity range across training bounds); without
+/// coverage at both extremes the LM gets trapped near the centroid.
 fn make_seeds(n: usize) -> Vec<[f32; N_PARAMS]> {
     let mut seeds: Vec<[f32; N_PARAMS]> = Vec::with_capacity(n);
+
     // Centroid of parameter space
     seeds.push([0.5; N_PARAMS]);
+
     // Near-market prior in normalised space (κ=3, θ=0.04, σ_v=0.4, ρ=−0.7, v₀=0.04)
     if n >= 2 {
         seeds.push(market_prior_norm());
     }
+    // Low-κ regime: κ≈0.8 normalised to (0.8−0.5)/(5.5) ≈ 0.055 → use 0.08
+    if n >= 3 {
+        let prior = market_prior_norm();
+        seeds.push([0.06, prior[1], prior[2], prior[3], prior[4]]);
+    }
+    // High-κ regime: κ≈5.5 normalised to (5.5−0.5)/5.5 ≈ 0.91 → use 0.90
+    if n >= 4 {
+        let prior = market_prior_norm();
+        seeds.push([0.90, prior[1], prior[2], prior[3], prior[4]]);
+    }
     // Equity-like: fast mean-reversion, moderate vol-of-vol, steep skew
     // (normalised kappa≈0.7 → physical ≈5.7, rho≈0.1 → physical ≈−0.87)
-    if n >= 3 {
+    if n >= 5 {
         seeds.push([0.7, 0.3, 0.3, 0.1, 0.3]);
     }
     // High vol-of-vol regime
-    if n >= 4 {
+    if n >= 6 {
         seeds.push([0.3, 0.5, 0.7, 0.2, 0.5]);
     }
     // Fill remaining with evenly-spaced scalar values
@@ -784,8 +849,8 @@ pub fn calibrate_heston_from_dataset(
     } else {
         build_weights(&surface, &mask, &confidence, config.moneyness_weight_sigma)
     };
-    let carry_norm = normalise_carry(dataset_carry(dataset));
-    calibrator.calibrate_with_weights(&surface, &weights, carry_norm, n_restarts, config)
+    let (r, q) = dataset_rq(dataset);
+    calibrator.calibrate_with_weights(&surface, &weights, normalise_r(r), normalise_q(q), n_restarts, config)
 }
 
 /// End-to-end pipeline: load the ONNX surrogate, calibrate Heston parameters
@@ -980,9 +1045,8 @@ mod tests {
         }
 
         let weights = build_weights(&iv_market, &mask, &confidence, Some(0.30));
-        let carry_norm = normalise_carry((r - q) as f32);
         let result = calibrator
-            .calibrate_with_weights(&iv_market, &weights, carry_norm, 5, &CalibrationConfig::default())
+            .calibrate_with_weights(&iv_market, &weights, normalise_r(r as f32), normalise_q(q as f32), 5, &CalibrationConfig::default())
             .expect("calibration failed");
 
         let h = result.heston;
@@ -1311,9 +1375,8 @@ mod tests {
         }
 
         let weights = build_weights(&iv_market, &mask, &confidence, Some(0.30));
-        let carry_norm = normalise_carry((r - q) as f32);
         let cal = calibrator
-            .calibrate_with_weights(&iv_market, &weights, carry_norm, 5, &CalibrationConfig::default())
+            .calibrate_with_weights(&iv_market, &weights, normalise_r(r as f32), normalise_q(q as f32), 5, &CalibrationConfig::default())
             .expect("calibration failed");
 
         let h = cal.heston;
@@ -1380,5 +1443,386 @@ mod tests {
 
         assert!(ctmc_deep.price > 0.0);
         assert!(ctmc_deep.price < spot);
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostic tests  (document accuracy characteristics; all #[ignore])
+    // -----------------------------------------------------------------------
+
+    /// Measures surrogate IV-RMSE sensitivity to κ at a fixed surface.
+    ///
+    /// Rationale: a well-trained surrogate should show a clear, well-localised
+    /// minimum at the true κ value.  A Δ-range < 50 bps across the entire
+    /// training interval indicates the model cannot reliably recover κ
+    /// (calibration will be unreliable).  With the current 39-epoch checkpoint
+    /// this test exposes the known κ-insensitivity; it should pass once the
+    /// surrogate is retrained to <10 bps IVRMSE.
+    ///
+    ///   cargo test --release -p numerical-methods -- --ignored surrogate_kappa_sensitivity --nocapture
+    #[test]
+    #[ignore]
+    fn surrogate_kappa_sensitivity() {
+        use crate::slv::{cos_european, HestonParameters, OptionSide};
+        use options::black_scholes::calculate_iv;
+
+        let onnx_path = default_onnx_path().expect("ONNX model not found");
+        let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
+
+        // Surface generated at κ=3.0 (prior), other params fixed.
+        let true_kappa = 3.0_f32;
+        let theta = 0.04_f32;
+        let sigma_v = 0.40_f32;
+        let rho = -0.70_f32;
+        let v0 = 0.04_f32;
+
+        let true_heston = HestonParameters {
+            kappa:  true_kappa as f64,
+            v_bar:  theta as f64,
+            sigma:  sigma_v as f64,
+            rho:    rho as f64,
+            v0:     v0 as f64,
+        };
+        let spot = 100.0_f64;
+        let r = 0.0_f64;
+        let q = 0.0_f64;
+        let lm_grid = log_moneyness_grid();
+        let mut iv_market = [0f32; N_FLAT];
+        let mut mask = [true; N_FLAT];
+
+        for ik in 0..NK {
+            let strike = spot * (lm_grid[ik] as f64).exp();
+            for it in 0..NT {
+                let tau = MATURITIES[it] as f64;
+                let idx = ik * NT + it;
+                let price = cos_european(OptionSide::Put, spot, strike, r, q, tau, &true_heston, 256);
+                let iv = calculate_iv(price, spot, strike, tau, r, q, false);
+                if iv > 0.005 && iv < 5.0 {
+                    iv_market[idx] = iv as f32;
+                } else {
+                    iv_market[idx] = (theta as f64).sqrt() as f32;
+                    mask[idx] = false;
+                }
+            }
+        }
+
+        let confidence = [1.0f32; N_FLAT];
+
+        // Sweep κ over training range; record IVRMSE at each candidate.
+        let kappa_scan: Vec<f32> = (0..12)
+            .map(|i| PARAM_LO[0] + (PARAM_HI[0] - PARAM_LO[0]) * i as f32 / 11.0)
+            .collect();
+
+        println!("\n=== Surrogate κ Sensitivity Test ===");
+        println!("Surface: κ_true={:.2}  θ={:.3}  σ_v={:.2}  ρ={:.2}  v₀={:.3}",
+            true_kappa, theta, sigma_v, rho, v0);
+        println!("\n{:>10}  {:>14}  {:>10}", "kappa", "IVRMSE_raw", "diff_from_min");
+
+        let mut ivrmse_vals = Vec::with_capacity(kappa_scan.len());
+        for &kappa_cand in &kappa_scan {
+            let phys = [kappa_cand, theta, sigma_v, rho, v0];
+            let norm = normalise(&phys);
+            let iv_pred = calibrator.forward(&norm, 0.0_f32, 0.0_f32).expect("forward failed");
+            let valid: Vec<usize> = (0..N_FLAT).filter(|&i| mask[i]).collect();
+            let mse: f32 = valid.iter().map(|&i| {
+                let e = iv_pred[i] - iv_market[i];
+                e * e
+            }).sum::<f32>() / valid.len() as f32;
+            ivrmse_vals.push(mse.sqrt());
+        }
+
+        let min_rmse = ivrmse_vals.iter().cloned().fold(f32::MAX, f32::min);
+        let max_rmse = ivrmse_vals.iter().cloned().fold(0f32, f32::max);
+        let range_bps = (max_rmse - min_rmse) * 10000.0;
+        let min_idx = ivrmse_vals.iter().position(|&v| v == min_rmse).unwrap();
+        let best_kappa = kappa_scan[min_idx];
+
+        for (k, r) in kappa_scan.iter().zip(ivrmse_vals.iter()) {
+            let diff = (r - min_rmse) * 10000.0;
+            let mark = if (*k - true_kappa).abs() < 0.3 { " ← true" } else { "" };
+            let best = if (*k - best_kappa).abs() < 0.3 { " ← best" } else { "" };
+            println!("{:>10.3}  {:>11.1} bps  {:>+9.1} bps{}{}", k, r * 10000.0, diff, mark, best);
+        }
+
+        println!("\nSensitivity range: {:.1} bps over κ ∈ [{:.2}, {:.2}]", range_bps, PARAM_LO[0], PARAM_HI[0]);
+        println!("Best κ: {:.3}  True κ: {:.3}  Error: {:+.3}", best_kappa, true_kappa, best_kappa - true_kappa);
+
+        // Require: model must distinguish κ with at least 100 bps range once retrained.
+        // (Currently fails at 40 bps — marks the threshold for acceptable surrogates.)
+        assert!(
+            range_bps > 100.0,
+            "κ sensitivity range {:.1} bps < 100 bps — surrogate needs retraining \
+             (current best-val IVRMSE ~125 bps is insufficient; target <10 bps)",
+            range_bps
+        );
+
+        // Best-recovered κ must be within 25% of true κ.
+        let kappa_rel_err = (best_kappa - true_kappa).abs() / true_kappa;
+        assert!(
+            kappa_rel_err < 0.25,
+            "best κ={:.3} differs from true κ={:.3} by {:.1}% > 25%",
+            best_kappa, true_kappa, kappa_rel_err * 100.0
+        );
+    }
+
+    /// 3×3 κ-θ grid recovery test.
+    ///
+    /// Generates COS IV surfaces for 9 combinations of (κ, θ) with other
+    /// parameters fixed at the prior.  Calibrates each and checks:
+    ///   - IV-RMSE ≤ 30 bps  (requires well-trained surrogate)
+    ///   - κ recovered within 20% relative error
+    ///   - θ recovered within 15% relative error
+    ///
+    ///   cargo test --release -p numerical-methods -- --ignored kappa_theta_grid_recovery --nocapture
+    #[test]
+    #[ignore]
+    fn kappa_theta_grid_recovery() {
+        use crate::slv::{cos_european, HestonParameters, OptionSide};
+        use options::black_scholes::calculate_iv;
+
+        let onnx_path = default_onnx_path().expect("ONNX model not found");
+        let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
+
+        let kappas = [1.0_f64, 3.0, 5.0];
+        let thetas = [0.03_f64, 0.05, 0.08];
+        let sigma_v = 0.40_f64;
+        let rho = -0.70_f64;
+        let spot = 100.0_f64;
+        let r = 0.0_f64;
+        let q = 0.0_f64;
+        let lm_grid = log_moneyness_grid();
+
+        println!("\n=== 3×3 κ-θ Grid Recovery Test ===");
+        println!("{:>6} {:>6} | {:>6} {:>6} | {:>7} {:>7} | {:>8}",
+            "κ_true", "θ_true", "κ_rec", "θ_rec", "Δκ%", "Δθ%", "IVRMSE");
+        println!("{}", "-".repeat(62));
+
+        let mut all_pass = true;
+        for &kappa in &kappas {
+            for &theta in &thetas {
+                let v0 = theta;  // v0 = theta → stationary variance
+                let true_heston = HestonParameters { kappa, v_bar: theta, sigma: sigma_v, rho, v0 };
+                let mut iv_market = [0f32; N_FLAT];
+                let mut mask = [true; N_FLAT];
+
+                for ik in 0..NK {
+                    let strike = spot * (lm_grid[ik] as f64).exp();
+                    for it in 0..NT {
+                        let tau = MATURITIES[it] as f64;
+                        let idx = ik * NT + it;
+                        let price = cos_european(OptionSide::Put, spot, strike, r, q, tau, &true_heston, 256);
+                        let iv = calculate_iv(price, spot, strike, tau, r, q, false);
+                        if iv > 0.005 && iv < 5.0 {
+                            iv_market[idx] = iv as f32;
+                        } else {
+                            iv_market[idx] = (theta.sqrt()) as f32;
+                            mask[idx] = false;
+                        }
+                    }
+                }
+
+                let confidence = [1.0f32; N_FLAT];
+                let weights = build_vega_weights(&iv_market, &mask, &confidence);
+                let result = calibrator
+                    .calibrate_with_weights(&iv_market, &weights, 0.0_f32, 0.0_f32, 5, &CalibrationConfig::default())
+                    .expect("calibration failed");
+
+                let h = &result.heston;
+                let dk_pct = (h.kappa - kappa).abs() / kappa * 100.0;
+                let dt_pct = (h.v_bar - theta).abs() / theta * 100.0;
+                let ivrmse_bps = result.ivrmse * 10000.0;
+
+                let kappa_ok = dk_pct < 20.0;
+                let theta_ok = dt_pct < 15.0;
+                let rmse_ok  = ivrmse_bps < 30.0;
+                let pass = kappa_ok && theta_ok && rmse_ok;
+                if !pass { all_pass = false; }
+
+                println!("{:>6.2} {:>6.3} | {:>6.3} {:>6.3} | {:>+6.1}% {:>+6.1}% | {:>6.1} bps{}",
+                    kappa, theta, h.kappa, h.v_bar, dk_pct, dt_pct, ivrmse_bps,
+                    if pass { "" } else { " FAIL" });
+            }
+        }
+
+        assert!(
+            all_pass,
+            "κ-θ grid recovery failed. \
+             Likely cause: surrogate needs retraining (current val IVRMSE ~125 bps). \
+             Re-run `python -m model.train` from deep-calibration project."
+        );
+    }
+
+    /// Tests recovery of v₀ ≠ θ (non-stationary initial variance).
+    ///
+    /// When v₀ ≠ θ, the IV surface has a term-structure slope: short-dated IV
+    /// is dominated by v₀, long-dated by θ.  A well-trained surrogate should
+    /// identify both independently.  Strong v₀-θ entanglement (r > 0.7) or
+    /// large bias indicates the surrogate confounds the two.
+    ///
+    ///   cargo test --release -p numerical-methods -- --ignored v0_theta_identifiability --nocapture
+    #[test]
+    #[ignore]
+    fn v0_theta_identifiability() {
+        use crate::slv::{cos_european, HestonParameters, OptionSide};
+        use options::black_scholes::calculate_iv;
+
+        let onnx_path = default_onnx_path().expect("ONNX model not found");
+        let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
+
+        // Four asymmetric (v0, theta) cases.
+        let cases: &[(f64, f64, &str)] = &[
+            (0.025, 0.09, "v0≪θ (low initial, high LR)"),
+            (0.09,  0.025, "v0≫θ (high initial, low LR)"),
+            (0.04,  0.08,  "v0<θ  (moderate asymmetry)"),
+            (0.08,  0.04,  "v0>θ  (moderate asymmetry)"),
+        ];
+        let kappa = 3.0_f64;
+        let sigma_v = 0.40_f64;
+        let rho = -0.70_f64;
+        let spot = 100.0_f64;
+        let r = 0.0_f64;
+        let q = 0.0_f64;
+        let lm_grid = log_moneyness_grid();
+        let config = CalibrationConfig::default();
+
+        println!("\n=== v₀-θ Identifiability Test ===");
+        println!("{:<30} {:>6} {:>6} {:>6} {:>6} {:>8}",
+            "case", "v0_true", "θ_true", "v0_rec", "θ_rec", "IVRMSE");
+        println!("{}", "-".repeat(72));
+
+        let mut all_pass = true;
+        for &(v0, theta, label) in cases {
+            let true_heston = HestonParameters { kappa, v_bar: theta, sigma: sigma_v, rho, v0 };
+            let mut iv_market = [0f32; N_FLAT];
+            let mut mask = [true; N_FLAT];
+
+            for ik in 0..NK {
+                let strike = spot * (lm_grid[ik] as f64).exp();
+                for it in 0..NT {
+                    let tau = MATURITIES[it] as f64;
+                    let idx = ik * NT + it;
+                    let price = cos_european(OptionSide::Put, spot, strike, r, q, tau, &true_heston, 256);
+                    let iv = calculate_iv(price, spot, strike, tau, r, q, false);
+                    if iv > 0.005 && iv < 5.0 {
+                        iv_market[idx] = iv as f32;
+                    } else {
+                        iv_market[idx] = (((v0 + theta) / 2.0).sqrt()) as f32;
+                        mask[idx] = false;
+                    }
+                }
+            }
+
+            let confidence = [1.0f32; N_FLAT];
+            let weights = build_vega_weights(&iv_market, &mask, &confidence);
+            let result = calibrator
+                .calibrate_with_weights(&iv_market, &weights, 0.0_f32, 0.0_f32, 5, &config)
+                .expect("calibration failed");
+
+            let h = &result.heston;
+            let dv0_pct = (h.v0 - v0).abs() / v0 * 100.0;
+            let dth_pct = (h.v_bar - theta).abs() / theta * 100.0;
+            let ivrmse_bps = result.ivrmse * 10000.0;
+            let pass = dv0_pct < 20.0 && dth_pct < 20.0 && ivrmse_bps < 30.0;
+            if !pass { all_pass = false; }
+
+            println!("{:<30} {:>6.3} {:>6.3} {:>6.4} {:>6.4} {:>6.1} bps{}",
+                label, v0, theta, h.v0, h.v_bar, ivrmse_bps,
+                if pass { "" } else { " FAIL" });
+        }
+
+        assert!(
+            all_pass,
+            "v₀-θ identifiability failed. \
+             With a well-trained surrogate (IVRMSE <10 bps), both v₀ and θ should be \
+             recoverable to 20% relative error even when they differ significantly."
+        );
+    }
+
+    /// Bias profile test across each parameter's range.
+    ///
+    /// For each Heston parameter, sweeps its value from 10% above its lower
+    /// bound to 10% below its upper bound while holding other parameters at
+    /// the prior.  Fails if any recovered parameter is biased by more than
+    /// 20% relative to the true value AND the IVRMSE is below 30 bps
+    /// (bias without fit quality is acceptable for boundary params).
+    ///
+    ///   cargo test --release -p numerical-methods -- --ignored param_bias_profile --nocapture
+    #[test]
+    #[ignore]
+    fn param_bias_profile() {
+        use crate::slv::{cos_european, HestonParameters, OptionSide};
+        use options::black_scholes::calculate_iv;
+
+        let onnx_path = default_onnx_path().expect("ONNX model not found");
+        let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
+
+        // Prior (physical)
+        let prior = [3.0_f64, 0.04, 0.40, -0.70, 0.04];
+        let param_names = ["kappa", "theta", "sigma_v", "rho", "v0"];
+        let lm_grid = log_moneyness_grid();
+        let config = CalibrationConfig::default();
+        let n_scan = 5_usize;
+        let spot = 100.0_f64;
+
+        println!("\n=== Parameter Bias Profile ===");
+        let mut all_pass = true;
+
+        for pi in 0..5_usize {
+            let lo = (PARAM_LO[pi] + 0.10 * (PARAM_HI[pi] - PARAM_LO[pi])) as f64;
+            let hi = (PARAM_HI[pi] - 0.10 * (PARAM_HI[pi] - PARAM_LO[pi])) as f64;
+
+            println!("\n  {}  (range [{:.3}, {:.3}]):", param_names[pi], lo, hi);
+            println!("  {:>8}  {:>8}  {:>8}  {:>8}", "true", "rec", "bias%", "IVRMSE");
+
+            for k in 0..n_scan {
+                let val = lo + (hi - lo) * k as f64 / (n_scan - 1) as f64;
+                let mut params = prior;
+                params[pi] = val;
+                let [kappa, theta, sigma_v, rho, v0] = params;
+
+                let true_heston = HestonParameters { kappa, v_bar: theta, sigma: sigma_v, rho, v0 };
+                let mut iv_market = [0f32; N_FLAT];
+                let mut mask = [true; N_FLAT];
+
+                for ik in 0..NK {
+                    let strike = spot * (lm_grid[ik] as f64).exp();
+                    for it in 0..NT {
+                        let tau = MATURITIES[it] as f64;
+                        let idx = ik * NT + it;
+                        let price = cos_european(OptionSide::Put, spot, strike, 0.0, 0.0, tau, &true_heston, 256);
+                        let iv = calculate_iv(price, spot, strike, tau, 0.0, 0.0, false);
+                        if iv > 0.005 && iv < 5.0 {
+                            iv_market[idx] = iv as f32;
+                        } else {
+                            iv_market[idx] = (theta.sqrt()) as f32;
+                            mask[idx] = false;
+                        }
+                    }
+                }
+
+                let confidence = [1.0f32; N_FLAT];
+                let weights = build_vega_weights(&iv_market, &mask, &confidence);
+                let result = calibrator
+                    .calibrate_with_weights(&iv_market, &weights, 0.0_f32, 0.0_f32, 5, &config)
+                    .expect("calibration failed");
+
+                let h = &result.heston;
+                let rec_vals = [h.kappa, h.v_bar, h.sigma, h.rho, h.v0];
+                let rec = rec_vals[pi];
+                let bias_pct = (rec - val) / val.abs() * 100.0;
+                let ivrmse_bps = result.ivrmse * 10000.0;
+                let pass = bias_pct.abs() < 20.0 || ivrmse_bps >= 30.0;
+                if !pass { all_pass = false; }
+
+                println!("  {:>8.4}  {:>8.4}  {:>+7.1}%  {:>6.1} bps{}",
+                    val, rec, bias_pct, ivrmse_bps,
+                    if !pass { " FAIL" } else { "" });
+            }
+        }
+
+        assert!(
+            all_pass,
+            "Bias profile failed: at least one parameter shows >20% bias at <30 bps IVRMSE. \
+             Likely cause: surrogate underfitting. Retrain to <10 bps IVRMSE."
+        );
     }
 }

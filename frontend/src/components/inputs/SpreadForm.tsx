@@ -1,45 +1,42 @@
-import type { SpreadType, SpreadStrikes } from "../../types/index.ts";
-import { SPREAD_LABELS } from "../../types/index.ts";
-import { Input } from "../ui/Input.tsx";
-import { Select } from "../ui/Select.tsx";
+import type { SpreadStrikes, SpreadType } from "../../types/index.ts";
 
-interface SpreadFormProps {
+export type SpreadFormProps = {
   spreadType: SpreadType;
   onSpreadTypeChange: (type: SpreadType) => void;
   strikes: SpreadStrikes;
   onStrikesChange: (strikes: SpreadStrikes) => void;
-  shortTermMaturity: string;
-  longTermMaturity: string;
-  onMaturityChange: (field: string, value: string) => void;
-  showTypeSelector: boolean;
-}
-
-const SPREAD_OPTIONS = Object.entries(SPREAD_LABELS).map(([value, label]) => ({
-  value,
-  label,
-}));
-
-const STRIKE_FIELDS: Record<SpreadType, (keyof SpreadStrikes)[]> = {
-  straddle: ["strike"],
-  strangle: ["strike_call", "strike_put"],
-  strip: ["strike"],
-  strap: ["strike"],
-  synthetic_stock: ["strike"],
-  bull_spread_call: ["strike_low", "strike_high"],
-  bull_spread_put: ["strike_low", "strike_high"],
-  bear_spread_call: ["strike_low", "strike_high"],
-  bear_spread_put: ["strike_low", "strike_high"],
-  butterfly: ["strike_low", "strike_medium", "strike_high"],
-  calendar_spread: ["strike"],
+  shortTermMaturity?: string;
+  longTermMaturity?: string;
+  onMaturityChange?: (field: string, value: string) => void;
+  showTypeSelector?: boolean;
 };
 
-const STRIKE_LABELS: Record<keyof SpreadStrikes, string> = {
-  strike: "Strike",
-  strike_call: "Call Strike",
-  strike_put: "Put Strike",
-  strike_low: "Lower Strike",
-  strike_high: "Upper Strike",
-  strike_medium: "Middle Strike",
+const SPREAD_STRIKE_COUNTS: Record<SpreadType, number> = {
+  straddle: 1,
+  strangle: 1,
+  strip: 1,
+  strap: 1,
+  synthetic_stock: 1,
+  bull_spread_call: 2,
+  bull_spread_put: 2,
+  bear_spread_call: 2,
+  bear_spread_put: 2,
+  butterfly: 3,
+  calendar_spread: 1,
+};
+
+const SPREAD_LABELS: Record<SpreadType, string> = {
+  straddle: "Straddle",
+  strangle: "Strangle",
+  strip: "Strip",
+  strap: "Strap",
+  synthetic_stock: "Synthetic stock",
+  bull_spread_call: "Bull call",
+  bull_spread_put: "Bull put",
+  bear_spread_call: "Bear call",
+  bear_spread_put: "Bear put",
+  butterfly: "Butterfly",
+  calendar_spread: "Calendar",
 };
 
 export function SpreadForm({
@@ -47,63 +44,50 @@ export function SpreadForm({
   onSpreadTypeChange,
   strikes,
   onStrikesChange,
-  shortTermMaturity,
-  longTermMaturity,
-  onMaturityChange,
-  showTypeSelector,
+  showTypeSelector = true,
 }: SpreadFormProps) {
-  const strikeFields = STRIKE_FIELDS[spreadType];
-  const needsMaturity = spreadType === "calendar_spread";
+  const count = SPREAD_STRIKE_COUNTS[spreadType] ?? 1;
 
-  function handleStrikeChange(field: keyof SpreadStrikes, value: string) {
-    const num = value === "" ? undefined : parseFloat(value);
-    onStrikesChange({ ...strikes, [field]: num });
-  }
+  const getStrikeKey = (index: number): keyof SpreadStrikes => {
+    const keys: (keyof SpreadStrikes)[] = ["strike", "strike_call", "strike_put", "strike_low", "strike_high", "strike_medium"];
+    return keys[index] || "strike";
+  };
 
-  if (showTypeSelector) {
-    return (
-      <Select
-        label="Spread Type"
-        value={spreadType}
-        onChange={(v) => onSpreadTypeChange(v as SpreadType)}
-        options={SPREAD_OPTIONS}
-      />
-    );
-  }
+  const handleStrikeChange = (index: number, value: string) => {
+    const key = getStrikeKey(index);
+    onStrikesChange({ ...strikes, [key]: parseFloat(value) || undefined });
+  };
 
   return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-4">
-        {strikeFields.map((field) => (
-          <Input
-            key={field}
-            label={STRIKE_LABELS[field]}
-            type="number"
-            value={strikes[field] ?? ""}
-            onChange={(v) => handleStrikeChange(field, v)}
-            placeholder="100.00"
-          />
-        ))}
-      </div>
-
-      {needsMaturity && (
-        <div className="grid grid-cols-2 gap-4">
-          <Input
-            label="Short-Term TTM"
-            type="number"
-            value={shortTermMaturity}
-            onChange={(v) => onMaturityChange("shortTermMaturity", v)}
-            placeholder="0.25"
-          />
-          <Input
-            label="Long-Term TTM"
-            type="number"
-            value={longTermMaturity}
-            onChange={(v) => onMaturityChange("longTermMaturity", v)}
-            placeholder="0.5"
-          />
+    <div style={{ fontSize: 12, color: "var(--fg-2)" }}>
+      {showTypeSelector && (
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ display: "block", fontSize: 10, color: "var(--fg-3)", textTransform: "uppercase", marginBottom: 4 }}>Spread type</label>
+          <select
+            value={spreadType}
+            onChange={(e) => onSpreadTypeChange(e.target.value as SpreadType)}
+            style={{ width: "100%", padding: "6px 8px", fontSize: 12, borderRadius: 4 }}
+          >
+            {(Object.keys(SPREAD_LABELS) as SpreadType[]).map(type => (
+              <option key={type} value={type}>{SPREAD_LABELS[type]}</option>
+            ))}
+          </select>
         </div>
       )}
+
+      {Array.from({ length: count }, (_, i) => (
+        <div key={i} style={{ marginBottom: 8 }}>
+          <label style={{ display: "block", fontSize: 10, color: "var(--fg-3)", textTransform: "uppercase" }}>
+            Strike {i + 1}
+          </label>
+          <input
+            type="number"
+            value={strikes[getStrikeKey(i)] ?? ""}
+            onChange={(e) => handleStrikeChange(i, e.target.value)}
+            style={{ width: "100%", padding: "4px 8px", fontSize: 12, borderRadius: 4 }}
+          />
+        </div>
+      ))}
     </div>
   );
 }

@@ -1,231 +1,61 @@
-import type { PriceRequest, PriceResponse, SingleOptionRequest } from "../types/index.ts";
+import type { PriceRequest, PriceResponse, SingleOptionRequest, SpreadRequest } from "../types/index.ts";
 
-export interface PayoffData {
-  spotPrices: number[];
-  payoffs: number[];
-  breakEvenPoints: number[];
-  maxProfit: number | null;
-  maxLoss: number | null;
-}
+export type PayoffPoint = {
+  spot: number;
+  pnl: number;
+};
 
-export function calculatePayoffGrid(
-  request: PriceRequest,
-  priceResult: PriceResponse
-): PayoffData | null {
-  if (priceResult.payoff_curve) {
-    const { spot_prices, payoffs } = priceResult.payoff_curve;
-    const breakEvenPoints = findBreakEvenPoints(spot_prices, payoffs);
-    const { maxProfit, maxLoss } = calculateMaxProfitLoss(payoffs);
-    return {
-      spotPrices: spot_prices,
-      payoffs,
-      breakEvenPoints,
-      maxProfit,
-      maxLoss,
-    };
+export function calculatePayoffGrid(req: PriceRequest | null, result: PriceResponse | null): PayoffPoint[] {
+  if (!req || !result) return [];
+
+  let S = 100;
+  let direction: "long" | "short" = "long";
+
+  if (req.structure_type === "single") {
+    const singleReq = req as SingleOptionRequest;
+    S = singleReq.spot_price;
+    direction = singleReq.direction;
+  } else if (req.structure_type === "spread") {
+    const spreadReq = req as SpreadRequest;
+    S = spreadReq.spot_price;
+    direction = spreadReq.direction;
+  } else {
+    return [];
   }
 
-  if (request.structure_type === "exotic") {
-    return null;
-  }
+  const points: PayoffPoint[] = [];
+  const lo = S * 0.6;
+  const hi = S * 1.4;
+  const n = 80;
 
-  const bsPrice = priceResult.pricing.black_scholes;
-  const premium = Math.abs(bsPrice);
+  for (let i = 0; i <= n; i++) {
+    const spot = lo + (hi - lo) * i / n;
+    let intrinsic = 0;
 
-  if (request.structure_type === "single") {
-    return calculateSingleOptionPayoff(request, premium);
-  }
-
-  if (request.structure_type === "spread") {
-    return calculateSpreadPayoff(request, premium);
-  }
-
-  return null;
-}
-
-function calculateSingleOptionPayoff(
-  request: SingleOptionRequest,
-  premium: number
-): PayoffData {
-  const { option_type, strike_price, spot_price, direction } = request;
-  const dirMultiplier = direction === "long" ? 1 : -1;
-
-  const minSpot = spot_price * 0.5;
-  const maxSpot = spot_price * 1.5;
-  const numPoints = 100;
-  const step = (maxSpot - minSpot) / (numPoints - 1);
-
-  const spotPrices: number[] = [];
-  const payoffs: number[] = [];
-
-  for (let i = 0; i < numPoints; i++) {
-    const spot = minSpot + i * step;
-    spotPrices.push(spot);
-
-    let intrinsicValue = 0;
-    if (option_type === "call") {
-      intrinsicValue = Math.max(spot - strike_price, 0);
-    } else {
-      intrinsicValue = Math.max(strike_price - spot, 0);
-    }
-
-    const payoff = dirMultiplier * (intrinsicValue - premium);
-    payoffs.push(payoff);
-  }
-
-  const breakEvenPoints = findBreakEvenPoints(spotPrices, payoffs);
-  const { maxProfit, maxLoss } = calculateMaxProfitLoss(payoffs);
-
-  return { spotPrices, payoffs, breakEvenPoints, maxProfit, maxLoss };
-}
-
-function calculateSpreadPayoff(
-  request: Extract<PriceRequest, { structure_type: "spread" }>,
-  totalPremium: number
-): PayoffData {
-  const {
-    spread_type,
-    strikes,
-    spot_price,
-    direction,
-  } = request;
-
-  const dirMultiplier = direction === "long" ? 1 : -1;
-  const minSpot = spot_price * 0.5;
-  const maxSpot = spot_price * 1.5;
-  const numPoints = 100;
-  const step = (maxSpot - minSpot) / (numPoints - 1);
-
-  const spotPrices: number[] = [];
-  const payoffs: number[] = [];
-
-  for (let i = 0; i < numPoints; i++) {
-    const spot = minSpot + i * step;
-    spotPrices.push(spot);
-
-    let payoff = 0;
-
-    switch (spread_type) {
-      case "straddle": {
-        const K = strikes.strike ?? spot_price;
-        payoff = Math.max(spot - K, 0) + Math.max(K - spot, 0) - totalPremium;
-        break;
-      }
-
-      case "strangle": {
-        const Kc = strikes.strike_call ?? spot_price * 1.05;
-        const Kp = strikes.strike_put ?? spot_price * 0.95;
-        payoff =
-          Math.max(spot - Kc, 0) + Math.max(Kp - spot, 0) - totalPremium;
-        break;
-      }
-
-      case "strip": {
-        const K = strikes.strike ?? spot_price;
-        payoff =
-          Math.max(spot - K, 0) + 2 * Math.max(K - spot, 0) - totalPremium;
-        break;
-      }
-
-      case "strap": {
-        const K = strikes.strike ?? spot_price;
-        payoff =
-          2 * Math.max(spot - K, 0) + Math.max(K - spot, 0) - totalPremium;
-        break;
-      }
-
-      case "synthetic_stock": {
-        const K = strikes.strike ?? spot_price;
-        payoff = Math.max(spot - K, 0) - Math.max(K - spot, 0);
-        break;
-      }
-
-      case "bull_spread_call": {
-        const Klow = strikes.strike_low ?? spot_price * 0.95;
-        const Khigh = strikes.strike_high ?? spot_price * 1.05;
-        payoff =
-          Math.max(spot - Klow, 0) - Math.max(spot - Khigh, 0) - totalPremium;
-        break;
-      }
-
-      case "bull_spread_put": {
-        const Klow = strikes.strike_low ?? spot_price * 0.95;
-        const Khigh = strikes.strike_high ?? spot_price * 1.05;
-        payoff =
-          Math.max(Klow - spot, 0) - Math.max(Khigh - spot, 0) - totalPremium;
-        break;
-      }
-
-      case "bear_spread_call": {
-        const Klow = strikes.strike_low ?? spot_price * 0.95;
-        const Khigh = strikes.strike_high ?? spot_price * 1.05;
-        payoff =
-          Math.max(spot - Khigh, 0) - Math.max(spot - Klow, 0) - totalPremium;
-        break;
-      }
-
-      case "bear_spread_put": {
-        const Klow = strikes.strike_low ?? spot_price * 0.95;
-        const Khigh = strikes.strike_high ?? spot_price * 1.05;
-        payoff =
-          Math.max(Khigh - spot, 0) - Math.max(Klow - spot, 0) - totalPremium;
-        break;
-      }
-
-      case "butterfly": {
-        const Klow = strikes.strike_low ?? spot_price * 0.95;
-        const Kmid = strikes.strike_medium ?? spot_price;
-        const Khigh = strikes.strike_high ?? spot_price * 1.05;
-        payoff =
-          Math.max(spot - Klow, 0) -
-          2 * Math.max(spot - Kmid, 0) +
-          Math.max(spot - Khigh, 0) -
-          totalPremium;
-        break;
-      }
-
-      case "calendar_spread": {
-        payoff = 0;
-        break;
+    if (req.structure_type === "single") {
+      const singleReq = req as SingleOptionRequest;
+      const K = singleReq.strike_price;
+      const type = singleReq.option_type;
+      intrinsic = type === "call" ? Math.max(spot - K, 0) : Math.max(K - spot, 0);
+    } else if (req.structure_type === "spread") {
+      const spreadReq = req as SpreadRequest;
+      const strikes = Object.values(spreadReq.strikes).filter(v => v != null) as number[];
+      if (strikes.length >= 2) {
+        strikes.sort((a, b) => a - b);
+        const K1 = strikes[0];
+        const K2 = strikes[1];
+        intrinsic = Math.max(spot - K1, 0) - Math.max(spot - K2, 0);
       }
     }
 
-    payoffs.push(dirMultiplier * payoff);
+    const premium = typeof result.pricing?.black_scholes === "number"
+      ? result.pricing.black_scholes
+      : 0;
+
+    const pnl = direction === "long" ? intrinsic - premium : premium - intrinsic;
+
+    points.push({ spot, pnl });
   }
 
-  const breakEvenPoints = findBreakEvenPoints(spotPrices, payoffs);
-  const { maxProfit, maxLoss } = calculateMaxProfitLoss(payoffs);
-
-  return { spotPrices, payoffs, breakEvenPoints, maxProfit, maxLoss };
-}
-
-function findBreakEvenPoints(spotPrices: number[], payoffs: number[]): number[] {
-  const breakEvenPoints: number[] = [];
-
-  for (let i = 1; i < payoffs.length; i++) {
-    const prev = payoffs[i - 1];
-    const curr = payoffs[i];
-
-    if ((prev <= 0 && curr >= 0) || (prev >= 0 && curr <= 0)) {
-      const spotPrev = spotPrices[i - 1];
-      const spotCurr = spotPrices[i];
-      const interpolated = spotPrev + ((0 - prev) / (curr - prev)) * (spotCurr - spotPrev);
-      breakEvenPoints.push(interpolated);
-    }
-  }
-
-  return breakEvenPoints;
-}
-
-function calculateMaxProfitLoss(payoffs: number[]): {
-  maxProfit: number | null;
-  maxLoss: number | null;
-} {
-  const maxProfit = Math.max(...payoffs);
-  const maxLoss = Math.min(...payoffs);
-
-  return {
-    maxProfit: maxProfit > 0 ? maxProfit : null,
-    maxLoss: maxLoss < 0 ? maxLoss : null,
-  };
+  return points;
 }
