@@ -11,10 +11,13 @@
 //!   - N_FLAT = 686  (row-major: strike-first, then maturity)
 //!
 //! # Parameter order (normalised [0,1])
-//! kappa, theta, sigma_v, rho, v0, carry  (pure Heston + market carry r−q)
+//! kappa, theta, sigma_v, rho, v0, r_norm, q_norm
 //!
-//! The first 5 are optimised by LM; carry is a fixed market observable passed
-//! as the 6th input to the ONNX model.
+//! The first 5 are optimised by LM. The ONNX surrogate was trained with
+//! q pinned to 0 and r ∈ [0, 0.05]; since q enters Heston only through the
+//! drift (r − q), callers pass physical r and q and we feed
+//! r_norm = normalise_r(r − q), q_norm = 0.0 into the model. See
+//! training data creation/v2/sampling.py and generate_v2.py:Q_FIXED=0.0.
 //!
 //! # Mapping to HestonParameters
 //! kappa→kappa, theta→v_bar, sigma_v→sigma, rho→rho, v0→v0.
@@ -104,26 +107,27 @@ pub fn log_moneyness_grid() -> [f32; NK] {
 // Source of truth: PARAM_BOUNDS in training data creation/heston_datagen.py.
 
 /// Physical lower bounds: [kappa, theta, sigma_v, rho, v0]
-const PARAM_LO: [f32; N_PARAMS] = [0.50, 0.02, 0.10, -0.95, 0.02];
+/// Match v2 training: training data creation/v2/sampling.py L29-39.
+const PARAM_LO: [f32; N_PARAMS] = [0.30, 0.01, 0.10, -0.90, 0.02];
 /// Physical upper bounds: [kappa, theta, sigma_v, rho, v0]
-const PARAM_HI: [f32; N_PARAMS] = [6.00, 0.10, 0.90, -0.20, 0.10];
+const PARAM_HI: [f32; N_PARAMS] = [10.0, 0.16, 1.50, -0.30, 0.20];
 
-/// Risk-free rate bounds — from R_BOUNDS in heston_datagen.py.
+/// Carry bounds (r − q). Training set q_fixed=0, r ∈ [0.00, 0.05], so the
+/// surrogate internally learned carry ∈ [0.00, 0.05]. Since q enters Heston
+/// only through the drift (r − q), q>0 at inference is handled by composing
+/// carry = r − q and feeding r_norm = normalise_r(carry), q_norm = 0.
+/// Source of truth: training data creation/v2/sampling.py:40.
 const R_LO: f32 = 0.00;
-const R_HI: f32 = 0.06;
-/// Dividend yield bounds — from Q_BOUNDS in heston_datagen.py.
-const Q_LO: f32 = 0.00;
-const Q_HI: f32 = 0.04;
+const R_HI: f32 = 0.05;
 
-/// Normalise risk-free rate to [0,1] for ONNX input slot 5.
-fn normalise_r(r: f32) -> f32 {
-    (r - R_LO) / (R_HI - R_LO)
+/// Normalise carry (r − q) to [0,1] for ONNX input slot 5.
+fn normalise_r(carry: f32) -> f32 {
+    (carry - R_LO) / (R_HI - R_LO)
 }
 
-/// Normalise dividend yield to [0,1] for ONNX input slot 6.
-fn normalise_q(q: f32) -> f32 {
-    (q - Q_LO) / (Q_HI - Q_LO)
-}
+// `normalise_q` removed: the v2 surrogate was trained with q pinned to 0.
+// Callers pass literal 0.0 into the q-slot and fold physical q into the
+// r-slot via carry = r − q.
 
 /// Extract (r, q) from a `CalibrationDataset`.
 /// All instruments must share the same risk-free rate and dividend yield;
@@ -292,8 +296,10 @@ impl BatesCalibrator {
     ///
     /// * `iv_market` – `[f32; 686]` flat IV surface (NK×NT, strike-major).
     /// * `weights`   – `[f32; 686]` per-cell weights; 0.0 = excluded.
-    /// * `r_norm`    – risk-free rate normalised to [0,1] via `normalise_r(r)`.
-    /// * `q_norm`    – dividend yield normalised to [0,1] via `normalise_q(q)`.
+    /// * `r_norm`    – normalised carry = (r − q). Pass `normalise_r(r - q)`.
+    /// * `q_norm`    – must be 0.0. The surrogate was trained with q pinned
+    ///                 to zero; q is folded into the r-slot via the drift
+    ///                 identity (r − q). Pass literal 0.0.
     /// * `n_restarts` – number of independent LM restarts (≥1).
     pub fn calibrate_with_weights(
         &mut self,
@@ -347,7 +353,9 @@ impl BatesCalibrator {
     ) -> ort::Result<DeepCalibrationResult> {
         let confidence = [1.0f32; N_FLAT];
         let weights = build_weights(iv_market, mask, &confidence, config.moneyness_weight_sigma);
-        self.calibrate_with_weights(iv_market, &weights, normalise_r(r), normalise_q(q), n_restarts, config)
+        // Compose carry = r − q; surrogate learned carry ∈ [0, 0.05] with q=0 pinned.
+        let carry = r - q;
+        self.calibrate_with_weights(iv_market, &weights, normalise_r(carry), 0.0, n_restarts, config)
     }
 
     // -----------------------------------------------------------------------
@@ -850,7 +858,8 @@ pub fn calibrate_heston_from_dataset(
         build_weights(&surface, &mask, &confidence, config.moneyness_weight_sigma)
     };
     let (r, q) = dataset_rq(dataset);
-    calibrator.calibrate_with_weights(&surface, &weights, normalise_r(r), normalise_q(q), n_restarts, config)
+    let carry = r - q;
+    calibrator.calibrate_with_weights(&surface, &weights, normalise_r(carry), 0.0, n_restarts, config)
 }
 
 /// End-to-end pipeline: load the ONNX surrogate, calibrate Heston parameters
@@ -1045,8 +1054,9 @@ mod tests {
         }
 
         let weights = build_weights(&iv_market, &mask, &confidence, Some(0.30));
+        let carry = (r - q) as f32;
         let result = calibrator
-            .calibrate_with_weights(&iv_market, &weights, normalise_r(r as f32), normalise_q(q as f32), 5, &CalibrationConfig::default())
+            .calibrate_with_weights(&iv_market, &weights, normalise_r(carry), 0.0, 5, &CalibrationConfig::default())
             .expect("calibration failed");
 
         let h = result.heston;
@@ -1375,8 +1385,9 @@ mod tests {
         }
 
         let weights = build_weights(&iv_market, &mask, &confidence, Some(0.30));
+        let carry = (r - q) as f32;
         let cal = calibrator
-            .calibrate_with_weights(&iv_market, &weights, normalise_r(r as f32), normalise_q(q as f32), 5, &CalibrationConfig::default())
+            .calibrate_with_weights(&iv_market, &weights, normalise_r(carry), 0.0, 5, &CalibrationConfig::default())
             .expect("calibration failed");
 
         let h = cal.heston;
