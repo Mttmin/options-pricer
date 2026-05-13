@@ -341,7 +341,8 @@ pub struct VarianceGeneratorCOO {
 
 fn build_variance_generator(slv_model: &SLVModelVariant, v_grid: &[f64]) -> VarianceGeneratorCOO {
     let m = v_grid.len();
-    let capacity = 3 * m.saturating_sub(2);
+    // Interior 3 entries + 2-state reflecting boundaries at each end.
+    let capacity = 3 * m.saturating_sub(2) + 4;
     let mut rows = Vec::with_capacity(capacity);
     let mut cols = Vec::with_capacity(capacity);
     let mut vals = Vec::with_capacity(capacity);
@@ -359,6 +360,27 @@ fn build_variance_generator(slv_model: &SLVModelVariant, v_grid: &[f64]) -> Vari
         rows.extend([l, l, l]);
         cols.extend([l + 1, l - 1, l]);
         vals.extend([lambda_up, lambda_dn, -(lambda_up + lambda_dn)]);
+    }
+
+    // Reflecting boundaries: reuse interior formula with dv_dn=dv_up at bottom
+    // and dv_up=dv_dn at top (no-flux reflection). Absorbing endpoints (no rates)
+    // leak probability mass and systematically bias prices.
+    if m >= 2 {
+        let dv = v_grid[1] - v_grid[0];
+        let sigma_sq = slv_model.sigma_v(v_grid[0]).powi(2);
+        let mu = slv_model.mu(v_grid[0]);
+        let lambda_up = ((sigma_sq + mu * dv) / (2.0 * dv * dv)).max(0.0);
+        rows.extend([0, 0]);
+        cols.extend([1, 0]);
+        vals.extend([lambda_up, -lambda_up]);
+
+        let dv = v_grid[m - 1] - v_grid[m - 2];
+        let sigma_sq = slv_model.sigma_v(v_grid[m - 1]).powi(2);
+        let mu = slv_model.mu(v_grid[m - 1]);
+        let lambda_dn = ((sigma_sq - mu * dv) / (2.0 * dv * dv)).max(0.0);
+        rows.extend([m - 1, m - 1]);
+        cols.extend([m - 2, m - 1]);
+        vals.extend([lambda_dn, -lambda_dn]);
     }
 
     VarianceGeneratorCOO { rows, cols, vals, num_states: m }
@@ -592,64 +614,65 @@ fn build_h3(h3_coeff: &[f64], x_grid: &[f64], boundary: &[f64], m: usize, n: usi
 }
 
 // Find b_k(v_l): X-space boundary where intrinsic = continuation for variance state l.
-// f(i) = excess[base+i] − J_k[base+i]; monotone decreasing in i (deep ITM → OTM).
-// Binary-search for the rightmost i where f(i) ≥ 0, then refine with linear interpolation.
+// f(i) = excess[base+i] − J_k[base+i] using SIGNED excess = K-S (not clamped), monotone
+// decreasing in i: f ≈ 0 across the exercise plateau (deep ITM, V_k = K-S), then f < 0
+// past the boundary (continuation, V_k > K-S), ultimately very negative at deep OTM.
+// Boundary = rightmost i with f(i) ≥ −tol. Negative tolerance absorbs numerical noise
+// from the explicit H^(3) time-step that can push J_k slightly above intrinsic in the
+// exercise region (previous f ≥ 0 threshold spuriously collapsed the exercise set).
 #[inline]
-fn find_boundary_for_state(j_k: &[f64], excess: &[f64], x_grid: &[f64], l: usize, n: usize) -> f64 {
+fn find_boundary_for_state(j_k: &[f64], excess: &[f64], x_grid: &[f64], l: usize, n: usize, strike: f64) -> f64 {
     let base = l * n;
     let f = |i: usize| excess[base + i] - j_k[base + i];
+    let tol = 1e-6 * strike;
 
-    // Edge cases: entire range in-the-money or none at all.
-    if f(n - 1) >= 0.0 {
-        return x_grid[n - 1];
-    }
-    if f(0) < 0.0 {
-        return x_grid[0];
-    }
-    // Invariant: f(lo) >= 0, f(hi) < 0. Converge to rightmost crossing.
+    // Entire grid is exercise region (rare: deep ITM throughout).
+    if f(n - 1) >= -tol { return x_grid[n - 1]; }
+    // No exercise region (even deep ITM has f < -tol — exercise boundary outside grid).
+    if f(0) < -tol { return x_grid[0]; }
+    // Invariant: f(lo) ≥ -tol (exercise plateau), f(hi) < -tol (continuation).
     let mut lo = 0;
     let mut hi = n - 1;
     while lo + 1 < hi {
         let mid = (lo + hi) / 2;
-        if f(mid) >= 0.0 { lo = mid; } else { hi = mid; }
+        if f(mid) >= -tol { lo = mid; } else { hi = mid; }
     }
-    let cross = lo;
-
-    let f_lo = f(cross);
-    let f_hi = f(cross + 1);
-    if (f_lo - f_hi).abs() > 1e-30 {
-        let alpha = f_lo / (f_lo - f_hi);
-        return x_grid[cross] + alpha * (x_grid[cross + 1] - x_grid[cross]);
+    let f_lo = f(lo);
+    let f_hi = f(lo + 1);
+    if (f_lo - f_hi) > 1e-30 {
+        let alpha = ((f_lo + tol) / (f_lo - f_hi)).clamp(0.0, 1.0);
+        return x_grid[lo] + alpha * (x_grid[lo + 1] - x_grid[lo]);
     }
-    x_grid[cross]
+    x_grid[lo]
 }
 
-// Find b_k(v_l) for a call: X-space boundary where intrinsic = continuation for variance state l.
-// f(i) = excess_call[base+i] − J_k[base+i]; monotone increasing in i (OTM → deep ITM).
-// Binary-search for the leftmost i where f(i) ≥ 0, then refine with linear interpolation.
-// Returns +∞ when no exercise region exists (correct for q=0: INFINITY causes h3 to be zero everywhere).
+// Find b_k(v_l) for a call: X-space boundary where exercise region is the RIGHT side.
+// f(i) = excess[base+i] − J_k[base+i] with signed excess = S−K; monotone increasing in i:
+// f very negative at deep OTM, crosses 0 at the boundary, plateau f ≈ 0 across exercise.
+// Boundary = leftmost i with f(i) ≥ −tol. Returns +∞ when no exercise region exists
+// (q=0 case: h3 then zero everywhere, recovering European Heston).
 #[inline]
-fn find_boundary_for_state_call(j_k: &[f64], excess: &[f64], x_grid: &[f64], l: usize, n: usize) -> f64 {
+fn find_boundary_for_state_call(j_k: &[f64], excess: &[f64], x_grid: &[f64], l: usize, n: usize, strike: f64) -> f64 {
     let base = l * n;
     let f = |i: usize| excess[base + i] - j_k[base + i];
+    let tol = 1e-6 * strike;
 
-    if f(n - 1) < 0.0 { return f64::INFINITY; } // no exercise anywhere
-    if f(0) >= 0.0 { return x_grid[0]; }          // entire range is exercise region
-    // Invariant: f(lo) < 0, f(hi) >= 0. Converge to leftmost crossing.
+    if f(n - 1) < -tol { return f64::INFINITY; } // no exercise anywhere in grid
+    if f(0) >= -tol { return x_grid[0]; }         // entire grid is exercise region
+    // Invariant: f(lo) < -tol (continuation), f(hi) ≥ -tol (exercise plateau).
     let mut lo = 0;
     let mut hi = n - 1;
     while lo + 1 < hi {
         let mid = (lo + hi) / 2;
-        if f(mid) < 0.0 { lo = mid; } else { hi = mid; }
+        if f(mid) < -tol { lo = mid; } else { hi = mid; }
     }
-    let cross = hi;
-    let f_lo = f(cross - 1);
-    let f_hi = f(cross);
-    if (f_hi - f_lo).abs() > 1e-30 {
-        let alpha = f_lo.abs() / (f_lo.abs() + f_hi.abs());
-        return x_grid[cross - 1] + alpha * (x_grid[cross] - x_grid[cross - 1]);
+    let f_lo = f(lo);
+    let f_hi = f(lo + 1);
+    if (f_hi - f_lo) > 1e-30 {
+        let alpha = ((-tol - f_lo) / (f_hi - f_lo)).clamp(0.0, 1.0);
+        return x_grid[lo] + alpha * (x_grid[lo + 1] - x_grid[lo]);
     }
-    x_grid[cross]
+    x_grid[lo + 1]
 }
 
 #[inline]
@@ -748,12 +771,22 @@ pub fn run_algorithm_31(
             .zip(h3.iter())
             .for_each(|((r, &jv), &h)| *r = jv + dt * h);
         j = operator.apply(&rhs);
+        // Enforce American constraint J_k ≥ h1 = max(intrinsic, 0) pointwise.
+        // The paper's Algorithm 3.1 requires a self-consistent boundary at each step;
+        // the explicit lag (h3 built from boundary_{k+1}) lets J_k drift below intrinsic
+        // under numerical noise, which then classifies the entire plateau as "no exercise"
+        // (h3 → 0) and cascades into a European-style propagation. Projection restores the
+        // invariant and stabilizes the boundary search on the next iteration.
+        j.iter_mut().zip(excess.iter()).for_each(|(v, &e)| {
+            let payoff = e.max(0.0);
+            if *v < payoff { *v = payoff; }
+        });
         boundary_x[k] = (0..m)
             .into_par_iter()
             .map(|l| if is_call {
-                find_boundary_for_state_call(&j, &excess, &ctmc.x_grid, l, n)
+                find_boundary_for_state_call(&j, &excess, &ctmc.x_grid, l, n, k_strike)
             } else {
-                find_boundary_for_state(&j, &excess, &ctmc.x_grid, l, n)
+                find_boundary_for_state(&j, &excess, &ctmc.x_grid, l, n, k_strike)
             })
             .collect();
     }
