@@ -2,8 +2,8 @@ pub mod fetcher;
 pub mod options_chain;
 pub mod volatility; 
 use options::{BlackScholesPrice, Options, black_scholes::black_scholes_price};
-use options::exotics::{AsianKind, AsianOption, AsianPooling, ConvertibleBond};
-use numerical_methods::{PenaltySolver, TimestepMode, monte_carlo_asian};
+use options::exotics::{AsianKind, AsianOption, AsianPooling, CliquetKind, CliquetOption, ConvertibleBond};
+use numerical_methods::{PenaltySolver, TimestepMode, monte_carlo_asian, monte_carlo_cliquet};
 
 #[tokio::main]
 async fn main() {
@@ -139,5 +139,32 @@ async fn main() {
     println!(
         "    Path MC:               {:.4}  +/- {:.4}  (95% CI)",
         max_mc.price, 1.96 * max_mc.std_error,
+    );
+
+    // Cliquet (ratchet) options demo
+    println!("\nCliquet Options");
+
+    let cliquet_call = CliquetOption::new(
+        CliquetKind::Call, 100.0, 0.30, 0.05, 1.0, None, 12,
+        None, Some(0.0), None, None,
+    );
+    let cq_cf = cliquet_call.bs_pricing();
+    let cq_mc = monte_carlo_cliquet(&cliquet_call, 200_000, 12);
+    println!("  Call  S=100 sigma=0.30 r=0.05 T=1  N=12  (uncapped, lf=0)");
+    println!("    Forward-start strip CF: {:.4}", cq_cf);
+    println!(
+        "    Path MC:                {:.4}  +/- {:.4}  (95% CI)",
+        cq_mc.price, 1.96 * cq_mc.std_error,
+    );
+
+    let cliquet_capped = CliquetOption::new(
+        CliquetKind::Call, 100.0, 0.30, 0.05, 1.0, None, 12,
+        Some(0.04), Some(0.0), None, None,
+    );
+    let cap_mc = monte_carlo_cliquet(&cliquet_capped, 200_000, 12);
+    println!("  Call  same, local_cap=0.04");
+    println!(
+        "    Path MC (capped):       {:.4}  +/- {:.4}  (95% CI)",
+        cap_mc.price, 1.96 * cap_mc.std_error,
     );
 }

@@ -7,6 +7,7 @@ pub mod slv;
 
 use nalgebra::{DMatrix, DVector};
 use options::exotics::{AsianKind, AsianOption, AsianPooling, kemna_vorst_geometric_price};
+use options::exotics::{CliquetKind, CliquetOption};
 use options::{MonteCarloParameters, Options, Payoff};
 use rand::SeedableRng;
 use rand::rng;
@@ -296,6 +297,79 @@ pub fn monte_carlo_asian(
     };
 
     MonteCarloResult { price, std_error }
+}
+
+/// Path-aware Monte Carlo for cliquet (ratchet) options.
+///
+/// Simulates GBM with `num_resets` reset periods. For each period the
+/// fractional return r_i = S_{t_{i+1}}/S_{t_i} - 1 is computed (puts use
+/// -r_i), clamped to [local_floor, local_cap], and accumulated. The
+/// summed return is clamped to [global_floor, global_cap]. Antithetic
+/// variates and rayon parallelism mirror `monte_carlo_asian`. Caps and
+/// floors that are `None` impose no clamp on that side.
+pub fn monte_carlo_cliquet(
+    opt: &CliquetOption,
+    num_simulations: u32,
+    num_resets: u32,
+) -> MonteCarloResult {
+    let n = num_resets.max(1) as usize;
+    let t = opt.time_to_maturity;
+    let r = opt.risk_free_rate;
+    let q = opt.dividend();
+    let sigma = opt.volatility;
+
+    let dt = t / n as f64;
+    let drift = (r - q - 0.5 * sigma * sigma) * dt;
+    let sqrt_dt = dt.sqrt();
+    let discount = (-r * t).exp();
+
+    let lc = opt.local_cap.unwrap_or(f64::INFINITY);
+    let lf = opt.local_floor.unwrap_or(f64::NEG_INFINITY);
+    let gc = opt.global_cap.unwrap_or(f64::INFINITY);
+    let gf = opt.global_floor.unwrap_or(f64::NEG_INFINITY);
+    let is_put = opt.kind == CliquetKind::Put;
+
+    let (sum, sum_sq): (f64, f64) = (0..num_simulations)
+        .into_par_iter()
+        .map_init(
+            || {
+                let rng = Xoshiro256PlusPlus::from_rng(&mut rand::rng());
+                let normal = Normal::new(0.0, 1.0).unwrap();
+                (rng, normal)
+            },
+            |(rng, normal), _| {
+                let mut acc_plus = 0.0_f64;
+                let mut acc_minus = 0.0_f64;
+                for _ in 0..n {
+                    let z: f64 = normal.sample(rng);
+                    // Gross factor S_{t+1}/S_t for the two antithetic paths.
+                    let g_plus = (drift + sigma * sqrt_dt * z).exp();
+                    let g_minus = (drift - sigma * sqrt_dt * z).exp();
+                    let mut r_plus = g_plus - 1.0;
+                    let mut r_minus = g_minus - 1.0;
+                    if is_put {
+                        r_plus = -r_plus;
+                        r_minus = -r_minus;
+                    }
+                    // .max(lf).min(lc) instead of clamp: no panic if floor > cap.
+                    acc_plus += r_plus.max(lf).min(lc);
+                    acc_minus += r_minus.max(lf).min(lc);
+                }
+                let pay_plus = acc_plus.max(gf).min(gc);
+                let pay_minus = acc_minus.max(gf).min(gc);
+                let val = 0.5 * (pay_plus + pay_minus);
+                (val, val * val)
+            },
+        )
+        .reduce(|| (0.0, 0.0), |(a, a2), (b, b2)| (a + b, a2 + b2));
+
+    let nf = num_simulations as f64;
+    let mean = sum / nf;
+    let variance = (sum_sq / nf - mean * mean).max(0.0);
+    MonteCarloResult {
+        price: discount * mean,
+        std_error: discount * (variance / nf).sqrt(),
+    }
 }
 
 /// Spatial grid with log-spacing
@@ -720,7 +794,7 @@ where
 mod tests {
     use super::*;
     use binomial::{BinomialParameters, ExerciseStyle, binomial_price};
-    use options::{Call, Put};
+    use options::{BlackScholesPrice, Call, Put};
     use std::time::Instant;
 
     #[test]
@@ -762,6 +836,63 @@ mod tests {
         let vanilla = options::Options::new_call(100.0, 100.0, 0.2, 0.05, 1.0, None).bs_pricing();
         assert!((mc.price - vanilla).abs() < 0.2,
             "Asian(N=1) {} vs vanilla {}", mc.price, vanilla);
+    }
+
+    #[test]
+    fn cliquet_uncapped_mc_matches_closed_form() {
+        // local_floor = 0, no caps, no global → analytic strip benchmark.
+        let opt = CliquetOption::new(
+            CliquetKind::Call, 100.0, 0.3, 0.05, 1.0, None, 4,
+            None, Some(0.0), None, None,
+        );
+        let cf = opt.bs_pricing();
+        let mc = monte_carlo_cliquet(&opt, 200_000, 4);
+        assert!((mc.price - cf).abs() < 2.0 * 1.96 * mc.std_error + 1e-3,
+            "MC {} vs CF {} (se {})", mc.price, cf, mc.std_error);
+    }
+
+    #[test]
+    fn cliquet_local_cap_reduces_price() {
+        let base = CliquetOption::new(
+            CliquetKind::Call, 100.0, 0.3, 0.05, 1.0, None, 4,
+            None, Some(0.0), None, None,
+        );
+        let capped = CliquetOption::new(
+            CliquetKind::Call, 100.0, 0.3, 0.05, 1.0, None, 4,
+            Some(0.05), Some(0.0), None, None,
+        );
+        let p_base = monte_carlo_cliquet(&base, 200_000, 4).price;
+        let p_cap = monte_carlo_cliquet(&capped, 200_000, 4).price;
+        assert!(p_cap < p_base, "cap {} not below uncapped {}", p_cap, p_base);
+    }
+
+    #[test]
+    fn cliquet_global_floor_increases_price() {
+        // Allow negative leg returns (local_floor = None) so a global floor bites.
+        let no_floor = CliquetOption::new(
+            CliquetKind::Call, 100.0, 0.3, 0.05, 1.0, None, 4,
+            None, None, None, None,
+        );
+        let floored = CliquetOption::new(
+            CliquetKind::Call, 100.0, 0.3, 0.05, 1.0, None, 4,
+            None, None, None, Some(0.0),
+        );
+        let p0 = monte_carlo_cliquet(&no_floor, 200_000, 4).price;
+        let p1 = monte_carlo_cliquet(&floored, 200_000, 4).price;
+        assert!(p1 > p0, "global floor {} not above {}", p1, p0);
+    }
+
+    #[test]
+    fn cliquet_single_reset_matches_vanilla_atm() {
+        let s = 100.0;
+        let opt = CliquetOption::new(
+            CliquetKind::Call, s, 0.2, 0.05, 1.0, None, 1,
+            None, Some(0.0), None, None,
+        );
+        let mc = monte_carlo_cliquet(&opt, 400_000, 1);
+        let vanilla = options::Options::new_call(100.0, s, 0.2, 0.05, 1.0, None).bs_pricing();
+        assert!((mc.price - vanilla / s).abs() < 0.01,
+            "cliquet(N=1) {} vs vanilla/S {}", mc.price, vanilla / s);
     }
 
     /// Speed comparison test: Monte Carlo vs Price Path

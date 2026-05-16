@@ -252,6 +252,31 @@ export default function App() {
           num_observations: numObs,
         };
       }
+      if (exoticType === "cliquet_option") {
+        const cqType = (exoticValues.cliquet_option_type === "put" ? "put" : "call") as "call" | "put";
+        const numResets = Math.max(1, parseInt(exoticValues.num_resets || "12") || 12);
+        const pct = (k: string): number | null => {
+          const raw = exoticValues[k];
+          if (raw === undefined || raw === "") return null;
+          const v = parseFloat(raw);
+          return Number.isFinite(v) ? v / 100 : null;
+        };
+        return {
+          structure_type: "exotic",
+          exotic_type: "cliquet_option",
+          option_type: cqType,
+          spot_price: S,
+          volatility: vol,
+          risk_free_rate: r,
+          time_to_maturity: T || 1,
+          dividend_yield: q || null,
+          num_resets: numResets,
+          local_cap: pct("local_cap"),
+          local_floor: pct("local_floor"),
+          global_cap: pct("global_cap"),
+          global_floor: pct("global_floor"),
+        };
+      }
       return {
         structure_type: "exotic",
         exotic_type: "chooser_option",

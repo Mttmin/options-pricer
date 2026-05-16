@@ -4,6 +4,7 @@ use statrs::distribution::{ContinuousCDF, Normal};
 pub enum ExoticOptions {
     ConvertibleBond(ConvertibleBond),
     AsianOption(AsianOption),
+    CliquetOption(CliquetOption),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -270,6 +271,133 @@ pub fn conze_lookback_fixed_strike_price(opt: &AsianOption) -> f64 {
     }
 }
 
+// =====================================================================
+// Cliquet (ratchet) options: a strip of consecutive forward-start
+// options. The underlying is monitored at N reset dates; each period
+// contributes a return r_i = S_{t_{i+1}}/S_{t_i} - 1. Per-period returns
+// are clamped to [local_floor, local_cap], summed, and the sum is
+// clamped to [global_floor, global_cap]. Calls use +r_i; puts use -r_i.
+//
+// Pricing: the analytic closed form here values the UNCAPPED strip with
+// each leg floored at zero as a sum of forward-start ATM Black-Scholes
+// options (Rubinstein, 1991), in fractional-return units. It is a
+// benchmark only; the path-MC in the numerical-methods crate handles
+// arbitrary caps/floors exactly.
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliquetKind {
+    Call,
+    Put,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CliquetOption {
+    pub kind: CliquetKind,
+    pub spot_price: f64,
+    pub volatility: f64,
+    pub risk_free_rate: f64,
+    pub time_to_maturity: f64,
+    pub dividend_yield: Option<f64>,
+    pub num_resets: u32,
+    pub local_cap: Option<f64>,
+    pub local_floor: Option<f64>,
+    pub global_cap: Option<f64>,
+    pub global_floor: Option<f64>,
+}
+
+impl CliquetOption {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        kind: CliquetKind,
+        spot_price: f64,
+        volatility: f64,
+        risk_free_rate: f64,
+        time_to_maturity: f64,
+        dividend_yield: Option<f64>,
+        num_resets: u32,
+        local_cap: Option<f64>,
+        local_floor: Option<f64>,
+        global_cap: Option<f64>,
+        global_floor: Option<f64>,
+    ) -> Self {
+        Self {
+            kind,
+            spot_price,
+            volatility,
+            risk_free_rate,
+            time_to_maturity,
+            dividend_yield,
+            num_resets: num_resets.max(1),
+            local_cap,
+            local_floor,
+            global_cap,
+            global_floor,
+        }
+    }
+
+    pub fn dividend(&self) -> f64 {
+        self.dividend_yield.unwrap_or(0.0)
+    }
+
+    /// Analytic benchmark: value of the UNCAPPED strip with each leg
+    /// floored at zero (sum of forward-start ATM Black-Scholes options).
+    /// Caps/floors are NOT reflected here — use `monte_carlo_cliquet`
+    /// for the exact capped/floored price.
+    pub fn closed_form_price(&self) -> f64 {
+        forward_start_strip_price(self)
+    }
+}
+
+impl BlackScholesPrice for CliquetOption {
+    fn bs_pricing(&self) -> f64 {
+        self.closed_form_price()
+    }
+}
+
+impl MonteCarloParameters for CliquetOption {
+    fn spot_price(&self) -> f64 { self.spot_price }
+    fn volatility(&self) -> f64 { self.volatility }
+    fn risk_free_rate(&self) -> f64 { self.risk_free_rate }
+    fn time_to_maturity(&self) -> f64 { self.time_to_maturity }
+}
+
+/// Sum of N consecutive forward-start ATM options (Rubinstein, 1991),
+/// in fractional-return units, settled at maturity to match the MC
+/// payoff: r_i = S_{t_{i+1}}/S_{t_i} - 1 floored at zero, accumulated
+/// and discounted once by e^{-rT}.
+///
+/// For equally spaced resets each period has length tau = T/N. By the
+/// scale invariance of GBM the per-period return is i.i.d.; the
+/// undiscounted expectation of one floored leg (S = K = 1) is the
+/// forward-style BS amount with forward F = e^{(r-q)·tau}:
+///
+///   d1 = ((r - q + 0.5σ²)·tau) / (σ·sqrt(tau)),  d2 = d1 - σ·sqrt(tau)
+///   leg = F·N(d1) - N(d2)            (call)
+///         N(-d2) - F·N(-d1)          (put)
+///   price = N · e^{-r·T} · leg       (fractional units; S0-independent)
+pub fn forward_start_strip_price(opt: &CliquetOption) -> f64 {
+    let n = opt.num_resets as f64;
+    let t = opt.time_to_maturity;
+    let r = opt.risk_free_rate;
+    let q = opt.dividend();
+    let sigma = opt.volatility;
+    let tau = t / n;
+
+    let std_norm = Normal::new(0.0, 1.0).unwrap();
+    let sqrt_tau = tau.sqrt();
+    let d1 = ((r - q + 0.5 * sigma * sigma) * tau) / (sigma * sqrt_tau);
+    let d2 = d1 - sigma * sqrt_tau;
+    let fwd = ((r - q) * tau).exp();
+
+    let leg = match opt.kind {
+        CliquetKind::Call => fwd * std_norm.cdf(d1) - std_norm.cdf(d2),
+        CliquetKind::Put => std_norm.cdf(-d2) - fwd * std_norm.cdf(-d1),
+    };
+
+    n * (-r * t).exp() * leg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +495,41 @@ mod tests {
         ).bs_pricing();
         let vanilla = Options::new_put(k, s, sigma, r, t, None).bs_pricing();
         assert!(lookback > vanilla);
+    }
+
+    #[test]
+    fn test_cliquet_strip_positive_and_finite() {
+        let c = CliquetOption::new(
+            CliquetKind::Call, 100.0, 0.3, 0.05, 1.0, None, 4,
+            None, Some(0.0), None, None,
+        );
+        let p = c.bs_pricing();
+        assert!(p > 0.0 && p.is_finite());
+    }
+
+    #[test]
+    fn test_cliquet_single_reset_matches_vanilla_atm() {
+        // N=1, t_0=0 → V_0 = bs_unit(tau=T) = fractional ATM BS call
+        // = vanilla ATM BS call value / S0 (scale invariance).
+        let s = 100.0;
+        let c = CliquetOption::new(
+            CliquetKind::Call, s, 0.2, 0.05, 1.0, None, 1,
+            None, Some(0.0), None, None,
+        );
+        let vanilla = Options::new_call(100.0, s, 0.2, 0.05, 1.0, None).bs_pricing();
+        assert!((c.bs_pricing() - vanilla / s).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cliquet_put_below_call_zero_div() {
+        let call = CliquetOption::new(
+            CliquetKind::Call, 100.0, 0.25, 0.05, 1.0, None, 4,
+            None, Some(0.0), None, None,
+        ).bs_pricing();
+        let put = CliquetOption::new(
+            CliquetKind::Put, 100.0, 0.25, 0.05, 1.0, None, 4,
+            None, Some(0.0), None, None,
+        ).bs_pricing();
+        assert!(call > put && put > 0.0);
     }
 }

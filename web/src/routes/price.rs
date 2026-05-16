@@ -3,11 +3,11 @@ use axum::Json;
 use std::sync::Arc;
 use std::time::Instant;
 use options::black_scholes::{black_scholes_approx_american, black_scholes_price, spread_black_scholes_approx_american};
-use options::exotics::{AsianKind, AsianOption, AsianPooling, ChooserOption, ConvertibleBond};
+use options::exotics::{AsianKind, AsianOption, AsianPooling, ChooserOption, CliquetKind, CliquetOption, ConvertibleBond};
 use options::optionspreads::{Direction, OptionSpreads};
 use options::{BlackScholesPrice, Call, Greeks, MonteCarloParameters, Options, Payoff, Put};
 use numerical_methods::binomial::{binomial_price, BinomialParameters, ExerciseStyle};
-use numerical_methods::{monte_carlo, monte_carlo_asian, price_european, PenaltySolver, TimestepMode};
+use numerical_methods::{monte_carlo, monte_carlo_asian, monte_carlo_cliquet, price_european, PenaltySolver, TimestepMode};
 
 use crate::error::AppError;
 use crate::models::request::*;
@@ -661,6 +661,75 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                     params.strike_price, s, params.volatility,
                     params.risk_free_rate, params.time_to_maturity, params.dividend_yield,
                     params.num_observations,
+                );
+                payoffs.push(probe.bs_pricing() - cf_price);
+            }
+
+            Ok(PriceResponse {
+                structure_type: "exotic".to_string(),
+                pricing: PricingResult {
+                    black_scholes: cf_price,
+                    monte_carlo: Some(mc_result),
+                    binomial_european: None,
+                    binomial_american: None,
+                    bs_american_approx: None,
+                    penalty_solver: None,
+                    timings: Some(PricingTimings {
+                        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                        black_scholes_ms: Some(bs_ms),
+                        monte_carlo_ms: Some(mc_ms),
+                        binomial_european_ms: None,
+                        binomial_american_ms: None,
+                        bs_american_approx_ms: None,
+                        penalty_solver_ms: None,
+                    }),
+                },
+                greeks: None,
+                payoff_curve: Some(PayoffCurve { spot_prices, payoffs }),
+            })
+        }
+        ExoticTypeInput::CliquetOption => {
+            let total_start = Instant::now();
+            let params: CliquetOptionRequest = serde_json::from_value(req.params)
+                .map_err(|e| AppError::BadRequest(format!("Invalid cliquet option params: {}", e)))?;
+
+            let kind = match params.option_type {
+                OptionTypeInput::Call => CliquetKind::Call,
+                OptionTypeInput::Put => CliquetKind::Put,
+            };
+            let cliquet = CliquetOption::new(
+                kind, params.spot_price, params.volatility, params.risk_free_rate,
+                params.time_to_maturity, params.dividend_yield, params.num_resets,
+                params.local_cap, params.local_floor, params.global_cap, params.global_floor,
+            );
+
+            let bs_start = Instant::now();
+            let cf_price = cliquet.bs_pricing();
+            let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
+
+            let mc_start = Instant::now();
+            let mc = monte_carlo_cliquet(&cliquet, params.mc_simulations, params.num_resets);
+            let mc_ms = mc_start.elapsed().as_secs_f64() * 1000.0;
+            let mc_result = MonteCarloResult {
+                price: mc.price,
+                std_error: mc.std_error,
+                ci_lower: mc.price - 1.96 * mc.std_error,
+                ci_upper: mc.price + 1.96 * mc.std_error,
+            };
+
+            // Payoff curve: closed-form benchmark vs S0 (S0-independent, flat).
+            let mut spot_prices = Vec::with_capacity(100);
+            let mut payoffs = Vec::with_capacity(100);
+            let min_spot = params.spot_price * 0.5;
+            let max_spot = params.spot_price * 1.5;
+            let step = (max_spot - min_spot) / 99.0;
+            for i in 0..100 {
+                let s = min_spot + (i as f64) * step;
+                spot_prices.push(s);
+                let probe = CliquetOption::new(
+                    kind, s, params.volatility, params.risk_free_rate,
+                    params.time_to_maturity, params.dividend_yield, params.num_resets,
+                    params.local_cap, params.local_floor, params.global_cap, params.global_floor,
                 );
                 payoffs.push(probe.bs_pricing() - cf_price);
             }

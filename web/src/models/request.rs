@@ -102,6 +102,7 @@ pub enum ExoticTypeInput {
     ConvertibleBond,
     ChooserOption,
     AsianOption,
+    CliquetOption,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -155,6 +156,32 @@ pub struct AsianOptionRequest {
 
 fn default_asian_observations() -> u32 {
     50
+}
+
+#[derive(Deserialize)]
+pub struct CliquetOptionRequest {
+    pub option_type: OptionTypeInput,
+    pub spot_price: f64,
+    pub volatility: f64,
+    pub risk_free_rate: f64,
+    pub time_to_maturity: f64,
+    pub dividend_yield: Option<f64>,
+    #[serde(default = "default_cliquet_resets")]
+    pub num_resets: u32,
+    #[serde(default)]
+    pub local_cap: Option<f64>,
+    #[serde(default)]
+    pub local_floor: Option<f64>,
+    #[serde(default)]
+    pub global_cap: Option<f64>,
+    #[serde(default)]
+    pub global_floor: Option<f64>,
+    #[serde(default = "default_mc_simulations")]
+    pub mc_simulations: u32,
+}
+
+fn default_cliquet_resets() -> u32 {
+    12
 }
 
 #[derive(Deserialize)]

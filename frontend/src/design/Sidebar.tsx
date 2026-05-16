@@ -283,6 +283,7 @@ export function Sidebar(props: SidebarProps) {
               <option value="convertible_bond">Convertible Bond</option>
               <option value="chooser_option">Chooser Option</option>
               <option value="asian_option">Asian Option</option>
+              <option value="cliquet_option">Cliquet Option</option>
             </select>
           )}
         </div>
@@ -439,6 +440,46 @@ export function Sidebar(props: SidebarProps) {
                     <input className="input mono" type="number" step="1" min="1" placeholder="50"
                       value={exoticValues.num_observations ?? ""}
                       onChange={(e) => onExoticChange("num_observations", e.target.value)} />
+                  </Field>
+                  <Field label="Expiry" hint={ttm ? `${(ttm * 365).toFixed(0)}d` : ""}>
+                    <input className="input mono" type="date" value={expirationDate}
+                      onChange={(e) => setExpirationDate(e.target.value)} />
+                  </Field>
+                </>
+              )}
+              {exoticType === "cliquet_option" && (
+                <>
+                  <Field label="Option">
+                    <select className="select" value={exoticValues.cliquet_option_type || "call"}
+                      onChange={(e) => onExoticChange("cliquet_option_type", e.target.value)}>
+                      <option value="call">Call</option>
+                      <option value="put">Put</option>
+                    </select>
+                  </Field>
+                  <Field label="Resets" hint="periods N">
+                    <input className="input mono" type="number" step="1" min="1" placeholder="12"
+                      value={exoticValues.num_resets ?? ""}
+                      onChange={(e) => onExoticChange("num_resets", e.target.value)} />
+                  </Field>
+                  <Field label="Local Cap" hint="per-period %">
+                    <input className="input mono" type="number" step="0.01" placeholder="none"
+                      value={exoticValues.local_cap ?? ""}
+                      onChange={(e) => onExoticChange("local_cap", e.target.value)} />
+                  </Field>
+                  <Field label="Local Floor" hint="per-period %">
+                    <input className="input mono" type="number" step="0.01" placeholder="none"
+                      value={exoticValues.local_floor ?? ""}
+                      onChange={(e) => onExoticChange("local_floor", e.target.value)} />
+                  </Field>
+                  <Field label="Global Cap" hint="total %">
+                    <input className="input mono" type="number" step="0.01" placeholder="none"
+                      value={exoticValues.global_cap ?? ""}
+                      onChange={(e) => onExoticChange("global_cap", e.target.value)} />
+                  </Field>
+                  <Field label="Global Floor" hint="total %">
+                    <input className="input mono" type="number" step="0.01" placeholder="none"
+                      value={exoticValues.global_floor ?? ""}
+                      onChange={(e) => onExoticChange("global_floor", e.target.value)} />
                   </Field>
                   <Field label="Expiry" hint={ttm ? `${(ttm * 365).toFixed(0)}d` : ""}>
                     <input className="input mono" type="date" value={expirationDate}
