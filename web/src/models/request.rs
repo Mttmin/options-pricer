@@ -101,6 +101,14 @@ pub enum SpreadTypeInput {
 pub enum ExoticTypeInput {
     ConvertibleBond,
     ChooserOption,
+    AsianOption,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum AsianPoolingInput {
+    Average,
+    Max,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +135,26 @@ pub struct ChooserOptionRequest {
     pub time_to_maturity: f64,
     pub dividend_yield: Option<f64>,
     pub choose_time: f64,
+}
+
+#[derive(Deserialize)]
+pub struct AsianOptionRequest {
+    pub option_type: OptionTypeInput,
+    pub pooling: AsianPoolingInput,
+    pub spot_price: f64,
+    pub strike_price: f64,
+    pub volatility: f64,
+    pub risk_free_rate: f64,
+    pub time_to_maturity: f64,
+    pub dividend_yield: Option<f64>,
+    #[serde(default = "default_asian_observations")]
+    pub num_observations: u32,
+    #[serde(default = "default_mc_simulations")]
+    pub mc_simulations: u32,
+}
+
+fn default_asian_observations() -> u32 {
+    50
 }
 
 #[derive(Deserialize)]

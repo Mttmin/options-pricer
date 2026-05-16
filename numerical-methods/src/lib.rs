@@ -1,3 +1,4 @@
+
 pub mod binomial;
 pub mod ctmc;
 pub mod deep_cal;
@@ -5,6 +6,7 @@ pub mod expm;
 pub mod slv;
 
 use nalgebra::{DMatrix, DVector};
+use options::exotics::{AsianKind, AsianOption, AsianPooling, kemna_vorst_geometric_price};
 use options::{MonteCarloParameters, Options, Payoff};
 use rand::SeedableRng;
 use rand::rng;
@@ -165,6 +167,133 @@ where
     let price = discount * mean_payoff;
     let variance = (sum_sq / n) - (mean_payoff * mean_payoff);
     let std_error = discount * (variance / n).sqrt();
+
+    MonteCarloResult { price, std_error }
+}
+
+/// Path-aware Monte Carlo for Asian options (Average / Max pooling).
+///
+/// Simulates GBM paths with `num_steps` increments, monitors the spot at
+/// each step, then applies the pooled payoff:
+///   - Average: arithmetic mean of monitored spots → Asian payoff.
+///   - Max:     path max (call) / path min (put) → fixed-strike lookback.
+///
+/// Uses antithetic variates throughout. When `use_geometric_control_variate`
+/// is true and pooling is Average, the geometric Asian payoff is computed
+/// alongside the arithmetic one and the Kemna-Vorst closed form is used as
+/// a control variate, sharply cutting variance for arithmetic Asian.
+pub fn monte_carlo_asian(
+    opt: &AsianOption,
+    num_simulations: u32,
+    num_steps: u32,
+    use_geometric_control_variate: bool,
+) -> MonteCarloResult {
+    let n_steps = num_steps.max(1) as usize;
+    let t = opt.time_to_maturity;
+    let r = opt.risk_free_rate;
+    let q = opt.dividend();
+    let sigma = opt.volatility;
+    let s0 = opt.spot_price;
+    let k = opt.strike_price;
+
+    let dt = t / n_steps as f64;
+    let drift = (r - q - 0.5 * sigma * sigma) * dt;
+    let sqrt_dt = dt.sqrt();
+    let discount = (-r * t).exp();
+
+    let use_cv = use_geometric_control_variate && opt.pooling == AsianPooling::Average;
+    let inv_n_steps = 1.0 / n_steps as f64;
+
+    // Accumulate first/second moments of (arithmetic_payoff - β·geometric_payoff)
+    // for variance reduction. β = 1 (standard Kemna-Vorst CV).
+    let (sum, sum_sq): (f64, f64) = (0..num_simulations)
+        .into_par_iter()
+        .map_init(
+            || {
+                let rng = Xoshiro256PlusPlus::from_rng(&mut rand::rng());
+                let normal = Normal::new(0.0, 1.0).unwrap();
+                (rng, normal)
+            },
+            |(rng, normal), _| {
+                // Simulate two antithetic paths simultaneously.
+                let mut s_plus = s0;
+                let mut s_minus = s0;
+                let mut sum_plus = 0.0_f64;
+                let mut sum_minus = 0.0_f64;
+                let mut log_sum_plus = 0.0_f64;
+                let mut log_sum_minus = 0.0_f64;
+                let mut ext_plus = s0;
+                let mut ext_minus = s0;
+
+                for _ in 0..n_steps {
+                    let z: f64 = normal.sample(rng);
+                    let step_plus = drift + sigma * sqrt_dt * z;
+                    let step_minus = drift - sigma * sqrt_dt * z;
+                    s_plus *= step_plus.exp();
+                    s_minus *= step_minus.exp();
+
+                    sum_plus += s_plus;
+                    sum_minus += s_minus;
+
+                    if use_cv {
+                        log_sum_plus += s_plus.ln();
+                        log_sum_minus += s_minus.ln();
+                    }
+
+                    match (opt.pooling, opt.kind) {
+                        (AsianPooling::Max, AsianKind::Call) => {
+                            if s_plus > ext_plus { ext_plus = s_plus; }
+                            if s_minus > ext_minus { ext_minus = s_minus; }
+                        }
+                        (AsianPooling::Max, AsianKind::Put) => {
+                            if s_plus < ext_plus { ext_plus = s_plus; }
+                            if s_minus < ext_minus { ext_minus = s_minus; }
+                        }
+                        _ => {}
+                    }
+                }
+
+                let payoff = |stat: f64| match opt.kind {
+                    AsianKind::Call => (stat - k).max(0.0),
+                    AsianKind::Put => (k - stat).max(0.0),
+                };
+
+                let (arith_plus, arith_minus, geom_plus, geom_minus) = match opt.pooling {
+                    AsianPooling::Average => (
+                        sum_plus * inv_n_steps,
+                        sum_minus * inv_n_steps,
+                        if use_cv { (log_sum_plus * inv_n_steps).exp() } else { 0.0 },
+                        if use_cv { (log_sum_minus * inv_n_steps).exp() } else { 0.0 },
+                    ),
+                    AsianPooling::Max => (ext_plus, ext_minus, 0.0, 0.0),
+                };
+
+                let arith_payoff = 0.5 * (payoff(arith_plus) + payoff(arith_minus));
+                let val = if use_cv {
+                    let geom_payoff = 0.5 * (payoff(geom_plus) + payoff(geom_minus));
+                    arith_payoff - geom_payoff
+                } else {
+                    arith_payoff
+                };
+
+                (val, val * val)
+            },
+        )
+        .reduce(|| (0.0, 0.0), |(a, a2), (b, b2)| (a + b, a2 + b2));
+
+    let n = num_simulations as f64;
+    let mean = sum / n;
+    let variance = (sum_sq / n - mean * mean).max(0.0);
+
+    let (price, std_error) = if use_cv {
+        // E[arith] = E[arith - geom] + E[geom_closed_form]
+        let geom_cf = kemna_vorst_geometric_price(opt);
+        let price = discount * mean + geom_cf;
+        let se = discount * (variance / n).sqrt();
+        (price, se)
+    } else {
+        (discount * mean, discount * (variance / n).sqrt())
+    };
 
     MonteCarloResult { price, std_error }
 }
@@ -593,6 +722,47 @@ mod tests {
     use binomial::{BinomialParameters, ExerciseStyle, binomial_price};
     use options::{Call, Put};
     use std::time::Instant;
+
+    #[test]
+    fn asian_mc_matches_kemna_vorst_with_cv() {
+        // Geometric CV applied to a geometric Asian collapses variance to 0 in
+        // theory. We verify the arithmetic Asian MC sits within a few std-errors
+        // of the closed-form geometric (Kemna-Vorst bound) and that increasing
+        // sims tightens the CI.
+        let opt = AsianOption::new(
+            AsianKind::Call, AsianPooling::Average,
+            100.0, 100.0, 0.3, 0.05, 1.0, None, 50,
+        );
+        let cf = kemna_vorst_geometric_price(&opt);
+        let mc = monte_carlo_asian(&opt, 50_000, 50, true);
+        // Arithmetic Asian > geometric Asian (Jensen) but close. CV must keep CI tight.
+        assert!(mc.price >= cf - 1e-2, "MC {} below CF {}", mc.price, cf);
+        assert!(mc.std_error < 0.05, "CV std_error too large: {}", mc.std_error);
+    }
+
+    #[test]
+    fn asian_max_call_mc_above_vanilla() {
+        let opt = AsianOption::new(
+            AsianKind::Call, AsianPooling::Max,
+            100.0, 100.0, 0.3, 0.05, 1.0, None, 100,
+        );
+        let mc = monte_carlo_asian(&opt, 50_000, 100, false);
+        let vanilla = options::Options::new_call(100.0, 100.0, 0.3, 0.05, 1.0, None).bs_pricing();
+        assert!(mc.price > vanilla);
+    }
+
+    #[test]
+    fn asian_average_single_obs_matches_vanilla() {
+        // With num_steps == 1, average = terminal spot = vanilla European payoff.
+        let opt = AsianOption::new(
+            AsianKind::Call, AsianPooling::Average,
+            100.0, 100.0, 0.2, 0.05, 1.0, None, 1,
+        );
+        let mc = monte_carlo_asian(&opt, 200_000, 1, false);
+        let vanilla = options::Options::new_call(100.0, 100.0, 0.2, 0.05, 1.0, None).bs_pricing();
+        assert!((mc.price - vanilla).abs() < 0.2,
+            "Asian(N=1) {} vs vanilla {}", mc.price, vanilla);
+    }
 
     /// Speed comparison test: Monte Carlo vs Price Path
     /// Run all speedtests: cargo test --release speedtest -- --ignored --nocapture

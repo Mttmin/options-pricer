@@ -17,7 +17,9 @@ export type SpreadType =
   | "butterfly"
   | "calendar_spread";
 
-export type ExoticType = "convertible_bond" | "chooser_option";
+export type ExoticType = "convertible_bond" | "chooser_option" | "asian_option";
+
+export type AsianPooling = "average" | "max";
 
 export type StructureType = "single" | "spread" | "exotic";
 
@@ -87,11 +89,27 @@ export type ChooserOptionRequest = {
   choose_time: number;
 };
 
+export type AsianOptionRequest = {
+  structure_type: "exotic";
+  exotic_type: "asian_option";
+  option_type: OptionType;
+  pooling: AsianPooling;
+  spot_price: number;
+  strike_price: number;
+  volatility: number;
+  risk_free_rate: number;
+  time_to_maturity: number;
+  dividend_yield: number | null;
+  num_observations: number;
+  mc_simulations?: number;
+};
+
 export type PriceRequest =
   | SingleOptionRequest
   | SpreadRequest
   | ConvertibleBondRequest
-  | ChooserOptionRequest;
+  | ChooserOptionRequest
+  | AsianOptionRequest;
 
 export type MonteCarloResult = {
   price: number;

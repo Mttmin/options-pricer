@@ -3,11 +3,11 @@ use axum::Json;
 use std::sync::Arc;
 use std::time::Instant;
 use options::black_scholes::{black_scholes_approx_american, black_scholes_price, spread_black_scholes_approx_american};
-use options::exotics::{ChooserOption, ConvertibleBond};
+use options::exotics::{AsianKind, AsianOption, AsianPooling, ChooserOption, ConvertibleBond};
 use options::optionspreads::{Direction, OptionSpreads};
 use options::{BlackScholesPrice, Call, Greeks, MonteCarloParameters, Options, Payoff, Put};
 use numerical_methods::binomial::{binomial_price, BinomialParameters, ExerciseStyle};
-use numerical_methods::{monte_carlo, price_european, PenaltySolver, TimestepMode};
+use numerical_methods::{monte_carlo, monte_carlo_asian, price_european, PenaltySolver, TimestepMode};
 
 use crate::error::AppError;
 use crate::models::request::*;
@@ -602,6 +602,82 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                         total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
                         black_scholes_ms: Some(bs_ms),
                         monte_carlo_ms: None,
+                        binomial_european_ms: None,
+                        binomial_american_ms: None,
+                        bs_american_approx_ms: None,
+                        penalty_solver_ms: None,
+                    }),
+                },
+                greeks: None,
+                payoff_curve: Some(PayoffCurve { spot_prices, payoffs }),
+            })
+        }
+        ExoticTypeInput::AsianOption => {
+            let total_start = Instant::now();
+            let params: AsianOptionRequest = serde_json::from_value(req.params)
+                .map_err(|e| AppError::BadRequest(format!("Invalid asian option params: {}", e)))?;
+
+            let kind = match params.option_type {
+                OptionTypeInput::Call => AsianKind::Call,
+                OptionTypeInput::Put => AsianKind::Put,
+            };
+            let pooling = match params.pooling {
+                AsianPoolingInput::Average => AsianPooling::Average,
+                AsianPoolingInput::Max => AsianPooling::Max,
+            };
+            let asian = AsianOption::new(
+                kind, pooling,
+                params.strike_price, params.spot_price, params.volatility,
+                params.risk_free_rate, params.time_to_maturity, params.dividend_yield,
+                params.num_observations,
+            );
+
+            let bs_start = Instant::now();
+            let cf_price = asian.bs_pricing();
+            let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
+
+            let use_cv = pooling == AsianPooling::Average;
+            let mc_start = Instant::now();
+            let mc = monte_carlo_asian(&asian, params.mc_simulations, params.num_observations, use_cv);
+            let mc_ms = mc_start.elapsed().as_secs_f64() * 1000.0;
+            let mc_result = MonteCarloResult {
+                price: mc.price,
+                std_error: mc.std_error,
+                ci_lower: mc.price - 1.96 * mc.std_error,
+                ci_upper: mc.price + 1.96 * mc.std_error,
+            };
+
+            // Payoff curve: closed-form price as a function of S0.
+            let mut spot_prices = Vec::with_capacity(100);
+            let mut payoffs = Vec::with_capacity(100);
+            let min_spot = params.spot_price * 0.5;
+            let max_spot = params.spot_price * 1.5;
+            let step = (max_spot - min_spot) / 99.0;
+            for i in 0..100 {
+                let s = min_spot + (i as f64) * step;
+                spot_prices.push(s);
+                let probe = AsianOption::new(
+                    kind, pooling,
+                    params.strike_price, s, params.volatility,
+                    params.risk_free_rate, params.time_to_maturity, params.dividend_yield,
+                    params.num_observations,
+                );
+                payoffs.push(probe.bs_pricing() - cf_price);
+            }
+
+            Ok(PriceResponse {
+                structure_type: "exotic".to_string(),
+                pricing: PricingResult {
+                    black_scholes: cf_price,
+                    monte_carlo: Some(mc_result),
+                    binomial_european: None,
+                    binomial_american: None,
+                    bs_american_approx: None,
+                    penalty_solver: None,
+                    timings: Some(PricingTimings {
+                        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                        black_scholes_ms: Some(bs_ms),
+                        monte_carlo_ms: Some(mc_ms),
                         binomial_european_ms: None,
                         binomial_american_ms: None,
                         bs_american_approx_ms: None,

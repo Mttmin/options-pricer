@@ -39,7 +39,6 @@ import { PayoffChart } from "./design/Charts.tsx";
 import { MarketModal, RightPanel, type ModalTab } from "./design/MarketContext.tsx";
 import { TweaksPanel, TWEAK_DEFAULTS, type Tweaks } from "./design/TweaksPanel.tsx";
 import { SpreadForm } from "./components/inputs/SpreadForm.tsx";
-import { ExoticForm } from "./components/inputs/ExoticForm.tsx";
 import { calculatePayoffGrid } from "./utils/payoff.ts";
 
 function todayPlus(days: number): string {
@@ -210,20 +209,47 @@ export default function App() {
       }
 
       if (exoticType === "convertible_bond") {
+        const couponPct = parseFloat(exoticValues.coupon_rate);
+        const coupon = Number.isFinite(couponPct) ? couponPct / 100 : 0.05;
+        const faceValue = parseFloat(exoticValues.face_value) || 1000;
+        const maturity = parseFloat(exoticValues.maturity) || 5;
+        const paymentFreq = Math.max(1, parseInt(exoticValues.payment_frequency || "2") || 2);
+        const creditSpreadPct = parseFloat(exoticValues.credit_spread);
+        const creditSpread = Number.isFinite(creditSpreadPct) ? creditSpreadPct / 100 : 0.02;
+        const conversionPrice = parseFloat(exoticValues.conversion_price) || 50;
         return {
           structure_type: "exotic",
           exotic_type: "convertible_bond",
-          face_value: 1000,
-          coupon_rate: 0.05,
-          maturity: 5,
-          payment_frequency: 2,
-          credit_spread: 0.02,
-          conversion_price: 50,
+          face_value: faceValue,
+          coupon_rate: coupon,
+          maturity,
+          payment_frequency: paymentFreq,
+          credit_spread: creditSpread,
+          conversion_price: conversionPrice,
           stock_price: S,
           volatility: vol,
-          time_to_maturity: T || 5,
+          time_to_maturity: T || maturity,
           risk_free_rate: r,
           dividend_yield: q || null,
+        };
+      }
+      if (exoticType === "asian_option") {
+        const pooling = (exoticValues.pooling === "max" ? "max" : "average") as "average" | "max";
+        const numObs = Math.max(1, parseInt(exoticValues.num_observations || "50") || 50);
+        const asianOptType = (exoticValues.asian_option_type === "put" ? "put" : "call") as "call" | "put";
+        const asianStrike = parseFloat(exoticValues.strike || strike) || S;
+        return {
+          structure_type: "exotic",
+          exotic_type: "asian_option",
+          option_type: asianOptType,
+          pooling,
+          spot_price: S,
+          strike_price: asianStrike,
+          volatility: vol,
+          risk_free_rate: r,
+          time_to_maturity: T || 1,
+          dividend_yield: q || null,
+          num_observations: numObs,
         };
       }
       return {
@@ -240,7 +266,7 @@ export default function App() {
     } catch {
       return null;
     }
-  }, [structure, optionType, direction, strike, bsArgs, effectiveVol, spreadType, strikes, exoticType]);
+  }, [structure, optionType, direction, strike, bsArgs, effectiveVol, spreadType, strikes, exoticType, exoticValues]);
 
   useEffect(() => {
     const req = buildRequest();
@@ -413,6 +439,8 @@ export default function App() {
           setStrikes={setStrikes}
           exoticType={exoticType}
           setExoticType={setExoticType}
+          exoticValues={exoticValues}
+          onExoticChange={handleExoticChange}
         />
 
         <div className="col center">
@@ -435,18 +463,6 @@ export default function App() {
                 strikes={strikes}
                 onStrikesChange={setStrikes}
                 showTypeSelector={true}
-              />
-            </div>
-          )}
-
-          {structure === "exotic" && (
-            <div style={{ padding: "14px", borderBottom: "1px solid var(--border)" }}>
-              <ExoticForm
-                exoticType={exoticType}
-                onExoticTypeChange={setExoticType}
-                values={exoticValues}
-                onChange={handleExoticChange}
-                manualOverride={manualOverride}
               />
             </div>
           )}

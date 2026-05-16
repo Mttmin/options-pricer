@@ -1,8 +1,9 @@
 pub mod fetcher;
 pub mod options_chain;
 pub mod volatility; 
-use options::{BlackScholesPrice, Options, black_scholes::black_scholes_price, exotics::ConvertibleBond};
-use numerical_methods::{PenaltySolver, TimestepMode};
+use options::{BlackScholesPrice, Options, black_scholes::black_scholes_price};
+use options::exotics::{AsianKind, AsianOption, AsianPooling, ConvertibleBond};
+use numerical_methods::{PenaltySolver, TimestepMode, monte_carlo_asian};
 
 #[tokio::main]
 async fn main() {
@@ -102,5 +103,41 @@ async fn main() {
     );
     solver.initialize();
     solver.solve();
-    print!("value of the quadratic solver {}",solver.option_value())
+    println!("value of the quadratic solver {}", solver.option_value());
+
+    // Asian options demo
+    println!("\nAsian Options");
+
+    let asian_avg_call = AsianOption::new(
+        AsianKind::Call, AsianPooling::Average,
+        100.0, 100.0, 0.3, 0.05, 1.0, None, 50,
+    );
+    let avg_cf = asian_avg_call.bs_pricing();
+    let avg_mc = monte_carlo_asian(&asian_avg_call, 200_000, 50, true);
+    println!(
+        "  Avg-pool Call  K=100 S=100 sigma=0.30 r=0.05 T=1  N=50",
+    );
+    println!(
+        "    Kemna-Vorst (geom CF): {:.4}",
+        avg_cf,
+    );
+    println!(
+        "    Arithmetic MC (CV):    {:.4}  +/- {:.4}  (95% CI)",
+        avg_mc.price, 1.96 * avg_mc.std_error,
+    );
+
+    let asian_max_put = AsianOption::new(
+        AsianKind::Put, AsianPooling::Max,
+        100.0, 100.0, 0.3, 0.05, 1.0, None, 100,
+    );
+    let max_cf = asian_max_put.bs_pricing();
+    let max_mc = monte_carlo_asian(&asian_max_put, 200_000, 200, false);
+    println!(
+        "  Max-pool Put   K=100 S=100 sigma=0.30 r=0.05 T=1  N=100",
+    );
+    println!("    Conze lookback CF:     {:.4}", max_cf);
+    println!(
+        "    Path MC:               {:.4}  +/- {:.4}  (95% CI)",
+        max_mc.price, 1.96 * max_mc.std_error,
+    );
 }

@@ -176,6 +176,8 @@ export type SidebarProps = {
   setStrikes: (s: SpreadStrikes) => void;
   exoticType: ExoticType;
   setExoticType: (e: ExoticType) => void;
+  exoticValues: Record<string, string>;
+  onExoticChange: (field: string, value: string) => void;
   loadingTicker: boolean;
 };
 
@@ -188,7 +190,7 @@ export function Sidebar(props: SidebarProps) {
     riskFreeRate, setRiskFreeRate, dividendYield, setDividendYield,
     volSource, setVolSource, volData, manualOverride, setManualOverride,
     spreadType, setSpreadType, strikes, setStrikes,
-    exoticType, setExoticType, loadingTicker,
+    exoticType, setExoticType, exoticValues, onExoticChange, loadingTicker,
   } = props;
 
   const volOptions: { key: VolSource; name: string; value: number | null }[] = volData ? [
@@ -280,6 +282,7 @@ export function Sidebar(props: SidebarProps) {
             <select className="select" value={exoticType} onChange={(e) => setExoticType(e.target.value as ExoticType)}>
               <option value="convertible_bond">Convertible Bond</option>
               <option value="chooser_option">Chooser Option</option>
+              <option value="asian_option">Asian Option</option>
             </select>
           )}
         </div>
@@ -344,6 +347,105 @@ export function Sidebar(props: SidebarProps) {
               <Field label="Expiry" hint={ttm ? `${(ttm * 365).toFixed(0)}d` : ""}>
                 <input className="input mono" type="date" value={expirationDate} onChange={(e) => setExpirationDate(e.target.value)} />
               </Field>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {structure === "exotic" && (
+        <div className="panel">
+          <div className="panel-h"><span>Exotic Parameters</span></div>
+          <div className="panel-body">
+            <div className="fields-grid">
+              {exoticType === "convertible_bond" && (
+                <>
+                  <Field label="Coupon" hint="%">
+                    <input className="input mono" type="number" step="0.01" placeholder="5.0"
+                      value={exoticValues.coupon_rate ?? ""}
+                      onChange={(e) => onExoticChange("coupon_rate", e.target.value)} />
+                  </Field>
+                  <Field label="Face Value">
+                    <input className="input mono" type="number" step="1" placeholder="1000"
+                      value={exoticValues.face_value ?? ""}
+                      onChange={(e) => onExoticChange("face_value", e.target.value)} />
+                  </Field>
+                  <Field label="Maturity" hint="yrs">
+                    <input className="input mono" type="number" step="0.25" placeholder="5"
+                      value={exoticValues.maturity ?? ""}
+                      onChange={(e) => onExoticChange("maturity", e.target.value)} />
+                  </Field>
+                  <Field label="Pmts / yr">
+                    <input className="input mono" type="number" step="1" min="1" placeholder="2"
+                      value={exoticValues.payment_frequency ?? ""}
+                      onChange={(e) => onExoticChange("payment_frequency", e.target.value)} />
+                  </Field>
+                  <Field label="Credit Spread" hint="%">
+                    <input className="input mono" type="number" step="0.01" placeholder="2.0"
+                      value={exoticValues.credit_spread ?? ""}
+                      onChange={(e) => onExoticChange("credit_spread", e.target.value)} />
+                  </Field>
+                  <Field label="Conv. Price">
+                    <input className="input mono" type="number" step="0.5" placeholder="50"
+                      value={exoticValues.conversion_price ?? ""}
+                      onChange={(e) => onExoticChange("conversion_price", e.target.value)} />
+                  </Field>
+                </>
+              )}
+              {exoticType === "chooser_option" && (
+                <>
+                  <Field label="Strike">
+                    <div className="input-group">
+                      <div className="adornment">$</div>
+                      <input className="input mono" type="number" value={strike}
+                        onChange={(e) => setStrike(e.target.value)} placeholder="230" />
+                    </div>
+                  </Field>
+                  <Field label="Choice Date">
+                    <input className="input mono" type="date"
+                      value={exoticValues.choice_date ?? ""}
+                      onChange={(e) => onExoticChange("choice_date", e.target.value)} />
+                  </Field>
+                  <Field label="Expiry" hint={ttm ? `${(ttm * 365).toFixed(0)}d` : ""}>
+                    <input className="input mono" type="date" value={expirationDate}
+                      onChange={(e) => setExpirationDate(e.target.value)} />
+                  </Field>
+                </>
+              )}
+              {exoticType === "asian_option" && (
+                <>
+                  <Field label="Option">
+                    <select className="select" value={exoticValues.asian_option_type || "call"}
+                      onChange={(e) => onExoticChange("asian_option_type", e.target.value)}>
+                      <option value="call">Call</option>
+                      <option value="put">Put</option>
+                    </select>
+                  </Field>
+                  <Field label="Pooling">
+                    <select className="select" value={exoticValues.pooling || "average"}
+                      onChange={(e) => onExoticChange("pooling", e.target.value)}>
+                      <option value="average">Average</option>
+                      <option value="max">Max (Lookback)</option>
+                    </select>
+                  </Field>
+                  <Field label="Strike">
+                    <div className="input-group">
+                      <div className="adornment">$</div>
+                      <input className="input mono" type="number" placeholder="spot"
+                        value={exoticValues.strike ?? ""}
+                        onChange={(e) => onExoticChange("strike", e.target.value)} />
+                    </div>
+                  </Field>
+                  <Field label="Observations" hint="monitoring N">
+                    <input className="input mono" type="number" step="1" min="1" placeholder="50"
+                      value={exoticValues.num_observations ?? ""}
+                      onChange={(e) => onExoticChange("num_observations", e.target.value)} />
+                  </Field>
+                  <Field label="Expiry" hint={ttm ? `${(ttm * 365).toFixed(0)}d` : ""}>
+                    <input className="input mono" type="date" value={expirationDate}
+                      onChange={(e) => setExpirationDate(e.target.value)} />
+                  </Field>
+                </>
+              )}
             </div>
           </div>
         </div>
