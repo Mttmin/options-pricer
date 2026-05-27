@@ -8,6 +8,7 @@ pub mod slv;
 use nalgebra::{DMatrix, DVector};
 use options::exotics::{AsianKind, AsianOption, AsianPooling, kemna_vorst_geometric_price};
 use options::exotics::{CliquetKind, CliquetOption};
+use options::exotics::{AutocallableNote, BarrierKind, BarrierOption, BarrierType};
 use options::{MonteCarloParameters, Options, Payoff};
 use rand::SeedableRng;
 use rand::rng;
@@ -369,6 +370,172 @@ pub fn monte_carlo_cliquet(
     MonteCarloResult {
         price: discount * mean,
         std_error: discount * (variance / nf).sqrt(),
+    }
+}
+
+/// Path-aware Monte Carlo for barrier options.
+///
+/// Simulates `num_steps` GBM steps and monitors the barrier at every step.
+/// Antithetic variates: +z and −z paths evolve independently with separate
+/// barrier-hit flags so variance reduction is applied correctly.
+pub fn monte_carlo_barrier(
+    opt: &BarrierOption,
+    num_simulations: u32,
+    num_steps: u32,
+) -> MonteCarloResult {
+    let n_steps = num_steps.max(1) as usize;
+    let s0 = opt.spot_price;
+    let r = opt.risk_free_rate;
+    let q = opt.dividend();
+    let sigma = opt.volatility;
+    let t = opt.time_to_maturity;
+    let h = opt.barrier;
+    let k = opt.strike_price;
+    let rebate = opt.rebate;
+
+    let dt = t / n_steps as f64;
+    let drift = (r - q - 0.5 * sigma * sigma) * dt;
+    let sqrt_dt = dt.sqrt();
+    let discount = (-r * t).exp();
+
+    let is_up = matches!(opt.barrier_type, BarrierType::UpAndIn | BarrierType::UpAndOut);
+    let is_out = matches!(opt.barrier_type, BarrierType::DownAndOut | BarrierType::UpAndOut);
+    let is_call = opt.kind == BarrierKind::Call;
+
+    let (sum, sum_sq): (f64, f64) = (0..num_simulations)
+        .into_par_iter()
+        .map_init(
+            || {
+                let rng = Xoshiro256PlusPlus::from_rng(&mut rand::rng());
+                let normal = Normal::new(0.0, 1.0).unwrap();
+                (rng, normal)
+            },
+            |(rng, normal), _| {
+                let mut s_plus = s0;
+                let mut s_minus = s0;
+                let mut hit_plus = false;
+                let mut hit_minus = false;
+
+                for _ in 0..n_steps {
+                    let z: f64 = normal.sample(rng);
+                    s_plus  *= (drift + sigma * sqrt_dt * z).exp();
+                    s_minus *= (drift - sigma * sqrt_dt * z).exp();
+                    if is_up {
+                        if s_plus  >= h { hit_plus  = true; }
+                        if s_minus >= h { hit_minus = true; }
+                    } else {
+                        if s_plus  <= h { hit_plus  = true; }
+                        if s_minus <= h { hit_minus = true; }
+                    }
+                }
+
+                let payoff = |s: f64, hit: bool| -> f64 {
+                    let intrinsic = if is_call { (s - k).max(0.0) } else { (k - s).max(0.0) };
+                    if is_out {
+                        if hit { rebate } else { intrinsic }
+                    } else {
+                        if hit { intrinsic } else { rebate }
+                    }
+                };
+
+                let val = 0.5 * (payoff(s_plus, hit_plus) + payoff(s_minus, hit_minus));
+                (val, val * val)
+            },
+        )
+        .reduce(|| (0.0, 0.0), |(a, a2), (b, b2)| (a + b, a2 + b2));
+
+    let n = num_simulations as f64;
+    let mean = sum / n;
+    let variance = (sum_sq / n - mean * mean).max(0.0);
+    MonteCarloResult {
+        price: discount * mean,
+        std_error: discount * (variance / n).sqrt(),
+    }
+}
+
+/// Monte Carlo pricing for autocallable notes.
+///
+/// Simulates `num_observations` GBM steps (one per autocall observation date).
+/// At each date the autocall trigger and protection barrier are checked.
+/// Antithetic variates: +z and −z paths evolve and settle independently.
+/// Memory coupon: when true, the note pays all deferred coupons on autocall
+/// (equivalent to notional × (1 + coupon_rate × t_i) at date t_i).
+/// Without memory, only the current-period coupon is paid.
+pub fn monte_carlo_autocallable(
+    opt: &AutocallableNote,
+    num_simulations: u32,
+) -> MonteCarloResult {
+    let n = opt.num_observations.max(1) as usize;
+    let s0 = opt.spot_price;
+    let r = opt.risk_free_rate;
+    let q = opt.dividend();
+    let sigma = opt.volatility;
+    let t = opt.time_to_maturity;
+    let notional = opt.notional;
+    let ac_barrier = opt.autocall_barrier * s0;
+    let ki_barrier = opt.protection_barrier * s0;
+    let coupon = opt.coupon_rate;
+    let memory = opt.memory_coupon;
+
+    let dt = t / n as f64;
+    let drift = (r - q - 0.5 * sigma * sigma) * dt;
+    let sqrt_dt = dt.sqrt();
+
+    let (sum, sum_sq): (f64, f64) = (0..num_simulations)
+        .into_par_iter()
+        .map_init(
+            || {
+                let rng = Xoshiro256PlusPlus::from_rng(&mut rand::rng());
+                let normal = Normal::new(0.0, 1.0).unwrap();
+                (rng, normal)
+            },
+            |(rng, normal), _| {
+                let mut simulate = |sign: f64| -> f64 {
+                    let mut s = s0;
+                    let mut ki_breached = false;
+
+                    for i in 0..n {
+                        let z: f64 = normal.sample(rng);
+                        s *= (drift + sign * sigma * sqrt_dt * z).exp();
+
+                        let t_i = dt * (i + 1) as f64;
+
+                        if s >= ac_barrier {
+                            let payout = if memory {
+                                notional * (1.0 + coupon * t_i)
+                            } else {
+                                notional * (1.0 + coupon * dt)
+                            };
+                            return payout * (-r * t_i).exp();
+                        }
+
+                        if s <= ki_barrier {
+                            ki_breached = true;
+                        }
+                    }
+
+                    let payout = if ki_breached {
+                        notional * s / s0
+                    } else {
+                        notional
+                    };
+                    payout * (-r * t).exp()
+                };
+
+                let pv_plus  = simulate(1.0);
+                let pv_minus = simulate(-1.0);
+                let val = 0.5 * (pv_plus + pv_minus);
+                (val, val * val)
+            },
+        )
+        .reduce(|| (0.0, 0.0), |(a, a2), (b, b2)| (a + b, a2 + b2));
+
+    let nf = num_simulations as f64;
+    let mean = sum / nf;
+    let variance = (sum_sq / nf - mean * mean).max(0.0);
+    MonteCarloResult {
+        price: mean,
+        std_error: (variance / nf).sqrt(),
     }
 }
 

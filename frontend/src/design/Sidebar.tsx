@@ -284,6 +284,8 @@ export function Sidebar(props: SidebarProps) {
               <option value="chooser_option">Chooser Option</option>
               <option value="asian_option">Asian Option</option>
               <option value="cliquet_option">Cliquet Option</option>
+              <option value="barrier_option">Barrier Option</option>
+              <option value="autocallable_note">Autocallable Note</option>
             </select>
           )}
         </div>
@@ -480,6 +482,85 @@ export function Sidebar(props: SidebarProps) {
                     <input className="input mono" type="number" step="0.01" placeholder="none"
                       value={exoticValues.global_floor ?? ""}
                       onChange={(e) => onExoticChange("global_floor", e.target.value)} />
+                  </Field>
+                  <Field label="Expiry" hint={ttm ? `${(ttm * 365).toFixed(0)}d` : ""}>
+                    <input className="input mono" type="date" value={expirationDate}
+                      onChange={(e) => setExpirationDate(e.target.value)} />
+                  </Field>
+                </>
+              )}
+              {exoticType === "barrier_option" && (
+                <>
+                  <Field label="Option">
+                    <select className="select" value={exoticValues.barrier_kind || "call"}
+                      onChange={(e) => onExoticChange("barrier_kind", e.target.value)}>
+                      <option value="call">Call</option>
+                      <option value="put">Put</option>
+                    </select>
+                  </Field>
+                  <Field label="Barrier">
+                    <select className="select" value={exoticValues.barrier_type || "down_and_out"}
+                      onChange={(e) => onExoticChange("barrier_type", e.target.value)}>
+                      <option value="down_and_out">Down-and-Out</option>
+                      <option value="down_and_in">Down-and-In</option>
+                      <option value="up_and_out">Up-and-Out</option>
+                      <option value="up_and_in">Up-and-In</option>
+                    </select>
+                  </Field>
+                  <Field label="Strike" hint="$">
+                    <input className="input mono" type="number" step="1" placeholder="100"
+                      value={exoticValues.barrier_strike ?? ""}
+                      onChange={(e) => onExoticChange("barrier_strike", e.target.value)} />
+                  </Field>
+                  <Field label="Barrier Level" hint="$">
+                    <input className="input mono" type="number" step="1" placeholder="90"
+                      value={exoticValues.barrier_level ?? ""}
+                      onChange={(e) => onExoticChange("barrier_level", e.target.value)} />
+                  </Field>
+                  <Field label="Rebate" hint="$">
+                    <input className="input mono" type="number" step="0.01" placeholder="0"
+                      value={exoticValues.rebate ?? ""}
+                      onChange={(e) => onExoticChange("rebate", e.target.value)} />
+                  </Field>
+                  <Field label="Expiry" hint={ttm ? `${(ttm * 365).toFixed(0)}d` : ""}>
+                    <input className="input mono" type="date" value={expirationDate}
+                      onChange={(e) => setExpirationDate(e.target.value)} />
+                  </Field>
+                </>
+              )}
+              {exoticType === "autocallable_note" && (
+                <>
+                  <Field label="Notional" hint="$">
+                    <input className="input mono" type="number" step="10" placeholder="1000"
+                      value={exoticValues.notional ?? ""}
+                      onChange={(e) => onExoticChange("notional", e.target.value)} />
+                  </Field>
+                  <Field label="Autocall" hint="×S₀">
+                    <input className="input mono" type="number" step="0.01" placeholder="1.05"
+                      value={exoticValues.autocall_barrier ?? ""}
+                      onChange={(e) => onExoticChange("autocall_barrier", e.target.value)} />
+                  </Field>
+                  <Field label="Coupon" hint="% p.a.">
+                    <input className="input mono" type="number" step="0.01" placeholder="8"
+                      value={exoticValues.coupon_rate ?? ""}
+                      onChange={(e) => onExoticChange("coupon_rate", e.target.value)} />
+                  </Field>
+                  <Field label="Protection" hint="×S₀">
+                    <input className="input mono" type="number" step="0.01" placeholder="0.80"
+                      value={exoticValues.protection_barrier ?? ""}
+                      onChange={(e) => onExoticChange("protection_barrier", e.target.value)} />
+                  </Field>
+                  <Field label="Observations" hint="per year">
+                    <input className="input mono" type="number" step="1" min="1" placeholder="4"
+                      value={exoticValues.num_observations ?? ""}
+                      onChange={(e) => onExoticChange("num_observations", e.target.value)} />
+                  </Field>
+                  <Field label="Memory">
+                    <select className="select" value={exoticValues.memory_coupon || "false"}
+                      onChange={(e) => onExoticChange("memory_coupon", e.target.value)}>
+                      <option value="false">No</option>
+                      <option value="true">Yes</option>
+                    </select>
                   </Field>
                   <Field label="Expiry" hint={ttm ? `${(ttm * 365).toFixed(0)}d` : ""}>
                     <input className="input mono" type="date" value={expirationDate}

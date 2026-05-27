@@ -3,11 +3,11 @@ use axum::Json;
 use std::sync::Arc;
 use std::time::Instant;
 use options::black_scholes::{black_scholes_approx_american, black_scholes_price, spread_black_scholes_approx_american};
-use options::exotics::{AsianKind, AsianOption, AsianPooling, ChooserOption, CliquetKind, CliquetOption, ConvertibleBond};
+use options::exotics::{AsianKind, AsianOption, AsianPooling, AutocallableNote, BarrierKind, BarrierOption, BarrierType, ChooserOption, CliquetKind, CliquetOption, ConvertibleBond};
 use options::optionspreads::{Direction, OptionSpreads};
 use options::{BlackScholesPrice, Call, Greeks, MonteCarloParameters, Options, Payoff, Put};
 use numerical_methods::binomial::{binomial_price, BinomialParameters, ExerciseStyle};
-use numerical_methods::{monte_carlo, monte_carlo_asian, monte_carlo_cliquet, price_european, PenaltySolver, TimestepMode};
+use numerical_methods::{monte_carlo, monte_carlo_asian, monte_carlo_autocallable, monte_carlo_barrier, monte_carlo_cliquet, price_european, PenaltySolver, TimestepMode};
 
 use crate::error::AppError;
 use crate::models::request::*;
@@ -173,7 +173,7 @@ fn price_single(req: SingleOptionRequest, dividend_info: Option<(f64, f64)>) -> 
     Ok(PriceResponse {
         structure_type: "single".to_string(),
         pricing: PricingResult {
-            black_scholes: bs_price,
+            black_scholes: Some(bs_price),
             monte_carlo: Some(MonteCarloResult {
                 price: mc_result.price * direction_sign,
                 std_error: mc_result.std_error,
@@ -429,7 +429,7 @@ fn price_spread(req: SpreadRequest, dividend_info: Option<(f64, f64)>) -> Result
     Ok(PriceResponse {
         structure_type: "spread".to_string(),
         pricing: PricingResult {
-            black_scholes: bs_price,
+            black_scholes: Some(bs_price),
             monte_carlo: Some(MonteCarloResult {
                 price: mc_result.price,
                 std_error: mc_result.std_error,
@@ -532,7 +532,7 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
             Ok(PriceResponse {
                 structure_type: "exotic".to_string(),
                 pricing: PricingResult {
-                    black_scholes: bs_price,
+                    black_scholes: Some(bs_price),
                     monte_carlo: None,
                     binomial_european: None,
                     binomial_american: None,
@@ -592,7 +592,7 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
             Ok(PriceResponse {
                 structure_type: "exotic".to_string(),
                 pricing: PricingResult {
-                    black_scholes: bs_price,
+                    black_scholes: Some(bs_price),
                     monte_carlo: None,
                     binomial_european: None,
                     binomial_american: None,
@@ -668,7 +668,7 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
             Ok(PriceResponse {
                 structure_type: "exotic".to_string(),
                 pricing: PricingResult {
-                    black_scholes: cf_price,
+                    black_scholes: Some(cf_price),
                     monte_carlo: Some(mc_result),
                     binomial_european: None,
                     binomial_american: None,
@@ -737,7 +737,7 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
             Ok(PriceResponse {
                 structure_type: "exotic".to_string(),
                 pricing: PricingResult {
-                    black_scholes: cf_price,
+                    black_scholes: Some(cf_price),
                     monte_carlo: Some(mc_result),
                     binomial_european: None,
                     binomial_american: None,
@@ -746,6 +746,158 @@ fn price_exotic(req: ExoticRequest) -> Result<PriceResponse, AppError> {
                     timings: Some(PricingTimings {
                         total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
                         black_scholes_ms: Some(bs_ms),
+                        monte_carlo_ms: Some(mc_ms),
+                        binomial_european_ms: None,
+                        binomial_american_ms: None,
+                        bs_american_approx_ms: None,
+                        penalty_solver_ms: None,
+                    }),
+                },
+                greeks: None,
+                payoff_curve: Some(PayoffCurve { spot_prices, payoffs }),
+            })
+        }
+        ExoticTypeInput::BarrierOption => {
+            let total_start = Instant::now();
+            let params: BarrierOptionRequest = serde_json::from_value(req.params)
+                .map_err(|e| AppError::BadRequest(format!("Invalid barrier option params: {}", e)))?;
+
+            let kind = match params.option_type {
+                BarrierKindInput::Call => BarrierKind::Call,
+                BarrierKindInput::Put => BarrierKind::Put,
+            };
+            let barrier_type = match params.barrier_type {
+                BarrierTypeInput::UpAndIn => BarrierType::UpAndIn,
+                BarrierTypeInput::UpAndOut => BarrierType::UpAndOut,
+                BarrierTypeInput::DownAndIn => BarrierType::DownAndIn,
+                BarrierTypeInput::DownAndOut => BarrierType::DownAndOut,
+            };
+            let barrier = BarrierOption {
+                kind,
+                barrier_type,
+                spot_price: params.spot_price,
+                strike_price: params.strike_price,
+                barrier: params.barrier,
+                rebate: params.rebate,
+                volatility: params.volatility,
+                risk_free_rate: params.risk_free_rate,
+                time_to_maturity: params.time_to_maturity,
+                dividend_yield: params.dividend_yield,
+            };
+
+            let bs_start = Instant::now();
+            let bs_price = barrier.bs_pricing();
+            let bs_ms = bs_start.elapsed().as_secs_f64() * 1000.0;
+
+            let mc_start = Instant::now();
+            let mc = monte_carlo_barrier(&barrier, params.mc_simulations, params.num_steps);
+            let mc_ms = mc_start.elapsed().as_secs_f64() * 1000.0;
+            let mc_result = MonteCarloResult {
+                price: mc.price,
+                std_error: mc.std_error,
+                ci_lower: mc.price - 1.96 * mc.std_error,
+                ci_upper: mc.price + 1.96 * mc.std_error,
+            };
+
+            let mut spot_prices = Vec::with_capacity(100);
+            let mut payoffs = Vec::with_capacity(100);
+            let min_spot = params.spot_price * 0.5;
+            let max_spot = params.spot_price * 1.5;
+            let step = (max_spot - min_spot) / 99.0;
+            for i in 0..100 {
+                let s = min_spot + (i as f64) * step;
+                spot_prices.push(s);
+                let probe = BarrierOption { spot_price: s, ..barrier };
+                payoffs.push(probe.bs_pricing() - bs_price);
+            }
+
+            Ok(PriceResponse {
+                structure_type: "exotic".to_string(),
+                pricing: PricingResult {
+                    black_scholes: Some(bs_price),
+                    monte_carlo: Some(mc_result),
+                    binomial_european: None,
+                    binomial_american: None,
+                    bs_american_approx: None,
+                    penalty_solver: None,
+                    timings: Some(PricingTimings {
+                        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                        black_scholes_ms: Some(bs_ms),
+                        monte_carlo_ms: Some(mc_ms),
+                        binomial_european_ms: None,
+                        binomial_american_ms: None,
+                        bs_american_approx_ms: None,
+                        penalty_solver_ms: None,
+                    }),
+                },
+                greeks: None,
+                payoff_curve: Some(PayoffCurve { spot_prices, payoffs }),
+            })
+        }
+        ExoticTypeInput::AutocallableNote => {
+            let total_start = Instant::now();
+            let params: AutocallableNoteRequest = serde_json::from_value(req.params)
+                .map_err(|e| AppError::BadRequest(format!("Invalid autocallable note params: {}", e)))?;
+
+            let note = AutocallableNote {
+                spot_price: params.spot_price,
+                volatility: params.volatility,
+                risk_free_rate: params.risk_free_rate,
+                time_to_maturity: params.time_to_maturity,
+                dividend_yield: params.dividend_yield,
+                notional: params.notional,
+                autocall_barrier: params.autocall_barrier,
+                coupon_rate: params.coupon_rate,
+                protection_barrier: params.protection_barrier,
+                num_observations: params.num_observations,
+                memory_coupon: params.memory_coupon,
+            };
+
+            let mc_start = Instant::now();
+            let mc = monte_carlo_autocallable(&note, params.mc_simulations);
+            let mc_ms = mc_start.elapsed().as_secs_f64() * 1000.0;
+            let mc_result = MonteCarloResult {
+                price: mc.price,
+                std_error: mc.std_error,
+                ci_lower: mc.price - 1.96 * mc.std_error,
+                ci_upper: mc.price + 1.96 * mc.std_error,
+            };
+
+            // Terminal payoff profile: analytical payout at maturity by spot level.
+            let s0 = params.spot_price;
+            let ac_level = params.autocall_barrier * s0;
+            let ki_level = params.protection_barrier * s0;
+            let t = params.time_to_maturity;
+            let mut spot_prices = Vec::with_capacity(100);
+            let mut payoffs = Vec::with_capacity(100);
+            let min_spot = s0 * 0.5;
+            let max_spot = s0 * 1.5;
+            let step = (max_spot - min_spot) / 99.0;
+            for i in 0..100 {
+                let s = min_spot + (i as f64) * step;
+                spot_prices.push(s);
+                let terminal_payout = if s >= ac_level {
+                    params.notional * (1.0 + params.coupon_rate * t)
+                } else if s < ki_level {
+                    params.notional * s / s0
+                } else {
+                    params.notional
+                };
+                payoffs.push(terminal_payout - mc.price);
+            }
+
+            Ok(PriceResponse {
+                structure_type: "exotic".to_string(),
+                pricing: PricingResult {
+                    black_scholes: None,
+                    monte_carlo: Some(mc_result),
+                    binomial_european: None,
+                    binomial_american: None,
+                    bs_american_approx: None,
+                    penalty_solver: None,
+                    timings: Some(PricingTimings {
+                        total_ms: total_start.elapsed().as_secs_f64() * 1000.0,
+                        black_scholes_ms: None,
                         monte_carlo_ms: Some(mc_ms),
                         binomial_european_ms: None,
                         binomial_american_ms: None,

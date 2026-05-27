@@ -5,6 +5,8 @@ pub enum ExoticOptions {
     ConvertibleBond(ConvertibleBond),
     AsianOption(AsianOption),
     CliquetOption(CliquetOption),
+    BarrierOption(BarrierOption),
+    AutocallableNote(AutocallableNote),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -398,9 +400,292 @@ pub fn forward_start_strip_price(opt: &CliquetOption) -> f64 {
     n * (-r * t).exp() * leg
 }
 
+// =====================================================================
+// Barrier options: path-dependent products that knock in or out when the
+// spot crosses a barrier level H. Four types for both calls and puts:
+// UpAndIn / UpAndOut / DownAndIn / DownAndOut.
+//
+// Pricing: Reiner-Rubinstein (1991) closed-form for BlackScholesPrice.
+// All "in" variants are derived from in-out parity: in = vanilla - out.
+// Monte Carlo: path simulation lives in the `numerical-methods` crate.
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierKind {
+    Call,
+    Put,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierType {
+    UpAndIn,
+    UpAndOut,
+    DownAndIn,
+    DownAndOut,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BarrierOption {
+    pub kind: BarrierKind,
+    pub barrier_type: BarrierType,
+    pub spot_price: f64,
+    pub strike_price: f64,
+    pub barrier: f64,
+    pub rebate: f64,
+    pub volatility: f64,
+    pub risk_free_rate: f64,
+    pub time_to_maturity: f64,
+    pub dividend_yield: Option<f64>,
+}
+
+impl BarrierOption {
+    pub fn dividend(&self) -> f64 {
+        self.dividend_yield.unwrap_or(0.0)
+    }
+}
+
+// Private Reiner-Rubinstein (1991) building blocks.
+// phi = +1 (call) or -1 (put); eta = +1 (down) or -1 (up).
+// All terms discounted under the cost-of-carry framework: b = r - q.
+
+fn rr_term_a(phi: f64, s: f64, k: f64, x1: f64, disc_b: f64, disc_r: f64, ssqt: f64, n: &Normal) -> f64 {
+    phi * (s * disc_b * n.cdf(phi * x1) - k * disc_r * n.cdf(phi * (x1 - ssqt)))
+}
+
+fn rr_term_b(phi: f64, s: f64, k: f64, x2: f64, disc_b: f64, disc_r: f64, ssqt: f64, n: &Normal) -> f64 {
+    phi * (s * disc_b * n.cdf(phi * x2) - k * disc_r * n.cdf(phi * (x2 - ssqt)))
+}
+
+fn rr_term_c(phi: f64, eta: f64, s: f64, k: f64, y1: f64, disc_b: f64, disc_r: f64, ssqt: f64, mu: f64, hs: f64, n: &Normal) -> f64 {
+    phi * (s * disc_b * hs.powf(2.0 * (mu + 1.0)) * n.cdf(eta * y1)
+         - k * disc_r * hs.powf(2.0 * mu) * n.cdf(eta * (y1 - ssqt)))
+}
+
+fn rr_term_d(phi: f64, eta: f64, s: f64, k: f64, y2: f64, disc_b: f64, disc_r: f64, ssqt: f64, mu: f64, hs: f64, n: &Normal) -> f64 {
+    phi * (s * disc_b * hs.powf(2.0 * (mu + 1.0)) * n.cdf(eta * y2)
+         - k * disc_r * hs.powf(2.0 * mu) * n.cdf(eta * (y2 - ssqt)))
+}
+
+fn rr_term_e(eta: f64, x2: f64, y2: f64, disc_r: f64, ssqt: f64, mu: f64, hs: f64, rebate: f64, n: &Normal) -> f64 {
+    rebate * disc_r * (n.cdf(eta * (x2 - ssqt)) - hs.powf(2.0 * mu) * n.cdf(eta * (y2 - ssqt)))
+}
+
+fn rr_barrier_price(opt: &BarrierOption) -> f64 {
+    let s = opt.spot_price;
+    let k = opt.strike_price;
+    let h = opt.barrier;
+    let r = opt.risk_free_rate;
+    let q = opt.dividend();
+    let sigma = opt.volatility;
+    let t = opt.time_to_maturity;
+    let b = r - q;
+
+    let n = Normal::new(0.0, 1.0).unwrap();
+    let sqt = t.sqrt();
+    let ssqt = sigma * sqt;
+    let mu = (b - 0.5 * sigma * sigma) / (sigma * sigma);
+    let disc_r = (-r * t).exp();
+    let disc_b = ((b - r) * t).exp();
+    let hs = h / s;
+
+    let x1 = (s / k).ln() / ssqt + (1.0 + mu) * ssqt;
+    let x2 = (s / h).ln() / ssqt + (1.0 + mu) * ssqt;
+    let y1 = (h * h / (s * k)).ln() / ssqt + (1.0 + mu) * ssqt;
+    let y2 = (h / s).ln() / ssqt + (1.0 + mu) * ssqt;
+
+    let phi: f64 = match opt.kind { BarrierKind::Call => 1.0, BarrierKind::Put => -1.0 };
+    let eta: f64 = match opt.barrier_type {
+        BarrierType::DownAndOut | BarrierType::DownAndIn => 1.0,
+        BarrierType::UpAndOut | BarrierType::UpAndIn => -1.0,
+    };
+
+    let a  = rr_term_a(phi, s, k, x1, disc_b, disc_r, ssqt, &n);
+    let bv = rr_term_b(phi, s, k, x2, disc_b, disc_r, ssqt, &n);
+    let c  = rr_term_c(phi, eta, s, k, y1, disc_b, disc_r, ssqt, mu, hs, &n);
+    let d  = rr_term_d(phi, eta, s, k, y2, disc_b, disc_r, ssqt, mu, hs, &n);
+    let e  = rr_term_e(eta, x2, y2, disc_r, ssqt, mu, hs, opt.rebate, &n);
+
+    // a = vanilla call (phi=1) or put (phi=-1)
+    let vanilla = a;
+
+    let out_price = match (opt.kind, opt.barrier_type) {
+        (BarrierKind::Call, BarrierType::DownAndOut) => {
+            if h <= k { a - c + e } else { bv - d + e }
+        }
+        (BarrierKind::Put, BarrierType::DownAndOut) => {
+            if h < k { a - c + e } else { e }
+        }
+        (BarrierKind::Call, BarrierType::UpAndOut) => {
+            if h >= k { a - bv + d + e } else { e }
+        }
+        (BarrierKind::Put, BarrierType::UpAndOut) => {
+            if h > k { a - c + e } else { bv - d + e }
+        }
+        (BarrierKind::Call, BarrierType::DownAndIn) => {
+            vanilla - if h <= k { a - c + e } else { bv - d + e }
+        }
+        (BarrierKind::Put, BarrierType::DownAndIn) => {
+            vanilla - if h < k { a - c + e } else { e }
+        }
+        (BarrierKind::Call, BarrierType::UpAndIn) => {
+            vanilla - if h >= k { a - bv + d + e } else { e }
+        }
+        (BarrierKind::Put, BarrierType::UpAndIn) => {
+            vanilla - if h > k { a - c + e } else { bv - d + e }
+        }
+    };
+
+    out_price.max(0.0)
+}
+
+impl BlackScholesPrice for BarrierOption {
+    fn bs_pricing(&self) -> f64 {
+        let s = self.spot_price;
+        let h = self.barrier;
+
+        // Already knocked out at inception: return discounted rebate.
+        let knocked_out = match self.barrier_type {
+            BarrierType::DownAndOut => s <= h,
+            BarrierType::UpAndOut   => s >= h,
+            _                       => false,
+        };
+        if knocked_out {
+            return self.rebate * (-self.risk_free_rate * self.time_to_maturity).exp();
+        }
+
+        // Already knocked in: price as vanilla option.
+        let knocked_in = match self.barrier_type {
+            BarrierType::DownAndIn => s <= h,
+            BarrierType::UpAndIn   => s >= h,
+            _                      => false,
+        };
+        if knocked_in {
+            let n = Normal::new(0.0, 1.0).unwrap();
+            let b = self.risk_free_rate - self.dividend();
+            let ssqt = self.volatility * self.time_to_maturity.sqrt();
+            let d1 = (s / self.strike_price).ln() / ssqt + (b / self.volatility + 0.5 * self.volatility) * self.time_to_maturity.sqrt();
+            let d2 = d1 - ssqt;
+            let disc_r = (-self.risk_free_rate * self.time_to_maturity).exp();
+            let disc_b = (b * self.time_to_maturity - self.risk_free_rate * self.time_to_maturity).exp();
+            return match self.kind {
+                BarrierKind::Call => s * disc_b * n.cdf(d1) - self.strike_price * disc_r * n.cdf(d2),
+                BarrierKind::Put  => self.strike_price * disc_r * n.cdf(-d2) - s * disc_b * n.cdf(-d1),
+            };
+        }
+
+        rr_barrier_price(self)
+    }
+}
+
+impl MonteCarloParameters for BarrierOption {
+    fn spot_price(&self) -> f64 { self.spot_price }
+    fn volatility(&self) -> f64 { self.volatility }
+    fn risk_free_rate(&self) -> f64 { self.risk_free_rate }
+    fn time_to_maturity(&self) -> f64 { self.time_to_maturity }
+}
+
+// =====================================================================
+// Autocallable note: a structured product that redeems early with a
+// coupon if the underlying trades at or above the autocall barrier on
+// any periodic observation date. If the spot ever breaches the
+// protection barrier (down-and-in put component), capital is at risk
+// at maturity. Priced by Monte Carlo only — no closed-form exists.
+// =====================================================================
+
+#[derive(Debug, Clone, Copy)]
+pub struct AutocallableNote {
+    pub spot_price: f64,
+    pub volatility: f64,
+    pub risk_free_rate: f64,
+    pub time_to_maturity: f64,
+    pub dividend_yield: Option<f64>,
+    pub notional: f64,
+    pub autocall_barrier: f64,   // fraction of S0, e.g. 1.05
+    pub coupon_rate: f64,        // annual rate, e.g. 0.08
+    pub protection_barrier: f64, // knock-in put fraction of S0, e.g. 0.80
+    pub num_observations: u32,   // autocall check count, e.g. 4 (quarterly)
+    pub memory_coupon: bool,
+}
+
+impl AutocallableNote {
+    pub fn dividend(&self) -> f64 {
+        self.dividend_yield.unwrap_or(0.0)
+    }
+}
+
+impl MonteCarloParameters for AutocallableNote {
+    fn spot_price(&self) -> f64 { self.spot_price }
+    fn volatility(&self) -> f64 { self.volatility }
+    fn risk_free_rate(&self) -> f64 { self.risk_free_rate }
+    fn time_to_maturity(&self) -> f64 { self.time_to_maturity }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::{BarrierKind, BarrierOption, BarrierType};
+
+    #[test]
+    fn barrier_in_out_parity() {
+        // cdi + cdo = vanilla European call for a down barrier below the strike.
+        let params = |barrier_type| BarrierOption {
+            kind: BarrierKind::Call,
+            barrier_type,
+            spot_price: 100.0,
+            strike_price: 100.0,
+            barrier: 90.0,
+            rebate: 0.0,
+            volatility: 0.2,
+            risk_free_rate: 0.05,
+            time_to_maturity: 1.0,
+            dividend_yield: None,
+        };
+        let cdo = params(BarrierType::DownAndOut).bs_pricing();
+        let cdi = params(BarrierType::DownAndIn).bs_pricing();
+        let vanilla = Options::new_call(100.0, 100.0, 0.2, 0.05, 1.0, None).bs_pricing();
+        assert!((cdo + cdi - vanilla).abs() < 1e-8,
+            "in-out parity violated: cdo={cdo:.4} + cdi={cdi:.4} = {:.4}, vanilla={vanilla:.4}", cdo+cdi);
+    }
+
+    #[test]
+    fn barrier_do_below_vanilla() {
+        // Down-and-out call must be cheaper than vanilla (some paths knocked out).
+        let cdo = BarrierOption {
+            kind: BarrierKind::Call, barrier_type: BarrierType::DownAndOut,
+            spot_price: 100.0, strike_price: 100.0, barrier: 90.0, rebate: 0.0,
+            volatility: 0.2, risk_free_rate: 0.05, time_to_maturity: 1.0, dividend_yield: None,
+        }.bs_pricing();
+        let vanilla = Options::new_call(100.0, 100.0, 0.2, 0.05, 1.0, None).bs_pricing();
+        assert!(cdo > 0.0 && cdo < vanilla, "cdo={cdo:.4} not in (0, {vanilla:.4})");
+    }
+
+    #[test]
+    fn barrier_knocked_out_at_inception() {
+        // Spot at or below down-out barrier → knocked out → rebate only.
+        let opt = BarrierOption {
+            kind: BarrierKind::Call, barrier_type: BarrierType::DownAndOut,
+            spot_price: 85.0, strike_price: 100.0, barrier: 90.0, rebate: 5.0,
+            volatility: 0.2, risk_free_rate: 0.05, time_to_maturity: 1.0, dividend_yield: None,
+        };
+        let expected = 5.0 * (-0.05_f64).exp();
+        assert!((opt.bs_pricing() - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn barrier_up_in_out_parity_put() {
+        // pui + puo = vanilla put for an up barrier above the strike.
+        let params = |barrier_type| BarrierOption {
+            kind: BarrierKind::Put, barrier_type,
+            spot_price: 100.0, strike_price: 100.0, barrier: 120.0, rebate: 0.0,
+            volatility: 0.2, risk_free_rate: 0.05, time_to_maturity: 1.0, dividend_yield: None,
+        };
+        let puo = params(BarrierType::UpAndOut).bs_pricing();
+        let pui = params(BarrierType::UpAndIn).bs_pricing();
+        let vanilla = Options::new_put(100.0, 100.0, 0.2, 0.05, 1.0, None).bs_pricing();
+        assert!((puo + pui - vanilla).abs() < 1e-8,
+            "put up parity: puo={puo:.4} + pui={pui:.4} = {:.4}, vanilla={vanilla:.4}", puo+pui);
+    }
 
     #[test]
     fn test_convertible_bond_pricing() {

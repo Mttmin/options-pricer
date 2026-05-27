@@ -17,7 +17,10 @@ export type SpreadType =
   | "butterfly"
   | "calendar_spread";
 
-export type ExoticType = "convertible_bond" | "chooser_option" | "asian_option" | "cliquet_option";
+export type ExoticType = "convertible_bond" | "chooser_option" | "asian_option" | "cliquet_option" | "barrier_option" | "autocallable_note";
+
+export type BarrierKind = "call" | "put";
+export type BarrierType = "up_and_in" | "up_and_out" | "down_and_in" | "down_and_out";
 
 export type AsianPooling = "average" | "max";
 
@@ -121,13 +124,49 @@ export type CliquetOptionRequest = {
   mc_simulations?: number;
 };
 
+export type BarrierOptionRequest = {
+  structure_type: "exotic";
+  exotic_type: "barrier_option";
+  option_type: BarrierKind;
+  barrier_type: BarrierType;
+  spot_price: number;
+  strike_price: number;
+  barrier: number;
+  rebate: number;
+  volatility: number;
+  risk_free_rate: number;
+  time_to_maturity: number;
+  dividend_yield: number | null;
+  num_steps?: number;
+  mc_simulations?: number;
+};
+
+export type AutocallableNoteRequest = {
+  structure_type: "exotic";
+  exotic_type: "autocallable_note";
+  spot_price: number;
+  volatility: number;
+  risk_free_rate: number;
+  time_to_maturity: number;
+  dividend_yield: number | null;
+  notional: number;
+  autocall_barrier: number;
+  coupon_rate: number;
+  protection_barrier: number;
+  num_observations: number;
+  memory_coupon: boolean;
+  mc_simulations?: number;
+};
+
 export type PriceRequest =
   | SingleOptionRequest
   | SpreadRequest
   | ConvertibleBondRequest
   | ChooserOptionRequest
   | AsianOptionRequest
-  | CliquetOptionRequest;
+  | CliquetOptionRequest
+  | BarrierOptionRequest
+  | AutocallableNoteRequest;
 
 export type MonteCarloResult = {
   price: number;
@@ -152,7 +191,7 @@ export type PenaltySolverResult = {
 };
 
 export type PricingResult = {
-  black_scholes: number;
+  black_scholes?: number;
   monte_carlo?: MonteCarloResult;
   binomial_european?: number;
   binomial_american?: number;

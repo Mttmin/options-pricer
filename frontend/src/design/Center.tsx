@@ -60,13 +60,15 @@ export function buildRows(
   const timings: Partial<PricingTimings> = p.timings ?? {};
 
   if (exerciseStyle === "european") {
-    rows.push({
-      id: "bs",
-      method: "Black-Scholes",
-      sub: "Analytical · GBM",
-      price: p.black_scholes,
-      ms: timings.black_scholes_ms ?? null,
-    });
+    if (p.black_scholes != null) {
+      rows.push({
+        id: "bs",
+        method: "Black-Scholes",
+        sub: "Analytical · GBM",
+        price: p.black_scholes,
+        ms: timings.black_scholes_ms ?? null,
+      });
+    }
     if (p.monte_carlo) {
       rows.push({
         id: "mc",

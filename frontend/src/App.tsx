@@ -277,6 +277,48 @@ export default function App() {
           global_floor: pct("global_floor"),
         };
       }
+      if (exoticType === "barrier_option") {
+        const bKind = (exoticValues.barrier_kind === "put" ? "put" : "call") as "call" | "put";
+        const bType = (exoticValues.barrier_type || "down_and_out") as import("./types/index.ts").BarrierType;
+        const barrierStrike = parseFloat(exoticValues.barrier_strike) || S;
+        const barrierLevel = parseFloat(exoticValues.barrier_level) || S * 0.9;
+        return {
+          structure_type: "exotic",
+          exotic_type: "barrier_option",
+          option_type: bKind,
+          barrier_type: bType,
+          spot_price: S,
+          strike_price: barrierStrike,
+          barrier: barrierLevel,
+          rebate: parseFloat(exoticValues.rebate) || 0,
+          volatility: vol,
+          risk_free_rate: r,
+          time_to_maturity: T || 1,
+          dividend_yield: q || null,
+        };
+      }
+      if (exoticType === "autocallable_note") {
+        const notional = parseFloat(exoticValues.notional) || 1000;
+        const autocallBarrier = parseFloat(exoticValues.autocall_barrier) || 1.05;
+        const couponRate = (parseFloat(exoticValues.coupon_rate) || 8) / 100;
+        const protectionBarrier = parseFloat(exoticValues.protection_barrier) || 0.80;
+        const numObs = Math.max(1, parseInt(exoticValues.num_observations || "4") || 4);
+        return {
+          structure_type: "exotic",
+          exotic_type: "autocallable_note",
+          spot_price: S,
+          volatility: vol,
+          risk_free_rate: r,
+          time_to_maturity: T || 1,
+          dividend_yield: q || null,
+          notional,
+          autocall_barrier: autocallBarrier,
+          coupon_rate: couponRate,
+          protection_barrier: protectionBarrier,
+          num_observations: numObs,
+          memory_coupon: exoticValues.memory_coupon === "true",
+        };
+      }
       return {
         structure_type: "exotic",
         exotic_type: "chooser_option",

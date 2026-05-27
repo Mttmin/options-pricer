@@ -103,6 +103,24 @@ pub enum ExoticTypeInput {
     ChooserOption,
     AsianOption,
     CliquetOption,
+    BarrierOption,
+    AutocallableNote,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum BarrierKindInput {
+    Call,
+    Put,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum BarrierTypeInput {
+    UpAndIn,
+    UpAndOut,
+    DownAndIn,
+    DownAndOut,
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -182,6 +200,61 @@ pub struct CliquetOptionRequest {
 
 fn default_cliquet_resets() -> u32 {
     12
+}
+
+#[derive(Deserialize)]
+pub struct BarrierOptionRequest {
+    pub option_type: BarrierKindInput,
+    pub barrier_type: BarrierTypeInput,
+    pub spot_price: f64,
+    pub strike_price: f64,
+    pub barrier: f64,
+    #[serde(default = "default_rebate")]
+    pub rebate: f64,
+    pub volatility: f64,
+    pub risk_free_rate: f64,
+    pub time_to_maturity: f64,
+    pub dividend_yield: Option<f64>,
+    #[serde(default = "default_barrier_steps")]
+    pub num_steps: u32,
+    #[serde(default = "default_mc_simulations")]
+    pub mc_simulations: u32,
+}
+
+#[derive(Deserialize)]
+pub struct AutocallableNoteRequest {
+    pub spot_price: f64,
+    pub volatility: f64,
+    pub risk_free_rate: f64,
+    pub time_to_maturity: f64,
+    pub dividend_yield: Option<f64>,
+    #[serde(default = "default_notional")]
+    pub notional: f64,
+    pub autocall_barrier: f64,
+    pub coupon_rate: f64,
+    pub protection_barrier: f64,
+    #[serde(default = "default_autocall_observations")]
+    pub num_observations: u32,
+    #[serde(default)]
+    pub memory_coupon: bool,
+    #[serde(default = "default_mc_simulations")]
+    pub mc_simulations: u32,
+}
+
+fn default_rebate() -> f64 {
+    0.0
+}
+
+fn default_barrier_steps() -> u32 {
+    252
+}
+
+fn default_notional() -> f64 {
+    1000.0
+}
+
+fn default_autocall_observations() -> u32 {
+    4
 }
 
 #[derive(Deserialize)]

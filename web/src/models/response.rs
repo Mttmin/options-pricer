@@ -39,7 +39,8 @@ pub struct PayoffCurve {
 
 #[derive(Serialize)]
 pub struct PricingResult {
-    pub black_scholes: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub black_scholes: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monte_carlo: Option<MonteCarloResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
