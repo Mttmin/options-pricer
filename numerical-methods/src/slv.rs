@@ -391,11 +391,17 @@ pub(crate) fn cos_european(
 	let c1 = (r - q - 0.5 * params.v_bar) * tau
 		+ 0.5 * (params.v0 - params.v_bar) * mean_reversion_factor;
 
-	// Truncation range centered on first cumulant plus log-moneyness
+	// Truncation window centred at 0, wide enough to cover BOTH the payoff kink
+	// (y = 0) and the density of y = ln(S_T/K), centred near x0 + c1. A window
+	// centred on x0 + c1 alone can exclude y = 0 for short-T deep-OTM cells,
+	// which inverts the put/call integration bounds (c_lo > c_hi) below and
+	// silently corrupts the price. Mirrors the Phase 2A-v2 fix in
+	// deep-calibration `training data creation/v2/pricer.py`.
 	let x0 = (s0 / strike).ln();
 	let margin = 12.0 * integrated_var.abs().sqrt();
-	let a = x0 + c1 - margin;
-	let b = x0 + c1 + margin;
+	let half = ((x0 + c1).abs() + margin).max(0.5);
+	let a = -half;
+	let b = half;
 	let ba = b - a;
 	let pi_ba = std::f64::consts::PI / ba;
 

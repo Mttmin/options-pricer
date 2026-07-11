@@ -121,8 +121,21 @@ const R_LO: f32 = 0.00;
 const R_HI: f32 = 0.05;
 
 /// Normalise carry (r − q) to [0,1] for ONNX input slot 5.
+///
+/// The surrogate only saw carry ∈ [R_LO, R_HI] during training; values outside
+/// that range (q > r gives negative carry, or r − q > 5%) would otherwise be
+/// fed to the network as out-of-hull inputs with undefined extrapolation
+/// behaviour. Clamp to the training range and warn so the caller can see the
+/// approximation being made.
 fn normalise_r(carry: f32) -> f32 {
-    (carry - R_LO) / (R_HI - R_LO)
+    if carry < R_LO || carry > R_HI {
+        eprintln!(
+            "[deep_cal] WARN: carry (r − q) = {carry:.4} outside surrogate training \
+             range [{R_LO}, {R_HI}]; clamping. Calibration accuracy is degraded for \
+             this rate environment — retrain with a wider carry range to remove this."
+        );
+    }
+    (carry.clamp(R_LO, R_HI) - R_LO) / (R_HI - R_LO)
 }
 
 // `normalise_q` removed: the v2 surrogate was trained with q pinned to 0.
@@ -325,7 +338,7 @@ impl BatesCalibrator {
     ) -> ort::Result<DeepCalibrationResult> {
         let seeds = make_seeds(n_restarts.max(1));
 
-        let mut best: Option<(f32, [f32; N_PARAMS], usize)> = None;
+        let mut best: Option<(f32, [f32; N_PARAMS])> = None;
         let mut total_evals = 0usize;
 
         for seed in &seeds {
@@ -334,11 +347,12 @@ impl BatesCalibrator {
             total_evals += evals;
             let rmse = iv_loss.sqrt();
             if best.as_ref().map_or(true, |b| rmse < b.0) {
-                best = Some((rmse, theta, total_evals));
+                best = Some((rmse, theta));
             }
         }
 
-        let (rmse, bates_norm, n_evals) = best.unwrap();
+        let (rmse, bates_norm) = best.unwrap();
+        let n_evals = total_evals;
         let phys = denormalise(&bates_norm);
         Ok(DeepCalibrationResult {
             heston: bates_to_heston(&phys),
@@ -1207,7 +1221,8 @@ mod tests {
 
         // Three scenarios: plan-specified + two alternatives covering different
         // vol-of-vol and skew regimes. All comfortably inside surrogate bounds
-        // kappa∈[0.3,8], theta∈[0.02,0.12], sigma_v∈[0.05,1.2], rho∈[-0.98,0.1], v0∈[0.02,0.12].
+        // kappa∈[0.3,10], theta∈[0.01,0.16], sigma_v∈[0.1,1.5], rho∈[-0.9,-0.3], v0∈[0.02,0.20]
+        // (PARAM_LO/PARAM_HI above; source of truth: v2/sampling.py).
         // Scenario (true_h, spot, strike, r, q, tau)
         let scenarios: [(HestonParameters, f64, f64, f64, f64, f64); 3] = [
             // Plan-specified: kappa=2, theta=0.04, sigma=0.35, rho=-0.65, v0=0.04, q=0.02
@@ -1502,8 +1517,8 @@ mod tests {
         let tau    = 0.50_f64;   // 6 months
 
         // True Heston params — comfortably inside training bounds
-        // kappa∈[0.30,8.00], theta∈[0.02,0.12], sigma_v∈[0.05,1.20],
-        // rho∈[−0.98,0.10], v0∈[0.02,0.12]
+        // kappa∈[0.30,10.0], theta∈[0.01,0.16], sigma_v∈[0.10,1.50],
+        // rho∈[−0.90,−0.30], v0∈[0.02,0.20]  (PARAM_LO/PARAM_HI)
         // NVDA character: higher vol (~50%), high vol-of-vol, steep skew
         let true_kappa   = 1.8_f64;
         let true_theta   = 0.070_f64;   // long-run var → ~26.5% ATM vol

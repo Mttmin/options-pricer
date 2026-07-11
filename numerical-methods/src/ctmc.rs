@@ -27,14 +27,16 @@ impl Heston {
         Self { rho, sigma, r_f, q, eta, ref_vol }
     }
     pub fn from_options(option: &Options) -> Self {
-        // Placeholders: calibrate eta, rho, sigma, ref_vol to market data in practice
+        // Placeholders: calibrate eta, rho, sigma, ref_vol to market data in practice.
+        // ref_vol is the long-run VARIANCE θ (mu(v) = η(θ − v) operates in variance
+        // units), so the option's implied vol must be squared here.
         Self {
             rho: 0.0,
             sigma: option.volatility(),
             r_f: option.risk_free_rate(),
             q: option.dividend_yield(),
             eta: 1.0,
-            ref_vol: option.volatility(),
+            ref_vol: option.volatility().powi(2),
         }
     }
     fn heston_g_integral(&self, s: f64) -> f64 { s.ln() }
@@ -308,16 +310,77 @@ impl SLVModel for SLVModelVariant {
 // Grid construction
 
 // Uniform variance grid v ∈ [step, 4·v0] with n steps, avoiding v=0.
-// Keep size small to balance numerical stability vs. matrix-exponentiation cost.
+//
+// DEPRECATED for Heston pricing: this grid ignores the long-run variance θ, so
+// whenever θ > 4·v0 the CTMC chain can never reach its own mean-reversion level
+// and long-dated options are underpriced (−41% at θ = 4·v0, −95% at θ = 8·v0 in
+// the European CTMC-vs-COS benchmark). Prefer `heston_variance_grid`.
 pub fn uniform_variance_grid(vol_0: f64, n_vol_steps: i32) -> Vec<f64> {
     let step = 4.0 * vol_0 / (n_vol_steps as f64);
     (1..=n_vol_steps).map(|i| i as f64 * step).collect()
 }
 
-#[allow(dead_code)]
-/// Sinh-stretched variance grid per Cui, Zhenyu 2018.
-fn sinh_variance_grid(_vol: f64, _n_vol_steps: i32) -> Vec<f64> {
-    todo!()
+/// CIR conditional moments of v_T | v_0 = v0: returns (mean, variance).
+///
+///   E[v_T]   = θ + (v0 − θ)·e^{−κT}
+///   Var[v_T] = v0·σ_v²·e^{−κT}(1 − e^{−κT})/κ + θ·σ_v²(1 − e^{−κT})²/(2κ)
+fn cir_conditional_moments(v0: f64, kappa: f64, theta_lr: f64, sigma_v: f64, t: f64) -> (f64, f64) {
+    let e = (-kappa * t).exp();
+    let one_minus_e = -(-kappa * t).exp_m1();
+    // e·(1−e)/κ → t and (1−e)²/(2κ) → κt²/2 as κ→0; guard only the division.
+    let k = kappa.max(1e-12);
+    let mean = theta_lr + (v0 - theta_lr) * e;
+    let var = v0 * sigma_v * sigma_v * e * one_minus_e / k
+        + theta_lr * sigma_v * sigma_v * one_minus_e * one_minus_e / (2.0 * k);
+    (mean, var)
+}
+
+/// Variance grid sized from the CIR conditional moments of v_T | v_0
+/// (Cui, Kirkby & Nguyen 2018 recommend moment-matched variance grids).
+///
+/// Uniformly spaced over [lo, hi] with
+///   hi = max(v0, E[v_T]) + L·sd(v_T)
+///   lo = max(hi·1e-4, min(v0, E[v_T]) − L·sd(v_T)),  L = 4,
+/// so the grid always reaches the mean-reversion level θ regardless of v0.
+/// Empirically (European CTMC vs COS benchmark, 80×20×50 grid) this cuts the
+/// θ = 4·v0 error from −41% to ~+2% and the θ = 8·v0 error from −95% to ~+2%.
+pub fn heston_variance_grid(
+    v0: f64, kappa: f64, theta_lr: f64, sigma_v: f64, t: f64, n_vol_steps: usize,
+) -> Vec<f64> {
+    let (mean_t, var_t) = cir_conditional_moments(v0, kappa, theta_lr, sigma_v, t);
+    let sd = var_t.max(0.0).sqrt();
+    const L: f64 = 4.0;
+    let hi = v0.max(mean_t) + L * sd;
+    let mut lo = (v0.min(mean_t) - L * sd).max(hi * 1e-4);
+    if lo >= v0 {
+        // Degenerate (sd ≈ 0 with mean ≥ v0): keep v0 strictly interior.
+        lo = 0.5 * v0;
+    }
+    let n = n_vol_steps.max(2);
+    (0..n)
+        .map(|i| lo + (hi - lo) * i as f64 / (n - 1) as f64)
+        .collect()
+}
+
+/// X-grid half-width from the moments of X_T = g(S_T) − ρ·f(v_T).
+///
+/// Covers (a) the diffusion of X (std ≈ √((1−ρ²)·E[∫v dt])) with an L_x = 7
+/// margin, (b) the drift terms |r−q|·T + ½·E[∫v dt], and (c) the spread of the
+/// payoff-kink position ln K − ρ·f(v_l) across all variance states. The
+/// paper's fixed range [g(0.001·S), g(4·S)] spends most of its n_x points on
+/// probabilistically dead regions; at n_x = 80 that dominated the pricing
+/// error once the variance grid was widened to reach θ.
+fn heston_x_half_width(
+    v0: f64, kappa: f64, theta_lr: f64, sigma_v: f64, rho: f64,
+    r: f64, q: f64, t: f64, v_lo: f64, v_hi: f64,
+) -> f64 {
+    let one_minus_e = -(-kappa * t).exp_m1();
+    let k = kappa.max(1e-12);
+    let integ_var = theta_lr * t + (v0 - theta_lr) * one_minus_e / k; // E[∫₀ᵀ v_s ds]
+    let std_x = ((1.0 - rho * rho) * integ_var).max(0.0).sqrt();
+    let kink_span = rho.abs() * (v_hi - v_lo) / sigma_v; // |ρ|·(f(v_hi) − f(v_lo))
+    const L_X: f64 = 7.0;
+    (kink_span + 0.5 * integ_var + (r - q).abs() * t + L_X * std_x).max(0.75)
 }
 
 #[allow(dead_code)]
@@ -805,7 +868,11 @@ pub fn run_algorithm_31(
 ///
 /// Accepts any `Options` variant (put or call). Builds grids, assembles G, selects Dense Padé
 /// or Krylov based on problem size, then runs Algorithm 3.1.
-/// Grid range follows the paper: x ∈ [g(0.001S), g(4S)].
+///
+/// Grids are moment-matched: the variance grid covers the CIR conditional
+/// moments of v_T (so it reaches θ even when θ ≫ v0), and the x-grid is
+/// centred on x₀ with a half-width from the moments of X_T (see
+/// `heston_variance_grid` / `heston_x_half_width`).
 pub fn price_american_option_heston(
     option: options::Options,
     v0: f64,
@@ -823,11 +890,15 @@ pub fn price_american_option_heston(
     let t    = option.time_to_maturity();
     let model = SLVModelVariant::Heston(Heston::new(heston_rho, sigma_v, r, Some(q), kappa, theta_lr));
 
-    let v_grid = uniform_variance_grid(v0, m_v as i32);
+    let v_grid = heston_variance_grid(v0, kappa, theta_lr, sigma_v, t, m_v);
 
     let f_v0 = model.f_integral(v0);
-    let x_min = model.g_integral(1e-3 * spot) - heston_rho * f_v0;
-    let x_max = model.g_integral(4.0 * spot) - heston_rho * f_v0;
+    let x0 = model.g_integral(spot) - heston_rho * f_v0;
+    let half = heston_x_half_width(
+        v0, kappa, theta_lr, sigma_v, heston_rho, r, q, t,
+        v_grid[0], *v_grid.last().unwrap(),
+    );
+    let (x_min, x_max) = (x0 - half, x0 + half);
     let x_grid: Vec<f64> = (0..n_x).map(|i| x_min + (x_max - x_min) * i as f64 / (n_x - 1) as f64).collect();
     let x_spacings: Vec<f64> = x_grid.windows(2).map(|w| w[1] - w[0]).collect();
 
@@ -904,6 +975,46 @@ mod tests {
         assert_eq!(h1.len(), 15);
         for &v in &h1 { assert!(v >= 0.0, "Negative payoff: {v}"); }
         assert!(h1[0] > h1[4]);
+    }
+
+    #[test]
+    fn variance_grid_reaches_theta() {
+        // θ = 8·v0: the old (0, 4·v0] grid capped the chain at 0.16·v0/…, far
+        // below the mean-reversion level. The moment-matched grid must cover θ.
+        let g = heston_variance_grid(0.02, 2.0, 0.16, 0.3, 1.0, 25);
+        assert_eq!(g.len(), 25);
+        assert!(g[0] > 0.0, "grid must stay strictly positive");
+        assert!(g.windows(2).all(|w| w[1] > w[0]), "grid must be increasing");
+        assert!(g[0] < 0.02, "v0 must be interior (lower bound below v0)");
+        assert!(*g.last().unwrap() > 0.16, "grid must reach beyond theta");
+
+        // Downward term structure: grid still brackets both v0 and θ.
+        let g = heston_variance_grid(0.08, 2.0, 0.04, 0.3, 1.0, 25);
+        assert!(g[0] < 0.04 && *g.last().unwrap() > 0.08);
+
+        // Degenerate vol-of-vol: v0 stays strictly interior.
+        let g = heston_variance_grid(0.04, 2.0, 0.04, 1e-12, 1.0, 25);
+        assert!(g[0] < 0.04 && *g.last().unwrap() >= 0.04);
+    }
+
+    #[test]
+    #[ignore]
+    fn american_put_theta_above_v0_exceeds_european() {
+        // Regression for the variance-grid truncation bug: with θ = 4·v0 the
+        // old (0, 4·v0] grid priced this put ~40% below its own European lower
+        // bound. American CTMC must dominate the European COS price.
+        use crate::slv::{cos_european, HestonParameters, OptionSide};
+        let p = HestonParameters { v0: 0.04, v_bar: 0.16, kappa: 2.0, sigma: 0.3, rho: -0.7 };
+        let (s, k, r, q, tau) = (100.0_f64, 100.0_f64, 0.05, 0.02, 1.0);
+        let eur = cos_european(OptionSide::Put, s, k, r, q, tau, &p, 512);
+        let amer = price_american_put_heston(
+            k, s, p.v0, tau, r, q, p.kappa, p.v_bar, p.sigma, p.rho, 120, 25, 75,
+        ).price;
+        println!("European COS: {eur:.4}, American CTMC: {amer:.4}");
+        assert!(amer >= eur * 0.98,
+            "American {amer:.4} must not fall below European lower bound {eur:.4}");
+        assert!(amer <= eur * 1.20,
+            "American {amer:.4} implausibly far above European {eur:.4}");
     }
 
     #[test]
