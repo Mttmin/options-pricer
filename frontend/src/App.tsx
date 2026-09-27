@@ -15,6 +15,7 @@ import type {
   VolatilityResponse,
   VolSource,
 } from "./types/index.ts";
+import { EXOTIC_LABELS, SPREAD_LABELS } from "./types/index.ts";
 import {
   fetchMarketData,
   fetchOptionChain,
@@ -26,20 +27,18 @@ import {
   type PricePoint,
 } from "./api/client.ts";
 import { calculateTTM } from "./utils/ttm.ts";
-import { Sidebar, type TickerInfo } from "./design/Sidebar.tsx";
+import { Sidebar, type TickerInfo } from "./components/Sidebar.tsx";
 import {
   buildRows,
+  CalibrationStrip,
   GreeksStrip,
   HeroPrice,
   PayoffPanel,
   PriceChartPanel,
   PricingRows,
-} from "./design/Center.tsx";
-import { PayoffChart } from "./design/Charts.tsx";
-import { MarketModal, RightPanel, type ModalTab } from "./design/MarketContext.tsx";
-import { TweaksPanel, TWEAK_DEFAULTS, type Tweaks } from "./design/TweaksPanel.tsx";
-import { SpreadForm } from "./components/inputs/SpreadForm.tsx";
-import { calculatePayoffGrid } from "./utils/payoff.ts";
+} from "./components/Center.tsx";
+import { MarketModal, RightPanel, type ModalTab } from "./components/MarketContext.tsx";
+import { TweaksPanel, TWEAK_DEFAULTS, type Tweaks } from "./components/TweaksPanel.tsx";
 
 function todayPlus(days: number): string {
   const d = new Date();
@@ -90,8 +89,10 @@ export default function App() {
 
   const [result, setResult] = useState<PriceResponse | null>(null);
   const [priceError, setPriceError] = useState<string | null>(null);
+  const [pricing, setPricing] = useState(false);
   const [ctmcResult, setCtmcResult] = useState<CtmcPriceResponse | null>(null);
   const [ctmcLoading, setCtmcLoading] = useState(false);
+  const [ctmcError, setCtmcError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchSofr()
@@ -131,6 +132,19 @@ export default function App() {
       setMarketLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    const sym = new URLSearchParams(window.location.search).get("symbol");
+    if (sym) loadSymbol(sym.toUpperCase());
+  }, [loadSymbol]);
+
+  useEffect(() => {
+    if (!selectedSymbol) return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("symbol") === selectedSymbol) return;
+    url.searchParams.set("symbol", selectedSymbol);
+    window.history.replaceState(null, "", url);
+  }, [selectedSymbol]);
 
   const ticker: TickerInfo | null = useMemo(() => {
     if (!marketData) return null;
@@ -319,6 +333,11 @@ export default function App() {
           memory_coupon: exoticValues.memory_coupon === "true",
         };
       }
+      const expiry = T || 1;
+      const chosen = exoticValues.choice_date ? calculateTTM(exoticValues.choice_date) : NaN;
+      const chooseTime = Number.isFinite(chosen)
+        ? Math.min(Math.max(chosen, 0), expiry)
+        : expiry * 0.5;
       return {
         structure_type: "exotic",
         exotic_type: "chooser_option",
@@ -326,9 +345,9 @@ export default function App() {
         strike_price: parseFloat(strike) || S,
         volatility: vol,
         risk_free_rate: r,
-        time_to_maturity: T || 1,
+        time_to_maturity: expiry,
         dividend_yield: q || null,
-        choose_time: T * 0.5,
+        choose_time: chooseTime,
       };
     } catch {
       return null;
@@ -337,11 +356,13 @@ export default function App() {
 
   useEffect(() => {
     const req = buildRequest();
-    if (!req) { setResult(null); return; }
+    if (!req) { setResult(null); setPricing(false); return; }
+    setPricing(true);
     const id = setTimeout(() => {
       submitPricing(req)
         .then(r => { setResult(r); setPriceError(null); })
-        .catch(err => setPriceError(err instanceof Error ? err.message : "Pricing failed"));
+        .catch(err => setPriceError(err instanceof Error ? err.message : "Pricing failed"))
+        .finally(() => setPricing(false));
     }, 150);
     return () => clearTimeout(id);
   }, [buildRequest]);
@@ -349,6 +370,7 @@ export default function App() {
   useEffect(() => {
     if (structure !== "single" || exerciseStyle !== "american" || !selectedSymbol) {
       setCtmcResult(null);
+      setCtmcError(null);
       return;
     }
     const K = parseFloat(strike);
@@ -365,9 +387,13 @@ export default function App() {
         time_to_maturity: T,
         risk_free_rate: bsArgs.r,
         dividend_yield: bsArgs.q || null,
+        model: "both",
       })
-        .then(setCtmcResult)
-        .catch(() => setCtmcResult(null))
+        .then(r => { setCtmcResult(r); setCtmcError(null); })
+        .catch(err => {
+          setCtmcResult(null);
+          setCtmcError(err instanceof Error ? err.message : "CTMC pricing failed");
+        })
         .finally(() => setCtmcLoading(false));
     }, 500);
     return () => { clearTimeout(id); setCtmcLoading(false); };
@@ -399,9 +425,16 @@ export default function App() {
   const heroSecondary = useMemo(() => {
     return rows
       .filter(r => r.id !== activeId && !r.loading && r.price != null && !r.dim)
-      .slice(0, 3)
+      .slice(0, 5)
       .map(r => ({ method: r.method, price: r.price }));
   }, [rows, activeId]);
+
+  const structureLabel = useMemo(() => {
+    const side = direction === "long" ? "Long" : "Short";
+    if (structure === "single") return `${side} · ${optionType.toUpperCase()} · ${exerciseStyle}`;
+    if (structure === "spread") return `${side} · ${SPREAD_LABELS[spreadType]}`;
+    return EXOTIC_LABELS[exoticType];
+  }, [structure, direction, optionType, exerciseStyle, spreadType, exoticType]);
 
   const pinCurrent = () => {
     if (heroPrimary?.price != null) {
@@ -413,16 +446,9 @@ export default function App() {
     setExoticValues(prev => ({ ...prev, [field]: value }));
   };
 
-  const payoffData = useMemo(() => {
-    if (!result) return null;
-    const req = buildRequest();
-    if (!req) return null;
-    return calculatePayoffGrid(req, result);
-  }, [result, buildRequest]);
-
   const lastClose = priceHistory[priceHistory.length - 1]?.price;
-  const prevClose = priceHistory[priceHistory.length - 2]?.price;
-  const dayChg = lastClose && prevClose ? (lastClose - prevClose) / prevClose : 0;
+  const livePrice = marketData?.spot_price ?? lastClose;
+  const chgVsClose = livePrice != null && lastClose ? (livePrice - lastClose) / lastClose : null;
 
   return (
     <div className="app">
@@ -435,10 +461,11 @@ export default function App() {
         {ticker && (
           <div className="topbar-meta">
             <span><strong>{ticker.sym}</strong></span>
-            {lastClose != null && <span className="tnum">${lastClose.toFixed(2)}</span>}
-            {lastClose != null && prevClose != null && (
-              <span className="tnum" style={{ color: dayChg >= 0 ? "var(--accent)" : "var(--loss)" }}>
-                {dayChg >= 0 ? "+" : ""}{(dayChg * 100).toFixed(2)}%
+            {livePrice != null && <span className="tnum">${livePrice.toFixed(2)}</span>}
+            {chgVsClose != null && (
+              <span className="tnum" title="Change vs last close in the loaded history"
+                style={{ color: chgVsClose >= 0 ? "var(--accent)" : "var(--loss)" }}>
+                {chgVsClose >= 0 ? "+" : ""}{(chgVsClose * 100).toFixed(2)}%
               </span>
             )}
             <span>σ={(effectiveVol * 100).toFixed(1)}%</span>
@@ -518,43 +545,51 @@ export default function App() {
             setRange={setRange}
           />
 
-          {marketError && (
-            <div className="empty" style={{ color: "var(--loss)" }}>{marketError}</div>
-          )}
+          {marketError && <div className="empty error">{marketError}</div>}
 
-          {structure === "spread" && (
-            <div style={{ padding: "14px", borderBottom: "1px solid var(--border)" }}>
-              <SpreadForm
-                spreadType={spreadType}
-                onSpreadTypeChange={setSpreadType}
-                strikes={strikes}
-                onStrikesChange={setStrikes}
-                showTypeSelector={true}
-              />
-            </div>
-          )}
-
-          {structure === "single" && heroPrimary && tweaks.emphasis === "hero" && (
+          {heroPrimary && tweaks.emphasis === "hero" && (
             <HeroPrice
-              label={`${direction === "long" ? "Long" : "Short"} · ${optionType.toUpperCase()} · ${exerciseStyle}`}
+              label={structureLabel}
               primary={heroPrimary}
               secondary={heroSecondary}
-              ctmc={ctmcResult}
+              stale={pricing || ctmcLoading}
               pinned={pinned}
               onPin={pinCurrent}
               onClearPin={() => setPinned(null)}
             />
           )}
 
-          {result && rows.length > 0 && (
+          {ctmcResult && (
+            <div className="cal-pair">
+              <CalibrationStrip
+                title="Heston calibration"
+                quote={ctmcResult.heston_quote}
+                error={ctmcResult.heston_error}
+                nInstruments={ctmcResult.n_instruments}
+              />
+              <CalibrationStrip
+                title="4/2 calibration"
+                quote={ctmcResult.four_two_quote}
+                error={ctmcResult.four_two_error}
+                nInstruments={ctmcResult.n_instruments}
+              />
+            </div>
+          )}
+          {ctmcError && <div className="empty error">{ctmcError}</div>}
+
+          {(result || ctmcResult || ctmcLoading) && rows.length > 0 && (
             <div className="results">
               <div className="results-head">
                 <div>
-                  <div className="results-title">Pricing methods</div>
+                  <div className="results-title">
+                    Pricing methods
+                    {pricing && <span className="recalc mono">recalculating…</span>}
+                    {ctmcLoading && <span className="recalc mono">calibrating…</span>}
+                  </div>
                   <div className="results-meta mono">
-                    <span>σ {(effectiveVol * 100).toFixed(2)}% ({manualOverride ? "manual" : volSource})</span>
+                    <span>σ {(effectiveVol * 100).toFixed(2)}% ({manualOverride || !volDataForSidebar ? "manual" : volSource})</span>
                     <span>S ${bsArgs.S.toFixed(2)}</span>
-                    <span>K ${bsArgs.K.toFixed(2)}</span>
+                    {structure === "single" && <span>K ${bsArgs.K.toFixed(2)}</span>}
                     <span>T {bsArgs.T.toFixed(3)}y</span>
                   </div>
                 </div>
@@ -568,31 +603,18 @@ export default function App() {
             </div>
           )}
 
-          {priceError && !result && (
-            <div className="empty" style={{ color: "var(--loss)" }}>{priceError}</div>
+          {priceError && !result && <div className="empty error">{priceError}</div>}
+
+          {result?.greeks && (
+            <GreeksStrip greeks={result.greeks} bsArgs={bsArgs} showCurves={structure === "single"} />
           )}
 
-          {(structure === "single" || structure === "spread") && result?.greeks && (
-            <GreeksStrip greeks={result.greeks} bsArgs={bsArgs} />
-          )}
-
-          {structure === "single" && result && heroPrimary?.price != null && (
+          {result?.payoff_curve && (
             <PayoffPanel
-              bsArgs={bsArgs}
-              direction={direction}
-              premium={heroPrimary.price}
+              curve={result.payoff_curve}
+              strike={structure === "single" ? bsArgs.K : undefined}
+              spot={bsArgs.S}
             />
-          )}
-
-          {(structure === "spread" || structure === "exotic") && payoffData && payoffData.length > 0 && (
-            <div className="payoff">
-              <div className="payoff-head">
-                <span style={{ fontSize: 11, color: "var(--fg-3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                  Payoff at expiry
-                </span>
-              </div>
-              <PayoffChart data={payoffData} height={160} strike={bsArgs.K} spot={bsArgs.S} />
-            </div>
           )}
         </div>
 

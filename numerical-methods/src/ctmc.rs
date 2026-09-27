@@ -840,6 +840,43 @@ pub fn price_american_option_heston(
     run_algorithm_31(&ctmc, &config, &model, &operator, spot, v0)
 }
 
+/// Price an American option under the Grasselli 4/2 model.
+///
+/// `a = 1`, `b = 0` is Heston. `b > 0` adds the 3/2 loading `b / sqrt(v)`.
+pub fn price_american_option_four_two(
+    option: options::Options,
+    v0: f64,
+    kappa: f64,
+    theta_lr: f64,
+    sigma_v: f64,
+    rho: f64,
+    a: f64,
+    b: f64,
+    n_x: usize,
+    m_v: usize,
+    n_time: usize,
+) -> CTMCResult {
+    let spot = option.spot_price();
+    let r = option.risk_free_rate();
+    let q = option.dividend_yield().unwrap_or(0.0);
+    let t = option.time_to_maturity();
+    let model = SLVModelVariant::FourTwo(FourTwo::new(rho, sigma_v, r, Some(q), kappa, theta_lr, a, b));
+
+    let v_grid = uniform_variance_grid(v0, m_v as i32);
+    let f_v0 = model.f_integral(v0);
+    let x_min = model.g_integral(1e-3 * spot) - rho * f_v0;
+    let x_max = model.g_integral(4.0 * spot) - rho * f_v0;
+    let x_grid: Vec<f64> = (0..n_x).map(|i| x_min + (x_max - x_min) * i as f64 / (n_x - 1) as f64).collect();
+    let x_spacings: Vec<f64> = x_grid.windows(2).map(|w| w[1] - w[0]).collect();
+
+    let ctmc = assemble_generator(&model, &x_grid, &x_spacings, &v_grid);
+    let nm = ctmc.dim();
+    let dt = t / n_time as f64;
+    let operator = MatExpOperator::new(&ctmc.generator, r, dt, MatExpOperator::suggest_strategy(nm));
+    let config = CTMCPricerConfig { option, n_time_steps: n_time };
+    run_algorithm_31(&ctmc, &config, &model, &operator, spot, v0)
+}
+
 /// Price an American put under Heston — convenience wrapper around `price_american_option_heston`.
 pub fn price_american_put_heston(
     strike: f64, spot: f64, v0: f64, maturity: f64,
@@ -904,6 +941,27 @@ mod tests {
         assert_eq!(h1.len(), 15);
         for &v in &h1 { assert!(v >= 0.0, "Negative payoff: {v}"); }
         assert!(h1[0] > h1[4]);
+    }
+
+    #[test]
+    fn four_two_american_put_is_finite_and_matches_heston_limit() {
+        let put = options::Options::new_put(100.0, 100.0, 0.0, 0.03, 0.5, Some(0.0));
+        let four = price_american_option_four_two(
+            put, 0.04, 2.0, 0.04, 0.3, -0.6, 1.0, 0.0, 24, 8, 12,
+        );
+        let heston = price_american_option_heston(
+            options::Options::new_put(100.0, 100.0, 0.0, 0.03, 0.5, Some(0.0)),
+            0.04, 2.0, 0.04, 0.3, -0.6, 24, 8, 12,
+        );
+        assert!(four.price.is_finite() && four.price > 0.0, "{}", four.price);
+        let rel = (four.price - heston.price).abs() / heston.price;
+        assert!(rel < 1e-6, "4/2 a=1,b=0 diverges from Heston: {} vs {}", four.price, heston.price);
+
+        let loaded = price_american_option_four_two(
+            options::Options::new_put(100.0, 100.0, 0.0, 0.03, 0.5, Some(0.01)),
+            0.04, 2.0, 0.04, 0.3, -0.6, 0.9, 0.01, 24, 8, 12,
+        );
+        assert!(loaded.price.is_finite() && loaded.price > four.price * 0.5, "{}", loaded.price);
     }
 
     #[test]

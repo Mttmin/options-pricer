@@ -1,7 +1,14 @@
 //! Deep calibration via the BatesSurrogate ONNX model.
 //!
-//! Loads the exported `bates_surrogate.onnx` (+ companion `.onnx.data`) and
-//! calibrates Heston parameters from a market IV surface using Levenberg-Marquardt
+//! Loads `bates_surrogate.onnx`. Weights are embedded in that file. A sibling
+//! `.onnx.data` is only required if an older export externalized them.
+//!
+//! The graph may be the stripped live path (collapsed residual GEMMs removed).
+//! The I/O contract is unchanged:
+//!   input  `parameters`  f32 [batch, 7]
+//!   output `iv_surface`  f32 [batch, 686]
+//!
+//! Calibrates Heston parameters from a market IV surface using Levenberg-Marquardt
 //! through the frozen surrogate (pure Heston, 5 parameters).
 //!
 //! # Grid
@@ -264,12 +271,12 @@ pub struct DeepCalibrationResult {
 pub struct BatesCalibrator {
     session: Session,
 }
-
 impl BatesCalibrator {
     /// Load from an ONNX file.
     ///
-    /// The `bates_surrogate.onnx.data` external-weights file must live in the
-    /// same directory as `onnx_path`.
+    /// Input must be named `parameters` with shape `[batch, 7]`.
+    /// Output must be named `iv_surface` with length 686.
+    /// A sibling `.onnx.data` is required only when the file externalizes weights.
     ///
     /// # Panics
     /// Panics if the ONNX model's input is not `[batch, N_PARAMS]`.
@@ -280,19 +287,24 @@ impl BatesCalibrator {
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .commit_from_file(onnx_path)?;
 
-        // Shape sanity: run a 1×N_MODEL_INPUTS forward pass.
-        // If the ONNX was exported with a different n_params (e.g. 5 instead of 6),
-        // ORT will return an error here — fail loudly at construction rather than
-        // silently producing wrong calibrations mid-run.
+        // Shape sanity: the pricer contract is [batch, 7] -> [batch, 686],
+        // independent of whether residual GEMMs were stripped before export.
         let dummy = Tensor::from_array(([1usize, N_MODEL_INPUTS], vec![0.5f32; N_MODEL_INPUTS]))?;
-        session.run(ort::inputs!["parameters" => dummy]).expect(
-            &format!(
-                "ONNX model rejected input shape [1, {}]. \
-                 The model was likely exported with a different n_params. \
-                 Re-export bates_surrogate.onnx after retraining.",
-                N_MODEL_INPUTS
+        let outputs = session.run(ort::inputs!["parameters" => dummy]).unwrap_or_else(|_| {
+            panic!(
+                "ONNX model rejected input shape [1, {N_MODEL_INPUTS}]. \
+                 Re-export bates_surrogate.onnx from the stripped surrogate."
             )
+        });
+        let (_shape, slice) = outputs["iv_surface"]
+            .try_extract_tensor::<f32>()
+            .expect("ONNX output 'iv_surface' missing or not f32");
+        assert!(
+            slice.len() == N_FLAT,
+            "ONNX iv_surface length {}, expected {N_FLAT}",
+            slice.len()
         );
+        drop(outputs);
 
         Ok(Self { session })
     }
@@ -998,6 +1010,21 @@ mod tests {
             "expected IV ≈ 0.25 at ATM 6M cell, got {cell_iv}"
         );
     }
+    /// The options pricer loads the exported graph by name and shape, not by
+    /// residual-block count. This checks that contract on the stripped file.
+    #[test]
+    fn stripped_onnx_matches_pricer_contract() {
+        let Some(onnx_path) = default_onnx_path() else {
+            return;
+        };
+        let mut calibrator = BatesCalibrator::new(&onnx_path).expect("failed to load ONNX");
+        let out = calibrator
+            .forward(&[0.5; N_PARAMS], 0.5, 0.0)
+            .expect("forward failed");
+        assert_eq!(out.len(), N_FLAT);
+        assert!(out.iter().all(|v| v.is_finite()), "iv_surface has non-finite values");
+    }
+
 
     /// Synthetic round-trip test: calibrate known Heston parameters from a
     /// COS-generated IV surface and verify recovery within 15% relative error.

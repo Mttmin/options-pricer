@@ -283,6 +283,7 @@ export type CtmcPriceRequest = {
   n_x?: number;
   m_v?: number;
   n_time?: number;
+  model?: "heston" | "four_two" | "both";
 };
 
 export type HestonResult = {
@@ -293,15 +294,40 @@ export type HestonResult = {
   v0: number;
 };
 
+export type FourTwoResult = HestonResult & { a: number; b: number };
+
+export type ModelQuote = {
+  price: number;
+  ivrmse: number;
+  n_evals: number;
+  timing_ms: number;
+  heston: HestonResult;
+  four_two?: FourTwoResult | null;
+};
+
 export type CtmcPriceResponse = {
   symbol: string;
   spot_price: number;
   price: number;
   heston: HestonResult;
+  four_two?: FourTwoResult | null;
+  model?: string;
   ivrmse: number;
   n_evals: number;
   n_instruments: number;
   timing_ms: number;
+  heston_quote?: ModelQuote | null;
+  four_two_quote?: ModelQuote | null;
+  heston_error?: string | null;
+  four_two_error?: string | null;
+};
+
+
+export const EXOTIC_LABELS: Record<ExoticType, string> = {
+  convertible_bond: "Convertible Bond",
+  chooser_option: "Chooser Option",
+  asian_option: "Asian Option",
+  cliquet_option: "Cliquet Option",
 };
 
 export const SPREAD_LABELS: Record<SpreadType, string> = {

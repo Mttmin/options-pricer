@@ -281,6 +281,13 @@ pub struct CtmcPriceRequest {
     pub m_v: Option<usize>,
     #[serde(default)]
     pub n_time: Option<usize>,
+    /// `"heston"` (default), `"four_two"`, or `"both"`.
+    #[serde(default = "default_slv_model")]
+    pub model: String,
+}
+
+fn default_slv_model() -> String {
+    "heston".to_string()
 }
 
 fn default_mc_simulations() -> u32 {

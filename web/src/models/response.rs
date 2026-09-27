@@ -95,7 +95,7 @@ pub struct PenaltySolverResult {
     pub diagnostics: PenaltySolverDiagnostics,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct HestonResult {
     pub kappa: f64,
     pub theta: f64,
@@ -104,16 +104,49 @@ pub struct HestonResult {
     pub v0: f64,
 }
 
+#[derive(Serialize, Clone)]
+pub struct FourTwoResult {
+    pub kappa: f64,
+    pub theta: f64,
+    pub sigma: f64,
+    pub rho: f64,
+    pub v0: f64,
+    pub a: f64,
+    pub b: f64,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ModelQuote {
+    pub price: f64,
+    pub ivrmse: f32,
+    pub n_evals: usize,
+    pub timing_ms: f64,
+    pub heston: HestonResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub four_two: Option<FourTwoResult>,
+}
+
 #[derive(Serialize)]
 pub struct CtmcPriceResponse {
     pub symbol: String,
     pub spot_price: f64,
     pub price: f64,
     pub heston: HestonResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub four_two: Option<FourTwoResult>,
+    pub model: String,
     pub ivrmse: f32,
     pub n_evals: usize,
     pub n_instruments: usize,
     pub timing_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heston_quote: Option<ModelQuote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub four_two_quote: Option<ModelQuote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heston_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub four_two_error: Option<String>,
 }
 
 #[derive(Serialize)]

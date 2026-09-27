@@ -2,6 +2,7 @@
 pub mod binomial;
 pub mod ctmc;
 pub mod deep_cal;
+pub mod deep_cal_four_two;
 pub mod expm;
 pub mod slv;
 
